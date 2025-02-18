@@ -4,7 +4,7 @@
 #include <time.h>
 
 #define NUM_ACCOUNTS 100000    // Number of accounts to generate
-#define STATE_FILE "state.bin"
+#define STATE_FILE "state_0.bin"
 #define INITIAL_BALANCE 1000000ULL  // Default initial balance for each account
 
 // Structure representing an account in the state
@@ -22,14 +22,6 @@ int main(void) {
     
     // Seed the random number generator
     srand(time(NULL));
-    
-    // Write the number of accounts first
-    uint32_t num_accounts = NUM_ACCOUNTS;
-    if (fwrite(&num_accounts, sizeof(num_accounts), 1, file) != 1) {
-        perror("Error writing number of accounts");
-        fclose(file);
-        exit(EXIT_FAILURE);
-    }
     
     // Generate and write each account
     for (size_t i = 0; i < NUM_ACCOUNTS; i++) {

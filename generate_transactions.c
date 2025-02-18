@@ -6,7 +6,7 @@
 #define BATCH_SIZE (1 << 16)      // 2^16 transactions per batch
 #define NUMBER_OF_BATCHES 10      // Total number of batches to generate
 #define TX_FILE "transactions.bin"
-#define STATE_FILE "state.bin"
+#define STATE_FILE "state_0.bin"  // Must match the file produced by your state generator
 
 // Transaction structure (each operation)
 typedef struct {
@@ -15,7 +15,7 @@ typedef struct {
     uint32_t amount;
 } Transaction;
 
-// Account structure (matches the one in generate_state.c)
+// Account structure (matches the one in your state generator)
 typedef struct {
     uint64_t address;
     uint64_t balance;
@@ -29,12 +29,9 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
     
-    size_t num_accounts;
-    if (fread(&num_accounts, sizeof(num_accounts), 1, stateFile) != 1) {
-        perror("Error reading number of accounts");
-        fclose(stateFile);
-        exit(EXIT_FAILURE);
-    }
+    // The state generator created NUM_ACCOUNTS accounts (here 100,000)
+    size_t num_accounts = 100000;
+    printf("Number of accounts: %zu\n", num_accounts);
     
     Account *accounts = malloc(num_accounts * sizeof(Account));
     if (!accounts) {
@@ -51,7 +48,7 @@ int main(void) {
     }
     fclose(stateFile);
     
-    // Open the transaction file for writing (this will clear previous data)
+    // Open the transaction file for writing (this clears previous data)
     FILE *txFile = fopen(TX_FILE, "wb");
     if (!txFile) {
         perror("Error opening transactions file for writing");
@@ -68,7 +65,7 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
     
-    // Generate transactions in batches
+    // Generate transactions in batches using the accounts from the state.
     for (size_t batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         for (size_t i = 0; i < BATCH_SIZE; i++) {
             size_t idx_sender = rand() % num_accounts;
@@ -96,6 +93,8 @@ int main(void) {
     free(batch);
     free(accounts);
     fclose(txFile);
-    printf("Generated %d transactions (in %d batches) and saved to '%s'.\n", NUMBER_OF_BATCHES * BATCH_SIZE, NUMBER_OF_BATCHES, TX_FILE);
+    printf("Generated %d transactions (in %d batches) and saved to '%s'.\n",
+           NUMBER_OF_BATCHES * BATCH_SIZE, NUMBER_OF_BATCHES, TX_FILE);
+    
     return 0;
 }
