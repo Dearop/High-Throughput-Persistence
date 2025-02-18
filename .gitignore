@@ -1,0 +1,8 @@
+transactions.bin
+
+*.o
+*.out
+generate_transactions
+
+*.log
+*.tmp
