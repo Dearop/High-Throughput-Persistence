@@ -13,32 +13,40 @@ typedef struct {
     uint32_t amount;
 } Transaction;
 
-int generate_batch(FILE *file, Transaction *batch) {
+void generate_batch(FILE *file, Transaction *batch) {
     for (size_t i = 0; i < BATCH_SIZE; i++) {
         batch[i].sender = ((uint64_t)rand() << 32) | rand();
         batch[i].receiver = ((uint64_t)rand() << 32) | rand();
-        batch[i].amount = rand() % (1<<16); 
+        batch[i].amount = rand() % (1 << 16); 
     }
 
     size_t written = fwrite(batch, sizeof(Transaction), BATCH_SIZE, file);
-
+    
     if (written != BATCH_SIZE) {
         perror("Error writing to file");
         fclose(file);
         exit(EXIT_FAILURE);
     }
-
-    return 0;
 }
 
 void generate_transactions(const char *filename) {
+    // clear past entries inside transactions.bin
     FILE *file = fopen(filename, "wb");
     if (!file) {
         perror("Error opening file");
         exit(EXIT_FAILURE);
     }
+    // close after clearing
+    fclose(file); 
 
-    srand(time(NULL)); 
+    // Reopen file for appending
+    file = fopen(filename, "ab");
+    if (!file) {
+        perror("Error opening file for appending");
+        exit(EXIT_FAILURE);
+    }
+
+    srand(time(NULL));
 
     Transaction batch[BATCH_SIZE];
     for (size_t i = 0; i < NUMBER_OF_BATCHES; i++) {
