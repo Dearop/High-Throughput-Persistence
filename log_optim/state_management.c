@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>   // For pthread_create, etc.
+#include <math.h>      // For ceil()
 
 #define BATCH_SIZE        (1 << 16)  // 2^16 transactions per batch
 #define INITIAL_BALANCE   1000000UL
@@ -26,12 +27,13 @@ typedef struct {
 } Transaction;
 
 typedef struct {
-    uint64_t address;   
+    uint64_t address;
     uint64_t balance;
 } Account;
 
 // -----------------------------------------------------------------------------
-// Global in-memory state (actively updated by the main thread)
+// Global in-memory state
+// -----------------------------------------------------------------------------
 static Account *g_state = NULL;
 static uint64_t g_processed_batches = 0;
 
@@ -46,16 +48,30 @@ static pthread_t  g_snapshot_thread;
 static int        g_snapshot_in_progress = 0;
 
 // -----------------------------------------------------------------------------
-// Utility: compute elapsed time in milliseconds
-static inline double timespec_diff_ms(const struct timespec *start, const struct timespec *end) {
+// Utility: compute time difference in milliseconds
+// -----------------------------------------------------------------------------
+static inline double timespec_diff_ms(const struct timespec *start, const struct timespec *end)
+{
     double secs  = (double)(end->tv_sec - start->tv_sec);
     double nsecs = (double)(end->tv_nsec - start->tv_nsec) / 1e9;
     return (secs + nsecs) * 1000.0;
 }
 
 // -----------------------------------------------------------------------------
-// Load existing snapshot or create a fresh state if none
-static void load_or_init_state(void) {
+// simple comparator for qsort (used for median/p90/p99 calculations)
+// -----------------------------------------------------------------------------
+static int cmp_doubles(const void *a, const void *b)
+{
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    return (da > db) - (da < db);  // sign of (da - db)
+}
+
+// -----------------------------------------------------------------------------
+// Load existing snapshot or create fresh state if none
+// -----------------------------------------------------------------------------
+static void load_or_init_state(void)
+{
     FILE *snapshot = fopen(SNAPSHOT_FILE, "rb");
     if (!snapshot) {
         // No snapshot => create fresh state
@@ -91,7 +107,9 @@ static void load_or_init_state(void) {
 
 // -----------------------------------------------------------------------------
 // Replay any existing log into g_state
-static void replay_log(void) {
+// -----------------------------------------------------------------------------
+static void replay_log(void)
+{
     FILE *log_fp = fopen(LOG_FILE, "rb");
     if (!log_fp) {
         printf("No log file found; nothing to replay.\n");
@@ -116,7 +134,9 @@ static void replay_log(void) {
 
 // -----------------------------------------------------------------------------
 // Background thread function to write a snapshot
-static void *snapshot_worker(void *arg) {
+// -----------------------------------------------------------------------------
+static void *snapshot_worker(void *arg)
+{
     SnapshotTask *task = (SnapshotTask *)arg;
     
     // Write the snapshot
@@ -138,15 +158,13 @@ static void *snapshot_worker(void *arg) {
     if (written != task->account_count) {
         fprintf(stderr, "Error writing snapshot: wrote=%zu, expected=%zu\n",
                 written, task->account_count);
-        // fall through
     } else {
         printf("[Async] Snapshot created with full state.\n");
     }
 
-    // After snapshot is written, remove/truncate the old log
+    // Remove/truncate old log
     if (remove(LOG_FILE) != 0 && errno != ENOENT) {
         perror("[Async] Error removing old log");
-        // not a fatal error for the background thread
     } else {
         printf("[Async] Log has been reset (old log removed).\n");
     }
@@ -162,9 +180,10 @@ static void *snapshot_worker(void *arg) {
 
 // -----------------------------------------------------------------------------
 // Wait for any prior snapshot to finish before starting a new one
-static void wait_for_snapshot_if_needed(void) {
+// -----------------------------------------------------------------------------
+static void wait_for_snapshot_if_needed(void)
+{
     if (g_snapshot_in_progress) {
-        // Join on the existing snapshot thread before launching another
         pthread_join(g_snapshot_thread, NULL);
         g_snapshot_in_progress = 0;
     }
@@ -172,14 +191,16 @@ static void wait_for_snapshot_if_needed(void) {
 
 // -----------------------------------------------------------------------------
 // Start an asynchronous snapshot: copy current state, spawn a worker thread
-static void create_snapshot_async(void) {
+// -----------------------------------------------------------------------------
+static void create_snapshot_async(void)
+{
     wait_for_snapshot_if_needed();
 
-    // Make a copy of the entire state to avoid concurrency issues
+    // Make a copy of the entire state
     Account *copy_state = (Account *)malloc(MAX_ACCOUNTS * sizeof(Account));
     if (!copy_state) {
         perror("malloc for snapshot copy failed");
-        return; // or exit
+        return;
     }
     memcpy(copy_state, g_state, MAX_ACCOUNTS * sizeof(Account));
 
@@ -188,13 +209,13 @@ static void create_snapshot_async(void) {
     if (!task) {
         perror("malloc for SnapshotTask failed");
         free(copy_state);
-        return; // or exit
+        return;
     }
     task->snapshot_state = copy_state;
     task->account_count  = MAX_ACCOUNTS;
 
     g_snapshot_in_progress = 1;
-    // Spawn background thread
+    // Spawn the background thread
     if (pthread_create(&g_snapshot_thread, NULL, snapshot_worker, task) != 0) {
         perror("Failed to create snapshot thread");
         g_snapshot_in_progress = 0;
@@ -204,8 +225,10 @@ static void create_snapshot_async(void) {
 }
 
 // -----------------------------------------------------------------------------
-
-int main(void) {
+// Main
+// -----------------------------------------------------------------------------
+int main(void)
+{
     load_or_init_state();
     replay_log();
 
@@ -236,6 +259,17 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
+    // We'll store each batch's processing time for stats
+    double *batch_times = (double *)malloc(TOTAL_BATCHES * sizeof(double));
+    if (!batch_times) {
+        perror("malloc for batch_times failed");
+        free(batch);
+        fclose(log_fp);
+        fclose(tx_file);
+        free(g_state);
+        exit(EXIT_FAILURE);
+    }
+
     double total_elapsed_ms = 0.0;
 
     // Process transactions in batches
@@ -252,6 +286,7 @@ int main(void) {
                 read_count = fread(batch, sizeof(Transaction), BATCH_SIZE, tx_file);
             } else {
                 perror("Error reading transaction batch");
+                free(batch_times);
                 free(batch);
                 fclose(log_fp);
                 fclose(tx_file);
@@ -272,17 +307,31 @@ int main(void) {
         // Append those transactions to the log
         if (fwrite(batch, sizeof(Transaction), read_count, log_fp) != read_count) {
             perror("Error writing to log");
+            free(batch_times);
             free(batch);
             fclose(log_fp);
             fclose(tx_file);
             free(g_state);
             exit(EXIT_FAILURE);
         }
-        // For performance, skip fsync here. The snapshot thread will remove
-        // the log after it finishes writing a snapshot.
+
+        // ---------------------------------------------------------------------
+        // ALWAYS FSync here to ensure this batch is safely on disk.
+        // ---------------------------------------------------------------------
+        fflush(log_fp);
+        if (fsync(fileno(log_fp)) != 0) {
+            perror("fsync on log");
+            free(batch_times);
+            free(batch);
+            fclose(log_fp);
+            fclose(tx_file);
+            free(g_state);
+            exit(EXIT_FAILURE);
+        }
 
         clock_gettime(CLOCK_MONOTONIC, &end);
         double elapsed_ms = timespec_diff_ms(&start, &end);
+        batch_times[iteration] = elapsed_ms;  // store this batch's latency
         total_elapsed_ms += elapsed_ms;
 
         g_processed_batches++;
@@ -293,10 +342,8 @@ int main(void) {
 
         // Check if it's time for a snapshot
         if (g_processed_batches % MAX_LOG_BATCHES == 0) {
-            // Flush the log so the background thread sees it fully
-            fflush(log_fp);
-            fsync(fileno(log_fp));  // Ensure it's on disk
-            // Close the current log file
+            // We already fsync'ed above, so the log is safe
+            // Close the current log file so snapshot thread can remove it
             fclose(log_fp);
 
             // Launch the asynchronous snapshot
@@ -306,6 +353,7 @@ int main(void) {
             log_fp = fopen(LOG_FILE, "ab");
             if (!log_fp) {
                 perror("Error re-opening log file");
+                free(batch_times);
                 free(batch);
                 fclose(tx_file);
                 free(g_state);
@@ -320,7 +368,41 @@ int main(void) {
     printf("Total time:    %.3f ms\n", total_elapsed_ms);
     printf("Avg per batch: %.3f ms\n", avg_elapsed_ms);
 
-    // Clean up
+    // -------------------------------------------------------------------------
+    // Calculate median, p90, p99
+    // -------------------------------------------------------------------------
+    qsort(batch_times, TOTAL_BATCHES, sizeof(double), cmp_doubles);
+
+    // median
+    double median_ms;
+    if (TOTAL_BATCHES % 2 == 0) {
+        // even
+        int mid = TOTAL_BATCHES / 2;
+        median_ms = (batch_times[mid - 1] + batch_times[mid]) / 2.0;
+    } else {
+        // odd
+        median_ms = batch_times[TOTAL_BATCHES / 2];
+    }
+
+    // 90th percentile
+    int idx_90 = (int)ceil(0.90 * TOTAL_BATCHES) - 1;  // 0-based index
+    if (idx_90 < 0) idx_90 = 0;
+    if (idx_90 >= (int)TOTAL_BATCHES) idx_90 = TOTAL_BATCHES - 1;
+    double p90_ms = batch_times[idx_90];
+
+    // 99th percentile
+    int idx_99 = (int)ceil(0.99 * TOTAL_BATCHES) - 1;
+    if (idx_99 < 0) idx_99 = 0;
+    if (idx_99 >= (int)TOTAL_BATCHES) idx_99 = TOTAL_BATCHES - 1;
+    double p99_ms = batch_times[idx_99];
+
+    printf("\nLatency statistics for %d batches:\n", TOTAL_BATCHES);
+    printf("  Median:    %.3f ms\n", median_ms);
+    printf("  p90:       %.3f ms\n", p90_ms);
+    printf("  p99:       %.3f ms\n", p99_ms);
+
+    // Cleanup
+    free(batch_times);
     free(batch);
     fclose(tx_file);
     fclose(log_fp);
