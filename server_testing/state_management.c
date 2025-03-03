@@ -267,14 +267,14 @@ int main(int argc, char **argv) {
     double total_processing_time = 0.0;
     
     // Start the prolonged processing loop.
-    // (For each batch, we simulate processing time using one value from the 50-value cycle.)
+    // For each batch, we simulate processing time using one value from the 50-value cycle.
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         // Choose a simulated time based on a 50-batch repeating cycle.
         double simulated_time = simulated_batch_times[batch_num % 50];
         // Sleep for the simulated processing time (in microseconds).
         usleep((useconds_t)(simulated_time * 1000));
         
-        // (Optionally, perform dummy updates to the state; here we add BATCH_SIZE to account 0.)
+        // Optionally perform dummy updates to the state; here we add BATCH_SIZE to account 0.
         state[0] += BATCH_SIZE;
         
         // Write a checkpoint for this batch.
@@ -286,10 +286,8 @@ int main(int argc, char **argv) {
         batch_times[batch_num] = simulated_time;
         total_processing_time += simulated_time;
         
-        // Print progress every 10,000 batches to avoid flooding the console.
-        if (batch_num % 10000 == 0) {
-            printf("Processed batch %u...\n", batch_num);
-        }
+        // Print detailed information for each finished batch.
+        printf("Batch %u processed in %.3f ms.\n", batch_num, simulated_time);
     }
     
     // Compute performance metrics.
