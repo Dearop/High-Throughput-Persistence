@@ -4,7 +4,7 @@
 #include <time.h>
 
 #define BATCH_SIZE (1 << 16)      // 2^16 transactions per batch
-#define NUMBER_OF_BATCHES 50      // Total number of batches to generate
+#define NUMBER_OF_BATCHES 500      // Total number of batches to generate
 #define TX_FILE "transactions.bin"
 #define SMALL_ACCOUNT_COUNT 2000000UL   
 

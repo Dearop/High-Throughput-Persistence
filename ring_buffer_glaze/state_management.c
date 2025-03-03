@@ -1,516 +1,346 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <time.h>
-#include <errno.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <math.h>
-#include <stdbool.h>
-#include <zlib.h>    // for crc32 calculation
+#include <time.h>
+#include <unistd.h>  // For fsync
 
-// ---------------------- Configuration ----------------------
+#define BATCH_SIZE        (1 << 16)            // 2^16 transactions per batch
+#define NUMBER_OF_BATCHES 50                    // Total number of batches (should match the transaction generator)
+#define TX_FILE           "transactions.bin"   // Transaction file generated earlier
+#define SMALL_ACCOUNT_COUNT 2000000UL          // Total number of accounts
 
-#define BATCH_SIZE          (1 << 16)    // 65536 transactions per batch
-#define INITIAL_BALANCE     1000000UL
-#define MAX_ACCOUNTS        2000000UL    // 2 million accounts
-#define TOTAL_BATCHES       50           // total # of batches to process
+// Ring log parameters.
+#define RING_SIZE         8                    // Number of checkpoint slots in the log.
+#define STATE_CHUNK_SIZE  (512 * 1024)         // 512KB state chunk per checkpoint.
+#define STATE_CHUNK_COUNT (STATE_CHUNK_SIZE / sizeof(int64_t))  // Number of int64_t elements in the state chunk.
+    
+// Write-set size is the batch of transactions.
+#define WRITE_SET_SIZE    (BATCH_SIZE * sizeof(Transaction))
 
-#define CHUNK_SIZE_ACCOUNTS 16384        // ~256 KB chunk if each Account=16 bytes
-#define RING_CAPACITY       (CHUNK_SIZE_ACCOUNTS * 2)
+// A checkpoint slot consists of a header, the state chunk, and the write-set.
+#define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
+#define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
+#define LOG_FILE          "checkpoint_log.dat" // Single log file with ring structure.
 
-#define RING_FILE           "chunk_ring.dat"
-#define TX_FILE             "transactions.bin"
-
-// ---------------------- Data Structures ----------------------
-
+// Transaction structure (as generated).
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
     uint32_t amount;
 } Transaction;
 
+// Checkpoint header stored at the beginning of each slot.
 typedef struct {
-    uint64_t address;
-    uint64_t balance;
-} Account;
+    uint32_t batch_num;         // Batch number of this checkpoint.
+    uint32_t state_chunk_count; // Should equal STATE_CHUNK_COUNT.
+    uint32_t write_set_count;   // Should equal BATCH_SIZE.
+    uint32_t reserved;          // Reserved/padding.
+} CheckpointHeader;
 
-#pragma pack(push, 1)
+// Structure to hold metadata for each checkpoint slot found in the log.
 typedef struct {
-    uint8_t  valid_marker;  // 1 => fully written & valid, 0 => partial/invalid
-    uint32_t crc32;
-    uint32_t chunk_id;
-    uint32_t data_len;
-    Account  accounts[CHUNK_SIZE_ACCOUNTS];
-} ChunkOnDisk;
-#pragma pack(pop)
+    CheckpointHeader header;
+    long offset; // File offset where this slot begins.
+} CheckpointSlot;
 
-#pragma pack(push, 1)
-typedef struct {
-    char     signature[8];   // "CHNKRING"
-    uint32_t version;
-    uint32_t ring_capacity;  
-    uint64_t ring_head;
-    uint64_t ring_tail;
-    uint8_t  reserved[32];   // pad to 64 bytes total
-} RingMetadata;
-#pragma pack(pop)
-
-// ---------------------- Globals ----------------------
-static Account *g_state = NULL;          // in-memory state
-static uint64_t g_num_chunk_writes = 0;  // how many chunk writes
-static uint64_t g_processed_batches = 0; // how many batches processed so far
-
-// ---------------------- Utility: Timing ----------------------
-static double timespec_diff_ms(const struct timespec *start, const struct timespec *end)
-{
-    double secs  = (double)(end->tv_sec - start->tv_sec);
-    double nsecs = (double)(end->tv_nsec - start->tv_nsec) / 1e9;
-    return (secs + nsecs) * 1000.0;
-}
-
-static int cmp_doubles(const void *a, const void *b)
-{
-    double da = *(const double *)a;
-    double db = *(const double *)b;
-    return (da > db) - (da < db);
-}
-
-// ---------------------- Fresh State ----------------------
-static void init_fresh_state(void)
-{
-    g_state = (Account *)malloc(MAX_ACCOUNTS * sizeof(Account));
-    if (!g_state) {
-        perror("malloc g_state");
-        exit(EXIT_FAILURE);
-    }
-    for (uint64_t i = 0; i < MAX_ACCOUNTS; i++) {
-        g_state[i].address = i;
-        g_state[i].balance = INITIAL_BALANCE;
-    }
-}
-
-// ---------------------- Offsets in the Ring ----------------------
-static inline off_t ring_offset_of_slot(uint64_t slot_idx)
-{
-    return 64 + (off_t)(slot_idx % RING_CAPACITY) * (off_t)sizeof(ChunkOnDisk);
-}
-
-// ---------------------- Metadata I/O ----------------------
-static void ring_read_metadata(int fd, RingMetadata *meta)
-{
-    if (lseek(fd, 0, SEEK_SET) == (off_t)-1) {
-        perror("lseek ring_read_metadata");
-        exit(EXIT_FAILURE);
-    }
-    ssize_t rc = read(fd, meta, sizeof(*meta));
-    if (rc < 0) {
-        perror("read ring metadata");
-        exit(EXIT_FAILURE);
-    }
-    // partial read => treat as new
-    if (rc < (ssize_t)sizeof(*meta)) {
-        memset(meta, 0, sizeof(*meta));
-        memcpy(meta->signature, "CHNKRING", 8);
-        meta->version       = 1;
-        meta->ring_capacity = RING_CAPACITY;
-        meta->ring_head     = 0;
-        meta->ring_tail     = 0;
-    }
-}
-
-static void ring_write_metadata(int fd, const RingMetadata *meta)
-{
-    if (lseek(fd, 0, SEEK_SET) == (off_t)-1) {
-        perror("lseek ring_write_metadata");
-        exit(EXIT_FAILURE);
-    }
-    ssize_t rc = write(fd, meta, sizeof(*meta));
-    if (rc < 0 || rc < (ssize_t)sizeof(*meta)) {
-        perror("write ring metadata");
-        exit(EXIT_FAILURE);
-    }
-    if (fsync(fd) != 0) {
-        perror("fsync ring metadata");
-        exit(EXIT_FAILURE);
-    }
-}
-
-// ---------------------- Two-Phase Write of a Chunk ----------------------
-static void ring_write_chunk(int fd, uint64_t slot, ChunkOnDisk *chunk)
-{
-    off_t offset = ring_offset_of_slot(slot);
-
-    // Mark invalid
-    chunk->valid_marker = 0;
-
-    // Step 1
-    if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
-        perror("lseek ring_write_chunk step1");
-        exit(EXIT_FAILURE);
-    }
-    ssize_t to_write = sizeof(ChunkOnDisk);
-    ssize_t rc = write(fd, chunk, to_write);
-    if (rc < 0 || rc < to_write) {
-        perror("write chunk step1");
-        exit(EXIT_FAILURE);
-    }
-
-    // compute CRC ignoring valid_marker
-    ChunkOnDisk tmp = *chunk;
-    tmp.valid_marker = 0;
-    tmp.crc32        = 0;
-    uint8_t *p       = (uint8_t *)&tmp;
-    p       += 1;
-    size_t len = sizeof(tmp) - 1;
-
-    uLong c = crc32(0L, Z_NULL, 0);
-    c = crc32(c, p, (uInt)len);
-    chunk->crc32        = (uint32_t)c;
-    chunk->valid_marker = 1;
-
-    // Step 2
-    if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
-        perror("lseek ring_write_chunk step2");
-        exit(EXIT_FAILURE);
-    }
-    rc = write(fd, chunk, to_write);
-    if (rc < 0 || rc < to_write) {
-        perror("write chunk step2");
-        exit(EXIT_FAILURE);
-    }
-
-    if (fsync(fd) != 0) {
-        perror("fsync chunk finalize");
-        exit(EXIT_FAILURE);
-    }
-}
-
-// ---------------------- ring_store_chunk ----------------------
-static void ring_store_chunk(int fd, ChunkOnDisk *chunk, RingMetadata *meta)
-{
-    uint64_t head = meta->ring_head;
-    uint64_t tail = meta->ring_tail;
-    uint64_t cap  = meta->ring_capacity;
-
-    uint64_t next_tail = (tail + 1) % cap;
-    if (next_tail == head) {
-        // ring full => discard oldest
-        head = (head + 1) % cap;
-        meta->ring_head = head;
-    }
-
-    ring_write_chunk(fd, tail, chunk);
-    meta->ring_tail = next_tail;
-    ring_write_metadata(fd, meta);
-}
-
-// ---------------------- incremental_persist ----------------------
-static void incremental_persist(int fd, RingMetadata *meta)
-{
-    ChunkOnDisk chunk;
-    memset(&chunk, 0, sizeof(chunk));
-
-    uint64_t possible_chunks = (MAX_ACCOUNTS + CHUNK_SIZE_ACCOUNTS - 1) / CHUNK_SIZE_ACCOUNTS;
-    uint32_t cid = (uint32_t)(g_num_chunk_writes % possible_chunks);
-    chunk.chunk_id = cid;
-
-    uint64_t start_idx = (uint64_t)cid * CHUNK_SIZE_ACCOUNTS;
-    uint64_t end_idx   = start_idx + CHUNK_SIZE_ACCOUNTS;
-    if (end_idx > MAX_ACCOUNTS) {
-        end_idx = MAX_ACCOUNTS;
-    }
-    uint64_t count = end_idx - start_idx;
-    chunk.data_len = (uint32_t)count;
-    memcpy(chunk.accounts, &g_state[start_idx], count * sizeof(Account));
-
-    ring_store_chunk(fd, &chunk, meta);
-
-    printf("Ring: wrote chunk_id=%u (write #%llu)\n",
-           cid, (unsigned long long)g_num_chunk_writes);
-
-    g_num_chunk_writes++;
-}
-
-// ---------------------- ring_recover ----------------------
-static bool ring_recover(int fd)
-{
-    RingMetadata meta;
-    ring_read_metadata(fd, &meta);
-
-    // Validate ring
-    if (memcmp(meta.signature, "CHNKRING", 8) != 0 || meta.version < 1) {
-        printf("Ring file invalid or version < 1. No ring recovery done.\n");
-        return false;
-    }
-
-    uint64_t possible_chunks = (MAX_ACCOUNTS + CHUNK_SIZE_ACCOUNTS - 1) / CHUNK_SIZE_ACCOUNTS;
-    off_t *last_offsets = (off_t*)malloc(possible_chunks * sizeof(off_t));
-    if (!last_offsets) {
-        perror("malloc last_offsets");
-        return false;
-    }
-    for (uint64_t i = 0; i < possible_chunks; i++) {
-        last_offsets[i] = -1;
-    }
-
-    uint64_t head = meta.ring_head;
-    uint64_t tail = meta.ring_tail;
-    uint64_t cap  = meta.ring_capacity;
-
-    uint64_t valid_chunks_found = 0;
-
-    // walk from head to tail
-    uint64_t idx = head;
-    while (idx != tail) {
-        off_t slot_off = ring_offset_of_slot(idx);
-        if (lseek(fd, slot_off, SEEK_SET) == (off_t)-1) {
-            perror("lseek ring slot");
-            break;
+// FNV-1a 64-bit hash function (to hash the state chunk or entire state).
+uint64_t fnv1a_hash(int64_t *data, size_t len) {
+    uint64_t hash = 14695981039346656037UL;
+    for (size_t i = 0; i < len; i++) {
+        uint64_t val = (uint64_t)data[i];
+        for (int j = 0; j < 8; j++) {
+            uint8_t byte = (val >> (j * 8)) & 0xFF;
+            hash ^= byte;
+            hash *= 1099511628211UL;
         }
-        ChunkOnDisk chunk;
-        ssize_t rc = read(fd, &chunk, sizeof(chunk));
-        if (rc < (ssize_t)sizeof(chunk)) {
-            idx = (idx + 1) % cap;
+    }
+    return hash;
+}
+
+// Returns current time in milliseconds (with sub-ms resolution).
+double get_time_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+// Writes the given state chunk (of count int64_t values) to a text file.
+void write_state_to_file(const char *filename, int64_t *state, size_t count) {
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        perror("Error opening state text file for writing");
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        fprintf(fp, "%zu: %lld\n", i, (long long)state[i]);
+    }
+    fclose(fp);
+}
+
+// Ensure the log file exists and is pre-allocated to RING_SIZE * CHECKPOINT_SLOT_SIZE bytes.
+FILE *open_log_file(const char *mode) {
+    FILE *fp = fopen(LOG_FILE, mode);
+    if (!fp && (strcmp(mode, "r+b") == 0 || strcmp(mode, "r+") == 0)) {
+        // If file does not exist, create it.
+        fp = fopen(LOG_FILE, "w+b");
+    }
+    if (!fp) {
+        perror("Error opening log file");
+        exit(EXIT_FAILURE);
+    }
+    // Pre-allocate file space if necessary.
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    long expected = RING_SIZE * CHECKPOINT_SLOT_SIZE;
+    if (fsize < expected) {
+        fseek(fp, 0, SEEK_SET);
+        char *zero_buf = calloc(1, expected);
+        if (!zero_buf) {
+            perror("calloc");
+            fclose(fp);
+            exit(EXIT_FAILURE);
+        }
+        fwrite(zero_buf, 1, expected, fp);
+        free(zero_buf);
+        fflush(fp);
+        fsync(fileno(fp));
+    }
+    return fp;
+}
+
+// Write a checkpoint (state chunk + write-set) into the log file at the appropriate ring slot.
+int write_checkpoint_to_log(FILE *log_fp, uint32_t batch_num, int64_t *state, Transaction *transactions) {
+    // Compute ring slot index and corresponding file offset.
+    uint32_t slot_index = batch_num % RING_SIZE;
+    long offset = slot_index * CHECKPOINT_SLOT_SIZE;
+    if (fseek(log_fp, offset, SEEK_SET) != 0) {
+        perror("fseek error in write_checkpoint_to_log");
+        return -1;
+    }
+    // Prepare header.
+    CheckpointHeader header;
+    header.batch_num = batch_num;
+    header.state_chunk_count = STATE_CHUNK_COUNT;
+    header.write_set_count = BATCH_SIZE;
+    header.reserved = 0;
+    // Write header.
+    if (fwrite(&header, sizeof(header), 1, log_fp) != 1) {
+        perror("Error writing checkpoint header");
+        return -1;
+    }
+    // Write state chunk.
+    // In this example, we dump a fixed contiguous block of the state (accounts 0..STATE_CHUNK_COUNT-1).
+    if (fwrite(state, sizeof(int64_t), STATE_CHUNK_COUNT, log_fp) != STATE_CHUNK_COUNT) {
+        perror("Error writing state chunk");
+        return -1;
+    }
+    // Write the write-set (the entire batch of transactions).
+    if (fwrite(transactions, sizeof(Transaction), BATCH_SIZE, log_fp) != BATCH_SIZE) {
+        perror("Error writing write-set");
+        return -1;
+    }
+    fflush(log_fp);
+    if (fsync(fileno(log_fp)) != 0) {
+        perror("fsync failed");
+        return -1;
+    }
+    return 0;
+}
+
+// Reconstruction: Read the checkpoint slot with the highest batch number from the log file
+// and load its state chunk directly into the state array.
+int reconstruct_state(FILE *log_fp, int64_t *state, int *last_batch) {
+    uint32_t latest_batch = 0;
+    int latest_slot = -1;
+    CheckpointHeader header;
+    
+    // Scan all slots in the ring.
+    for (uint32_t i = 0; i < RING_SIZE; i++) {
+        long offset = i * CHECKPOINT_SLOT_SIZE;
+        if (fseek(log_fp, offset, SEEK_SET) != 0)
             continue;
+        if (fread(&header, sizeof(header), 1, log_fp) != 1)
+            continue;
+        // Check for a valid header.
+        if (header.write_set_count == BATCH_SIZE && header.state_chunk_count == STATE_CHUNK_COUNT) {
+            if (header.batch_num >= latest_batch) {
+                latest_batch = header.batch_num;
+                latest_slot = i;
+            }
         }
+    }
+    if (latest_slot == -1) {
+        printf("No valid checkpoint found in log.\n");
+        return -1;
+    }
+    // Read the state chunk from the latest slot.
+    long offset = latest_slot * CHECKPOINT_SLOT_SIZE + CHECKPOINT_HEADER_SIZE;
+    if (fseek(log_fp, offset, SEEK_SET) != 0) {
+        perror("fseek error reading state chunk during reconstruction");
+        return -1;
+    }
+    if (fread(state, sizeof(int64_t), STATE_CHUNK_COUNT, log_fp) != STATE_CHUNK_COUNT) {
+        perror("Error reading state chunk during reconstruction");
+        return -1;
+    }
+    *last_batch = latest_batch;
+    return 0;
+}
 
-        if (chunk.valid_marker == 1) {
-            // check CRC
-            ChunkOnDisk tmp = chunk;
-            tmp.valid_marker = 0;
-            uint8_t *p = (uint8_t *)&tmp;
-            p += 1; 
-            size_t len = sizeof(tmp) - 1;
+// For performance metrics: compare two doubles.
+int compare_doubles(const void *a, const void *b) {
+    double diff = (*(double *)a) - (*(double *)b);
+    return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
+}
 
-            uint32_t old_crc = tmp.crc32;
-            tmp.crc32 = 0;
-
-            uLong c = crc32(0L, Z_NULL, 0);
-            c = crc32(c, p, (uInt)len);
-
-            if ((uint32_t)c == old_crc) {
-                valid_chunks_found++;
-                if (chunk.chunk_id < possible_chunks) {
-                    last_offsets[chunk.chunk_id] = slot_off;
+int main(int argc, char **argv) {
+    // Allocate state array.
+    int64_t *state = calloc(SMALL_ACCOUNT_COUNT + 1, sizeof(int64_t));
+    if (!state) {
+        perror("Error allocating state");
+        exit(EXIT_FAILURE);
+    }
+    
+    // If an old log file exists, reconstruct the state from it.
+    FILE *log_fp = NULL;
+    int reconstructed = 0;
+    int recovered_batch = -1;
+    if ((log_fp = fopen(LOG_FILE, "r+b")) != NULL) {
+        if (reconstruct_state(log_fp, state, &recovered_batch) == 0) {
+            reconstructed = 1;
+            printf("Reconstructed state from log up to batch %d.\n", recovered_batch);
+            uint64_t hash = fnv1a_hash(state, STATE_CHUNK_COUNT);
+            FILE *hash_fp = fopen("state_hash.dat", "rb");
+            if (hash_fp) {
+                uint64_t stored_hash;
+                fread(&stored_hash, sizeof(uint64_t), 1, hash_fp);
+                fclose(hash_fp);
+                if (hash == stored_hash) {
+                    printf("Reconstructed state hash matches stored hash: %llu\n", hash);
+                } else {
+                    printf("Reconstructed state hash mismatch! Computed: %llu, Stored: %llu\n", hash, stored_hash);
+                    // Output the reconstructed state to a text file for inspection.
+                    write_state_to_file("reconstructed_state.txt", state, STATE_CHUNK_COUNT);
                 }
             }
         }
-        idx = (idx + 1) % cap;
+        fclose(log_fp);
     }
-
-    if (valid_chunks_found == 0) {
-        printf("Ring recovery found no valid chunks.\n");
-        free(last_offsets);
-        return false;
+    
+    // If running in "recover" mode, exit after reconstruction.
+    if (argc > 1 && strcmp(argv[1], "recover") == 0) {
+        free(state);
+        return 0;
     }
-
-    // If we found valid chunks, apply them
-    for (uint64_t cid = 0; cid < possible_chunks; cid++) {
-        off_t off = last_offsets[cid];
-        if (off < 0) continue;
-        if (lseek(fd, off, SEEK_SET) == (off_t)-1) continue;
-        ChunkOnDisk chunk;
-        if (read(fd, &chunk, sizeof(chunk)) < (ssize_t)sizeof(chunk)) {
-            continue;
-        }
-        // apply
-        uint64_t start_idx = cid * CHUNK_SIZE_ACCOUNTS;
-        uint64_t end_idx   = start_idx + chunk.data_len;
-        if (end_idx > MAX_ACCOUNTS) {
-            end_idx = MAX_ACCOUNTS;
-        }
-        memcpy(&g_state[start_idx], chunk.accounts, (end_idx - start_idx) * sizeof(Account));
-    }
-
-    free(last_offsets);
-    printf("Ring recovery complete. Applied %llu valid chunks.\n",
-           (unsigned long long)valid_chunks_found);
-    return true;
-}
-
-// ---------------------- open_ring_file ----------------------
-static int open_ring_file(bool do_recovery, bool *used_fresh_state)
-{
-    int fd = open(RING_FILE, O_RDWR | O_CREAT, 0644);
-    if (fd < 0) {
-        perror("open ring file");
+    
+    // Reset batch_num to 0 for new processing.
+    int batch_num = 0;
+    
+    // Normal processing mode.
+    FILE *tx_fp = fopen(TX_FILE, "rb");
+    if (!tx_fp) {
+        perror("Error opening transactions file for reading");
+        free(state);
         exit(EXIT_FAILURE);
     }
-
-    RingMetadata meta;
-    ring_read_metadata(fd, &meta);
-
-    if (memcmp(meta.signature, "CHNKRING", 8) != 0) {
-        // brand new
-        memcpy(meta.signature, "CHNKRING", 8);
-        meta.version       = 1;
-        meta.ring_capacity = RING_CAPACITY;
-        meta.ring_head     = 0;
-        meta.ring_tail     = 0;
-        ring_write_metadata(fd, &meta);
-        printf("Created new ring file '%s'.\n", RING_FILE);
-    } else {
-        printf("Opened existing ring file. head=%llu, tail=%llu, capacity=%u\n",
-               (unsigned long long)meta.ring_head,
-               (unsigned long long)meta.ring_tail,
-               meta.ring_capacity);
-    }
-
-    // If do_recovery = true, try to parse existing chunks
-    if (do_recovery) {
-        bool success = ring_recover(fd);
-        if (success) {
-            // We actually used the old data => not a fresh state
-            *used_fresh_state = false;
-        }
-        else {
-            // We remain with fresh state
-            *used_fresh_state = true;
-        }
-    }
-
-    ring_write_metadata(fd, &meta);
-    return fd;
-}
-
-// ---------------------- MAIN ----------------------
-int main(void)
-{
-    // We'll keep track of whether we actually used the fresh state
-    bool used_fresh_state = true;
-
-    // 1) Allocate memory + fill with fresh data
-    init_fresh_state();
-
-    // 2) Attempt to open + recover from ring
-    int ring_fd = open_ring_file(true, &used_fresh_state);
-
-    // Print a message based on whether we ended up using the fresh state
-    if (used_fresh_state) {
-        printf("Using fresh in-memory state of %lu accounts.\n",
-               (unsigned long)MAX_ACCOUNTS);
-    } else {
-        printf("Successfully recovered old state from ring.\n");
-    }
-
-    // 3) Open transaction file
-    FILE *tx_file = fopen(TX_FILE, "rb");
-    if (!tx_file) {
-        perror("Error opening transactions file");
-        close(ring_fd);
-        free(g_state);
+    
+    // Rewind transactions file in case it was read during reconstruction.
+    fseek(tx_fp, 0, SEEK_SET);
+    
+    log_fp = open_log_file("r+b");
+    
+    Transaction *batchTransactions = malloc(BATCH_SIZE * sizeof(Transaction));
+    if (!batchTransactions) {
+        perror("Error allocating memory for transaction batch");
+        free(state);
+        fclose(tx_fp);
+        fclose(log_fp);
         exit(EXIT_FAILURE);
     }
-
-    // We'll track batch times
-    double *batch_times = (double *)malloc(TOTAL_BATCHES * sizeof(double));
+    
+    double *batch_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!batch_times) {
-        perror("malloc batch_times");
-        fclose(tx_file);
-        close(ring_fd);
-        free(g_state);
+        perror("Error allocating batch_times");
+        free(state);
+        free(batchTransactions);
+        fclose(tx_fp);
+        fclose(log_fp);
         exit(EXIT_FAILURE);
     }
-
-    Transaction *batch = (Transaction *)malloc(BATCH_SIZE * sizeof(Transaction));
-    if (!batch) {
-        perror("malloc batch");
+    
+    double total_time = 0.0;
+    
+    while (batch_num < NUMBER_OF_BATCHES) {
+        size_t read = fread(batchTransactions, sizeof(Transaction), BATCH_SIZE, tx_fp);
+        if (read != BATCH_SIZE) {
+            if (feof(tx_fp))
+                break;
+            perror("Error reading a transaction batch");
+            break;
+        }
+        
+        double start = get_time_ms();
+        for (size_t i = 0; i < BATCH_SIZE; i++) {
+            uint64_t sender = batchTransactions[i].sender;
+            uint64_t receiver = batchTransactions[i].receiver;
+            uint32_t amount = batchTransactions[i].amount;
+            if (sender <= SMALL_ACCOUNT_COUNT)
+                state[sender] -= amount;
+            if (receiver <= SMALL_ACCOUNT_COUNT)
+                state[receiver] += amount;
+        }
+        double end = get_time_ms();
+        double elapsed = end - start;
+        batch_times[batch_num] = elapsed;
+        total_time += elapsed;
+        
+        if (write_checkpoint_to_log(log_fp, batch_num, state, batchTransactions) != 0) {
+            printf("Failed to write checkpoint for batch %d\n", batch_num);
+        }
+        printf("Batch %d processed in %.3f ms.\n", batch_num, elapsed);
+        batch_num++;
+    }
+    
+    fclose(tx_fp);
+    
+    double average = total_time / batch_num;
+    double *sorted_times = malloc(batch_num * sizeof(double));
+    if (!sorted_times) {
+        perror("Error allocating sorted_times");
+        free(state);
+        free(batchTransactions);
         free(batch_times);
-        fclose(tx_file);
-        close(ring_fd);
-        free(g_state);
+        fclose(log_fp);
         exit(EXIT_FAILURE);
     }
-
-    // read current metadata once
-    RingMetadata meta;
-    ring_read_metadata(ring_fd, &meta);
-
-    double total_elapsed_ms = 0.0;
-
-    // 4) Process transactions in batches
-    for (uint64_t iteration = 0; iteration < TOTAL_BATCHES; iteration++) {
-        struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);
-
-        // read BATCH_SIZE transactions
-        size_t read_count = fread(batch, sizeof(Transaction), BATCH_SIZE, tx_file);
-        if (read_count < BATCH_SIZE) {
-            if (feof(tx_file)) {
-                rewind(tx_file);
-                read_count = fread(batch, sizeof(Transaction), BATCH_SIZE, tx_file);
-            } else {
-                perror("Error reading transaction batch");
-                free(batch);
-                free(batch_times);
-                fclose(tx_file);
-                close(ring_fd);
-                free(g_state);
-                exit(EXIT_FAILURE);
-            }
-        }
-
-        // apply in-memory
-        for (size_t i = 0; i < read_count; i++) {
-            Transaction *tx = &batch[i];
-            if (g_state[tx->sender].balance >= tx->amount) {
-                g_state[tx->sender].balance  -= tx->amount;
-                g_state[tx->receiver].balance += tx->amount;
-            }
-        }
-
-        // store next chunk
-        incremental_persist(ring_fd, &meta);
-
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double elapsed_ms = timespec_diff_ms(&start, &end);
-        batch_times[iteration] = elapsed_ms;
-        total_elapsed_ms += elapsed_ms;
-        g_processed_batches++;
-
-        printf("Batch %llu of %llu processed in %.3f ms\n",
-               (unsigned long long)(iteration + 1),
-               (unsigned long long)TOTAL_BATCHES,
-               elapsed_ms);
-    }
-
-    // 5) Print summary
-    double avg_ms = total_elapsed_ms / (double)TOTAL_BATCHES;
-    printf("\nProcessed %d batches total.\n", (int)TOTAL_BATCHES);
-    printf("Total time: %.3f ms\n", total_elapsed_ms);
-    printf("Avg batch: %.3f ms\n", avg_ms);
-
-    // Sort times and compute median/p90/p99
-    qsort(batch_times, TOTAL_BATCHES, sizeof(double), cmp_doubles);
-    double median_ms;
-    if (TOTAL_BATCHES % 2 == 0) {
-        int mid = (int)(TOTAL_BATCHES / 2);
-        median_ms = (batch_times[mid - 1] + batch_times[mid]) / 2.0;
+    memcpy(sorted_times, batch_times, batch_num * sizeof(double));
+    qsort(sorted_times, batch_num, sizeof(double), compare_doubles);
+    double median = sorted_times[batch_num / 2];
+    double p90 = sorted_times[(int)(batch_num * 0.9)];
+    double p99 = sorted_times[(int)(batch_num * 0.99)];
+    
+    printf("\nPerformance Metrics (ms):\n");
+    printf("Total processing time: %.3f ms\n", total_time);
+    printf("Average batch time: %.3f ms\n", average);
+    printf("Median batch time: %.3f ms\n", median);
+    printf("90th percentile batch time: %.3f ms\n", p90);
+    printf("99th percentile batch time: %.3f ms\n", p99);
+    
+    uint64_t state_hash = fnv1a_hash(state, STATE_CHUNK_COUNT);
+    printf("Final state chunk hash: %llu\n", state_hash);
+    FILE *hash_fp = fopen("state_hash.dat", "wb");
+    if (hash_fp) {
+        fwrite(&state_hash, sizeof(uint64_t), 1, hash_fp);
+        fclose(hash_fp);
     } else {
-        median_ms = batch_times[TOTAL_BATCHES / 2];
+        perror("Error opening state_hash.dat for writing");
     }
-    int idx_90 = (int)ceil(0.90 * TOTAL_BATCHES) - 1;
-    if (idx_90 < 0) idx_90 = 0;
-    if (idx_90 >= (int)TOTAL_BATCHES) idx_90 = TOTAL_BATCHES - 1;
-    double p90_ms = batch_times[idx_90];
-    int idx_99 = (int)ceil(0.99 * TOTAL_BATCHES) - 1;
-    if (idx_99 < 0) idx_99 = 0;
-    if (idx_99 >= (int)TOTAL_BATCHES) idx_99 = TOTAL_BATCHES - 1;
-    double p99_ms = batch_times[idx_99];
-
-    printf("\nLatency stats for %d batches:\n", (int)TOTAL_BATCHES);
-    printf("  Median: %.3f ms\n", median_ms);
-    printf("  p90:    %.3f ms\n", p90_ms);
-    printf("  p99:    %.3f ms\n", p99_ms);
-
-    // 6) Cleanup
-    free(batch);
+    
+    free(state);
+    free(batchTransactions);
     free(batch_times);
-    fclose(tx_file);
-    close(ring_fd);
-    free(g_state);
-
+    free(sorted_times);
+    fclose(log_fp);
     return 0;
 }
