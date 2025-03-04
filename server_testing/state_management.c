@@ -17,7 +17,6 @@
 // We have 2 million accounts total
 #define MAX_ACCOUNTS        2000000UL
 
-// We'll do 50 total batches
 #define TOTAL_BATCHES       5000
 
 // We'll store accounts in chunks of 32768 => ~512 KB each
