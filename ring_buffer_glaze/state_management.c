@@ -3,12 +3,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>  // For fsync
+#include <unistd.h>  // for fsync
 
-#define BATCH_SIZE        (1 << 16)            // 2^16 transactions per batch
-#define NUMBER_OF_BATCHES 50                    // Total number of batches (should match the transaction generator)
-#define TX_FILE           "transactions.bin"   // Transaction file generated earlier
-#define SMALL_ACCOUNT_COUNT 2000000UL          // Total number of accounts
+// Definitions and constants.
+#define BATCH_SIZE          (1 << 16)            // 2^16 transactions per batch
+#define NUMBER_OF_BATCHES   50               // Number of batches
+#define SMALL_ACCOUNT_COUNT 2000000UL            // Total number of accounts
 
 // Ring log parameters.
 #define RING_SIZE         8                    // Number of checkpoint slots in the log.
@@ -23,26 +23,20 @@
 #define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
 #define LOG_FILE          "checkpoint_log.dat" // Single log file with ring structure.
 
-// Transaction structure (as generated).
+// Dummy transaction structure.
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
     uint32_t amount;
 } Transaction;
 
-// Checkpoint header stored at the beginning of each slot.
+// Checkpoint header structure.
 typedef struct {
     uint32_t batch_num;         // Batch number of this checkpoint.
     uint32_t state_chunk_count; // Should equal STATE_CHUNK_COUNT.
     uint32_t write_set_count;   // Should equal BATCH_SIZE.
     uint32_t reserved;          // Reserved/padding.
 } CheckpointHeader;
-
-// Structure to hold metadata for each checkpoint slot found in the log.
-typedef struct {
-    CheckpointHeader header;
-    long offset; // File offset where this slot begins.
-} CheckpointSlot;
 
 // FNV-1a 64-bit hash function (to hash the state chunk or entire state).
 uint64_t fnv1a_hash(int64_t *data, size_t len) {
@@ -130,7 +124,6 @@ int write_checkpoint_to_log(FILE *log_fp, uint32_t batch_num, int64_t *state, Tr
         return -1;
     }
     // Write state chunk.
-    // In this example, we dump a fixed contiguous block of the state (accounts 0..STATE_CHUNK_COUNT-1).
     if (fwrite(state, sizeof(int64_t), STATE_CHUNK_COUNT, log_fp) != STATE_CHUNK_COUNT) {
         perror("Error writing state chunk");
         return -1;
@@ -175,7 +168,7 @@ int reconstruct_state(FILE *log_fp, int64_t *state, int *last_batch) {
         return -1;
     }
     // Read the state chunk from the latest slot.
-    long offset = latest_slot * CHECKPOINT_SLOT_SIZE + CHECKPOINT_HEADER_SIZE;
+    long offset = latest_slot * CHECKPOINT_SLOT_SIZE + sizeof(CheckpointHeader);
     if (fseek(log_fp, offset, SEEK_SET) != 0) {
         perror("fseek error reading state chunk during reconstruction");
         return -1;
@@ -195,20 +188,18 @@ int compare_doubles(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
-    // Allocate state array.
+    // Allocate the state array.
     int64_t *state = calloc(SMALL_ACCOUNT_COUNT + 1, sizeof(int64_t));
     if (!state) {
         perror("Error allocating state");
         exit(EXIT_FAILURE);
     }
     
-    // If an old log file exists, reconstruct the state from it.
+    // If an old log file exists, attempt to reconstruct the state.
     FILE *log_fp = NULL;
-    int reconstructed = 0;
     int recovered_batch = -1;
     if ((log_fp = fopen(LOG_FILE, "r+b")) != NULL) {
         if (reconstruct_state(log_fp, state, &recovered_batch) == 0) {
-            reconstructed = 1;
             printf("Reconstructed state from log up to batch %d.\n", recovered_batch);
             uint64_t hash = fnv1a_hash(state, STATE_CHUNK_COUNT);
             FILE *hash_fp = fopen("state_hash.dat", "rb");
@@ -220,7 +211,6 @@ int main(int argc, char **argv) {
                     printf("Reconstructed state hash matches stored hash: %llu\n", hash);
                 } else {
                     printf("Reconstructed state hash mismatch! Computed: %llu, Stored: %llu\n", hash, stored_hash);
-                    // Output the reconstructed state to a text file for inspection.
                     write_state_to_file("reconstructed_state.txt", state, STATE_CHUNK_COUNT);
                 }
             }
@@ -234,78 +224,59 @@ int main(int argc, char **argv) {
         return 0;
     }
     
-    // Reset batch_num to 0 for new processing.
-    int batch_num = 0;
-    
-    // Normal processing mode.
-    FILE *tx_fp = fopen(TX_FILE, "rb");
-    if (!tx_fp) {
-        perror("Error opening transactions file for reading");
-        free(state);
-        exit(EXIT_FAILURE);
-    }
-    
-    // Rewind transactions file in case it was read during reconstruction.
-    fseek(tx_fp, 0, SEEK_SET);
-    
+    // Open (or create) the log file.
     log_fp = open_log_file("r+b");
     
+    // Allocate memory for a dummy transaction batch.
     Transaction *batchTransactions = malloc(BATCH_SIZE * sizeof(Transaction));
     if (!batchTransactions) {
         perror("Error allocating memory for transaction batch");
         free(state);
-        fclose(tx_fp);
         fclose(log_fp);
         exit(EXIT_FAILURE);
     }
+    // Fill the dummy transaction batch with sample values.
+    for (size_t i = 0; i < BATCH_SIZE; i++) {
+        batchTransactions[i].sender = i % (SMALL_ACCOUNT_COUNT + 1);
+        batchTransactions[i].receiver = (i + 1) % (SMALL_ACCOUNT_COUNT + 1);
+        batchTransactions[i].amount = 1;
+    }
     
+    // Allocate an array to collect measured processing times for all batches.
     double *batch_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!batch_times) {
         perror("Error allocating batch_times");
         free(state);
         free(batchTransactions);
-        fclose(tx_fp);
         fclose(log_fp);
         exit(EXIT_FAILURE);
     }
+    double total_processing_time = 0.0;
     
-    double total_time = 0.0;
-    
-    while (batch_num < NUMBER_OF_BATCHES) {
-        size_t read = fread(batchTransactions, sizeof(Transaction), BATCH_SIZE, tx_fp);
-        if (read != BATCH_SIZE) {
-            if (feof(tx_fp))
-                break;
-            perror("Error reading a transaction batch");
-            break;
-        }
+    // Start the processing loop.
+    for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
+        double start_time = get_time_ms();
         
-        double start = get_time_ms();
-        for (size_t i = 0; i < BATCH_SIZE; i++) {
-            uint64_t sender = batchTransactions[i].sender;
-            uint64_t receiver = batchTransactions[i].receiver;
-            uint32_t amount = batchTransactions[i].amount;
-            if (sender <= SMALL_ACCOUNT_COUNT)
-                state[sender] -= amount;
-            if (receiver <= SMALL_ACCOUNT_COUNT)
-                state[receiver] += amount;
-        }
-        double end = get_time_ms();
-        double elapsed = end - start;
-        batch_times[batch_num] = elapsed;
-        total_time += elapsed;
+        // Dummy update: add BATCH_SIZE to account 0.
+        state[0] += BATCH_SIZE;
         
+        // Write a checkpoint for this batch.
         if (write_checkpoint_to_log(log_fp, batch_num, state, batchTransactions) != 0) {
-            printf("Failed to write checkpoint for batch %d\n", batch_num);
+            printf("Failed to write checkpoint for batch %u\n", batch_num);
         }
-        printf("Batch %d processed in %.3f ms.\n", batch_num, elapsed);
-        batch_num++;
+        
+        double end_time = get_time_ms();
+        double batch_duration = end_time - start_time;  // Actual elapsed time in ms.
+        
+        batch_times[batch_num] = batch_duration;
+        total_processing_time += batch_duration;
+        
+        printf("Batch %u processed in %.3f ms.\n", batch_num, batch_duration);
     }
     
-    fclose(tx_fp);
-    
-    double average = total_time / batch_num;
-    double *sorted_times = malloc(batch_num * sizeof(double));
+    // Compute performance metrics.
+    double average = total_processing_time / NUMBER_OF_BATCHES;
+    double *sorted_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!sorted_times) {
         perror("Error allocating sorted_times");
         free(state);
@@ -314,19 +285,20 @@ int main(int argc, char **argv) {
         fclose(log_fp);
         exit(EXIT_FAILURE);
     }
-    memcpy(sorted_times, batch_times, batch_num * sizeof(double));
-    qsort(sorted_times, batch_num, sizeof(double), compare_doubles);
-    double median = sorted_times[batch_num / 2];
-    double p90 = sorted_times[(int)(batch_num * 0.9)];
-    double p99 = sorted_times[(int)(batch_num * 0.99)];
+    memcpy(sorted_times, batch_times, NUMBER_OF_BATCHES * sizeof(double));
+    qsort(sorted_times, NUMBER_OF_BATCHES, sizeof(double), compare_doubles);
+    double median = sorted_times[NUMBER_OF_BATCHES / 2];
+    double p90 = sorted_times[(int)(NUMBER_OF_BATCHES * 0.9) - 1];
+    double p99 = sorted_times[(int)(NUMBER_OF_BATCHES * 0.99) - 1];
     
     printf("\nPerformance Metrics (ms):\n");
-    printf("Total processing time: %.3f ms\n", total_time);
+    printf("Total processing time: %.3f ms\n", total_processing_time);
     printf("Average batch time: %.3f ms\n", average);
     printf("Median batch time: %.3f ms\n", median);
     printf("90th percentile batch time: %.3f ms\n", p90);
     printf("99th percentile batch time: %.3f ms\n", p99);
     
+    // Compute and print final state chunk hash.
     uint64_t state_hash = fnv1a_hash(state, STATE_CHUNK_COUNT);
     printf("Final state chunk hash: %llu\n", state_hash);
     FILE *hash_fp = fopen("state_hash.dat", "wb");
@@ -337,6 +309,7 @@ int main(int argc, char **argv) {
         perror("Error opening state_hash.dat for writing");
     }
     
+    // Clean up.
     free(state);
     free(batchTransactions);
     free(batch_times);

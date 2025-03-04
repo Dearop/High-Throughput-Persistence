@@ -3,11 +3,11 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>  // for usleep and fsync
+#include <unistd.h>  // for fsync
 
 // Definitions and constants.
 #define BATCH_SIZE          (1 << 16)            // 2^16 transactions per batch
-#define NUMBER_OF_BATCHES   500000               // Increased for ~5 minutes run time (~500k batches)
+#define NUMBER_OF_BATCHES   500000               // Number of batches
 #define SMALL_ACCOUNT_COUNT 2000000UL            // Total number of accounts
 
 // Ring log parameters.
@@ -23,24 +23,20 @@
 #define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
 #define LOG_FILE          "checkpoint_log.dat" // Single log file with ring structure.
 
-// In this prolonged test version, dummy transaction batches are generated in memory.
+// Dummy transaction structure.
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
     uint32_t amount;
 } Transaction;
 
+// Checkpoint header structure.
 typedef struct {
     uint32_t batch_num;         // Batch number of this checkpoint.
     uint32_t state_chunk_count; // Should equal STATE_CHUNK_COUNT.
     uint32_t write_set_count;   // Should equal BATCH_SIZE.
     uint32_t reserved;          // Reserved/padding.
 } CheckpointHeader;
-
-typedef struct {
-    CheckpointHeader header;
-    long offset; // File offset where this slot begins.
-} CheckpointSlot;
 
 // FNV-1a 64-bit hash function (to hash the state chunk or entire state).
 uint64_t fnv1a_hash(int64_t *data, size_t len) {
@@ -246,16 +242,7 @@ int main(int argc, char **argv) {
         batchTransactions[i].amount = 1;
     }
     
-    // Simulated batch times (in milliseconds) for one 50-batch cycle.
-    double simulated_batch_times[50] = {
-        4.015, 1.384, 1.146, 0.975, 0.731, 0.683, 0.609, 0.599, 0.582, 0.569,
-        0.559, 0.551, 0.643, 0.438, 0.352, 0.576, 0.583, 0.580, 0.331, 0.303,
-        0.524, 0.555, 0.541, 0.525, 0.523, 0.517, 0.526, 0.515, 0.513, 0.509,
-        0.516, 0.508, 0.509, 0.506, 0.504, 0.504, 0.497, 0.500, 0.727, 0.458,
-        0.335, 0.283, 0.277, 0.273, 0.273, 0.268, 0.270, 0.295, 0.315, 0.334
-    };
-    
-    // Allocate an array to collect processing times for all batches.
+    // Allocate an array to collect measured processing times for all batches.
     double *batch_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!batch_times) {
         perror("Error allocating batch_times");
@@ -266,15 +253,11 @@ int main(int argc, char **argv) {
     }
     double total_processing_time = 0.0;
     
-    // Start the prolonged processing loop.
-    // For each batch, we simulate processing time using one value from the 50-value cycle.
+    // Start the processing loop.
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
-        // Choose a simulated time based on a 50-batch repeating cycle.
-        double simulated_time = simulated_batch_times[batch_num % 50];
-        // Sleep for the simulated processing time (in microseconds).
-        usleep((useconds_t)(simulated_time * 1000));
+        double start_time = get_time_ms();
         
-        // Optionally perform dummy updates to the state; here we add BATCH_SIZE to account 0.
+        // Dummy update: add BATCH_SIZE to account 0.
         state[0] += BATCH_SIZE;
         
         // Write a checkpoint for this batch.
@@ -282,12 +265,13 @@ int main(int argc, char **argv) {
             printf("Failed to write checkpoint for batch %u\n", batch_num);
         }
         
-        // Record the simulated processing time.
-        batch_times[batch_num] = simulated_time;
-        total_processing_time += simulated_time;
+        double end_time = get_time_ms();
+        double batch_duration = end_time - start_time;  // Actual elapsed time in ms.
         
-        // Print detailed information for each finished batch.
-        printf("Batch %u processed in %.3f ms.\n", batch_num, simulated_time);
+        batch_times[batch_num] = batch_duration;
+        total_processing_time += batch_duration;
+        
+        printf("Batch %u processed in %.3f ms.\n", batch_num, batch_duration);
     }
     
     // Compute performance metrics.
