@@ -11,7 +11,7 @@
 
 // Definitions and constants.
 #define BATCH_SIZE          (1 << 16)            // 2^16 transactions per batch
-#define NUMBER_OF_BATCHES   50                 // Number of batches
+#define NUMBER_OF_BATCHES   50                   // Number of batches
 #define SMALL_ACCOUNT_COUNT 2000000UL            // Total number of accounts
 
 // Ring log parameters.
@@ -106,11 +106,11 @@ void preallocate_log_file_posix(const char *filename) {
 // Structures for parallel commit
 // ----------------------
 
-// Each commit job contains the batch number, a copy of the state chunk, and pointer to the transaction batch.
+// Each commit job contains the batch number, a copy of the state chunk, and a pointer to the transaction batch.
 typedef struct {
     uint32_t batch_num;
-    int64_t *state_snapshot;  // Should have STATE_CHUNK_COUNT elements.
-    Transaction *transactions; // Pointer to the (constant) transaction batch.
+    int64_t *state_snapshot;   // Should have STATE_CHUNK_COUNT elements.
+    Transaction *transactions; // Transaction batch pointer.
 } CommitJob;
 
 // A simple thread-safe queue for commit jobs.
@@ -125,7 +125,6 @@ typedef struct {
     int done; // Flag indicating no more jobs will be enqueued.
 } CommitQueue;
 
-// Initialize the commit queue.
 void init_commit_queue(CommitQueue *queue, int capacity) {
     queue->jobs = malloc(sizeof(CommitJob*) * capacity);
     if (!queue->jobs) {
@@ -141,11 +140,9 @@ void init_commit_queue(CommitQueue *queue, int capacity) {
     pthread_cond_init(&queue->cond, NULL);
 }
 
-// Enqueue a commit job.
 void enqueue_job(CommitQueue *queue, CommitJob *job) {
     pthread_mutex_lock(&queue->mutex);
     if (queue->size == queue->capacity) {
-        // For simplicity, exit if the queue is full.
         fprintf(stderr, "Commit queue full, exiting.\n");
         exit(EXIT_FAILURE);
     }
@@ -156,7 +153,6 @@ void enqueue_job(CommitQueue *queue, CommitJob *job) {
     pthread_mutex_unlock(&queue->mutex);
 }
 
-// Dequeue a commit job. Returns NULL if queue is empty.
 CommitJob* dequeue_job(CommitQueue *queue) {
     CommitJob *job = NULL;
     if (queue->size > 0) {
@@ -167,11 +163,75 @@ CommitJob* dequeue_job(CommitQueue *queue) {
     return job;
 }
 
-// Destroy the commit queue.
 void destroy_commit_queue(CommitQueue *queue) {
     free(queue->jobs);
     pthread_mutex_destroy(&queue->mutex);
     pthread_cond_destroy(&queue->cond);
+}
+
+// ----------------------
+// Structures for transaction reading
+// ----------------------
+
+// Each transaction batch is an array of Transaction objects.
+typedef struct {
+    Transaction **batches;
+    int capacity;
+    int size;
+    int front;
+    int rear;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int done; // Flag indicating no more batches will be produced.
+} TransactionQueue;
+
+void init_transaction_queue(TransactionQueue *q, int capacity) {
+    q->batches = malloc(sizeof(Transaction*) * capacity);
+    if (!q->batches) {
+        perror("Failed to allocate transaction queue");
+        exit(EXIT_FAILURE);
+    }
+    q->capacity = capacity;
+    q->size = 0;
+    q->front = 0;
+    q->rear = 0;
+    q->done = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->cond, NULL);
+}
+
+void enqueue_transaction(TransactionQueue *q, Transaction *batch) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->size == q->capacity) {
+         pthread_cond_wait(&q->cond, &q->mutex);
+    }
+    q->batches[q->rear] = batch;
+    q->rear = (q->rear + 1) % q->capacity;
+    q->size++;
+    pthread_cond_signal(&q->cond);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+Transaction* dequeue_transaction(TransactionQueue *q) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->size == 0 && !q->done) {
+         pthread_cond_wait(&q->cond, &q->mutex);
+    }
+    Transaction *batch = NULL;
+    if (q->size > 0) {
+         batch = q->batches[q->front];
+         q->front = (q->front + 1) % q->capacity;
+         q->size--;
+         pthread_cond_signal(&q->cond);
+    }
+    pthread_mutex_unlock(&q->mutex);
+    return batch;
+}
+
+void destroy_transaction_queue(TransactionQueue *q) {
+    free(q->batches);
+    pthread_mutex_destroy(&q->mutex);
+    pthread_cond_destroy(&q->cond);
 }
 
 // ----------------------
@@ -227,10 +287,49 @@ void* commit_thread_func(void* arg) {
              }
              fsync(fd);
              free(job->state_snapshot);
+             free(job->transactions);  // Free the transaction batch.
              free(job);
          }
     }
     close(fd);
+    pthread_exit(NULL);
+}
+
+// ----------------------
+// Transaction reader thread function.
+// ----------------------
+void* transaction_reader_thread_func(void* arg) {
+    TransactionQueue *tq = (TransactionQueue*) arg;
+    FILE *fp = fopen("transactions.bin", "rb");
+    if (!fp) {
+         perror("Error opening transactions.bin for reading");
+         exit(EXIT_FAILURE);
+    }
+    for (unsigned int i = 0; i < NUMBER_OF_BATCHES; i++) {
+         Transaction *batch = malloc(BATCH_SIZE * sizeof(Transaction));
+         if (!batch) {
+             perror("Failed to allocate transaction batch");
+             exit(EXIT_FAILURE);
+         }
+         size_t items = fread(batch, sizeof(Transaction), BATCH_SIZE, fp);
+         if (items != BATCH_SIZE) {
+              if (feof(fp)) {
+                 // End-of-file reached; free batch and exit loop.
+                 free(batch);
+                 break;
+              } else {
+                 perror("Error reading transactions.bin");
+                 free(batch);
+                 exit(EXIT_FAILURE);
+              }
+         }
+         enqueue_transaction(tq, batch);
+    }
+    fclose(fp);
+    pthread_mutex_lock(&tq->mutex);
+    tq->done = 1;
+    pthread_cond_broadcast(&tq->cond);
+    pthread_mutex_unlock(&tq->mutex);
     pthread_exit(NULL);
 }
 
@@ -320,48 +419,42 @@ int main(int argc, char **argv) {
     // Pre-allocate the log file (if not already large enough).
     preallocate_log_file_posix(LOG_FILE);
     
-    // Allocate memory for a dummy transaction batch.
-    Transaction *batchTransactions = malloc(BATCH_SIZE * sizeof(Transaction));
-    if (!batchTransactions) {
-        perror("Error allocating memory for transaction batch");
-        free(state);
-        exit(EXIT_FAILURE);
-    }
-    // Fill the dummy transaction batch with sample values.
-    for (size_t i = 0; i < BATCH_SIZE; i++) {
-        batchTransactions[i].sender = i % (SMALL_ACCOUNT_COUNT + 1);
-        batchTransactions[i].receiver = (i + 1) % (SMALL_ACCOUNT_COUNT + 1);
-        batchTransactions[i].amount = 1;
+    // Initialize transaction queue and start transaction reader thread.
+    TransactionQueue transaction_queue;
+    init_transaction_queue(&transaction_queue, NUMBER_OF_BATCHES);
+    
+    pthread_t transaction_reader_thread;
+    if (pthread_create(&transaction_reader_thread, NULL, transaction_reader_thread_func, &transaction_queue) != 0) {
+         perror("Error creating transaction reader thread");
+         free(state);
+         exit(EXIT_FAILURE);
     }
     
     // Initialize commit queue and create commit thread.
     CommitQueue commit_queue;
-    // For simplicity, let the queue capacity be large enough to hold all jobs.
     init_commit_queue(&commit_queue, NUMBER_OF_BATCHES);
     
     pthread_t commit_thread;
     if (pthread_create(&commit_thread, NULL, commit_thread_func, &commit_queue) != 0) {
         perror("Error creating commit thread");
         free(state);
-        free(batchTransactions);
         exit(EXIT_FAILURE);
     }
     
-    // Allocate an array to collect measured processing times for all batches.
+    // Array for collecting batch processing times.
     double *batch_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!batch_times) {
         perror("Error allocating batch_times");
         free(state);
-        free(batchTransactions);
         exit(EXIT_FAILURE);
     }
     double total_processing_time = 0.0;
-
-    // Start processing loop.
+    
+    // Processing loop.
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double start_time = get_time_ms();
         
-        // Dummy update: add BATCH_SIZE to account 0.
+        // Dummy update to state.
         state[0] += BATCH_SIZE;
         
         // Create a snapshot of the state chunk.
@@ -372,6 +465,14 @@ int main(int argc, char **argv) {
         }
         memcpy(state_snapshot, state, STATE_CHUNK_SIZE);
         
+        // Retrieve a transaction batch from the transaction queue.
+        Transaction *transaction_batch = dequeue_transaction(&transaction_queue);
+        if (!transaction_batch) {
+            fprintf(stderr, "No transaction batch available\n");
+            free(state_snapshot);
+            break;
+        }
+        
         // Create a commit job.
         CommitJob *job = malloc(sizeof(CommitJob));
         if (!job) {
@@ -380,13 +481,13 @@ int main(int argc, char **argv) {
         }
         job->batch_num = batch_num;
         job->state_snapshot = state_snapshot;
-        job->transactions = batchTransactions;  // Constant dummy batch.
+        job->transactions = transaction_batch;
         
         // Enqueue the commit job.
         enqueue_job(&commit_queue, job);
         
         double end_time = get_time_ms();
-        double batch_duration = end_time - start_time;  // Processing time for this batch.
+        double batch_duration = end_time - start_time;
         batch_times[batch_num] = batch_duration;
         total_processing_time += batch_duration;
         
@@ -399,8 +500,9 @@ int main(int argc, char **argv) {
     pthread_cond_signal(&commit_queue.cond);
     pthread_mutex_unlock(&commit_queue.mutex);
     
-    // Wait for commit thread to finish.
+    // Wait for commit and transaction reader threads to finish.
     pthread_join(commit_thread, NULL);
+    pthread_join(transaction_reader_thread, NULL);
     
     // Compute performance metrics.
     double average = total_processing_time / NUMBER_OF_BATCHES;
@@ -408,7 +510,6 @@ int main(int argc, char **argv) {
     if (!sorted_times) {
         perror("Error allocating sorted_times");
         free(state);
-        free(batchTransactions);
         free(batch_times);
         exit(EXIT_FAILURE);
     }
@@ -425,7 +526,7 @@ int main(int argc, char **argv) {
     printf("90th percentile batch time: %.3f ms\n", p90);
     printf("99th percentile batch time: %.3f ms\n", p99);
     
-    // Compute and print final state chunk hash.
+    // Compute and write final state chunk hash.
     uint64_t state_hash = fnv1a_hash(state, STATE_CHUNK_COUNT);
     printf("Final state chunk hash: %llu\n", state_hash);
     FILE *hash_fp = fopen("state_hash.dat", "wb");
@@ -438,12 +539,13 @@ int main(int argc, char **argv) {
     
     // Clean up.
     free(state);
-    free(batchTransactions);
     free(batch_times);
     free(sorted_times);
     destroy_commit_queue(&commit_queue);
+    destroy_transaction_queue(&transaction_queue);
+    
     clock_t end = clock();
     double total_time_ms = (double)(end - start) * 1000 / CLOCKS_PER_SEC;
-    printf("Total time taken : %.3f ms\n", total_time_ms);
+    printf("Total time taken: %.3f ms\n", total_time_ms);
     return 0;
 }
