@@ -286,7 +286,7 @@ int main(int argc, char **argv) {
         perror("Error allocating state");
         exit(EXIT_FAILURE);
     }
-    clock_t start = clock()
+    clock_t start = clock();
     // If an old log file exists, attempt to reconstruct the state.
     int recovered_batch = -1;
     int log_fd = open(LOG_FILE, O_RDWR);
