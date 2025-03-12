@@ -280,6 +280,7 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
 // Main function.
 // ----------------------
 int main(int argc, char **argv) {
+    clock_t start = clock();
     // Allocate the state array.
     int64_t *state = calloc(SMALL_ACCOUNT_COUNT + 1, sizeof(int64_t));
     if (!state) {
@@ -355,7 +356,7 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
     double total_processing_time = 0.0;
-    
+
     // Start processing loop.
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double start_time = get_time_ms();
@@ -441,6 +442,8 @@ int main(int argc, char **argv) {
     free(batch_times);
     free(sorted_times);
     destroy_commit_queue(&commit_queue);
-    
+    clock_t end = clock();
+    double total_time_ms = (double)(end - start) * 1000 / CLOCKS_PER_SEC;
+    printf("Total time taken : %.3f ms\n", total_time_ms);
     return 0;
 }

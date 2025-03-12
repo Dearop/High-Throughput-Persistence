@@ -286,7 +286,7 @@ int main(int argc, char **argv) {
         perror("Error allocating state");
         exit(EXIT_FAILURE);
     }
-    
+    clock_t start = clock()
     // If an old log file exists, attempt to reconstruct the state.
     int recovered_batch = -1;
     int log_fd = open(LOG_FILE, O_RDWR);
@@ -441,6 +441,8 @@ int main(int argc, char **argv) {
     free(batch_times);
     free(sorted_times);
     destroy_commit_queue(&commit_queue);
-    
+    clock_t end = clock();
+    double time_taken_ms = (double)(end - start) * 1000 / CLOCKS_PER_SEC;
+    printf("Total time taken : %f", time_taken_ms);
     return 0;
 }
