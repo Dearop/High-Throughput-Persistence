@@ -490,8 +490,6 @@ int main(int argc, char **argv) {
         double batch_duration = end_time - start_time;
         batch_times[batch_num] = batch_duration;
         total_processing_time += batch_duration;
-        
-        printf("Batch %u processed in %.3f ms.\n", batch_num, batch_duration);
     }
     
     // Signal commit thread that no more jobs will be enqueued.
