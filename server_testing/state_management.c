@@ -12,20 +12,20 @@
 // Definitions and constants.
 #define BATCH_SIZE          (1 << 16)            // 2^16 transactions per batch
 #define NUMBER_OF_BATCHES   5000                   // Number of batches
-#define SMALL_ACCOUNT_COUNT 2000000UL              // Total number of accounts
+#define SMALL_ACCOUNT_COUNT 2000000UL            // Total number of accounts
 
 // Ring log parameters.
-#define RING_SIZE         8                        // Number of checkpoint slots in the log.
-#define STATE_CHUNK_SIZE  (512 * 1024)             // 512KB state chunk per checkpoint.
+#define RING_SIZE         8                      // Number of checkpoint slots in the log.
+#define STATE_CHUNK_SIZE  (512 * 1024)           // 512KB state chunk per checkpoint.
 #define STATE_CHUNK_COUNT (STATE_CHUNK_SIZE / sizeof(int64_t))  // Number of int64_t elements in the state chunk.
-
+    
 // Write-set size is the batch of transactions.
 #define WRITE_SET_SIZE    (BATCH_SIZE * sizeof(Transaction))
 
 // A checkpoint slot consists of a header, the state chunk, and the write-set.
 #define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
 #define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
-#define LOG_FILE          "checkpoint_log.dat"     // Single log file with ring structure.
+#define LOG_FILE          "checkpoint_log.dat"   // Single log file with ring structure.
 
 // Dummy transaction structure.
 typedef struct {
@@ -261,38 +261,33 @@ void* commit_thread_func(void* arg) {
              // Compute ring slot offset.
              uint32_t slot_index = job->batch_num % RING_SIZE;
              off_t offset = slot_index * CHECKPOINT_SLOT_SIZE;
-
-             // Allocate a contiguous buffer for header, state snapshot and transactions.
-             char *buffer = malloc(CHECKPOINT_SLOT_SIZE);
-             if (!buffer) {
-                 perror("Error allocating commit buffer");
-                 free(job->state_snapshot);
-                 free(job->transactions);
-                 free(job);
-                 continue;
-             }
-
              // Prepare checkpoint header.
              CheckpointHeader header;
              header.batch_num = job->batch_num;
              header.state_chunk_count = STATE_CHUNK_COUNT;
              header.write_set_count = BATCH_SIZE;
              header.reserved = 0;
-
-             // Combine header, state snapshot and transaction batch into one buffer.
-             memcpy(buffer, &header, sizeof(header));
-             memcpy(buffer + sizeof(header), job->state_snapshot, STATE_CHUNK_SIZE);
-             memcpy(buffer + sizeof(header) + STATE_CHUNK_SIZE, job->transactions, WRITE_SET_SIZE);
-
-             ssize_t bytes_written = pwrite(fd, buffer, CHECKPOINT_SLOT_SIZE, offset);
-             if (bytes_written != CHECKPOINT_SLOT_SIZE) {
-                 perror("Error writing combined checkpoint to log");
+             
+             ssize_t bytes_written;
+             // Write header.
+             bytes_written = pwrite(fd, &header, sizeof(header), offset);
+             if (bytes_written != sizeof(header)) {
+                perror("Error writing header in commit thread");
+             }
+             // Write state snapshot.
+             bytes_written = pwrite(fd, job->state_snapshot, sizeof(int64_t) * STATE_CHUNK_COUNT, offset + sizeof(header));
+             if (bytes_written != sizeof(int64_t) * STATE_CHUNK_COUNT) {
+                perror("Error writing state snapshot in commit thread");
+             }
+             // Write transactions (the write-set).
+             bytes_written = pwrite(fd, job->transactions, sizeof(Transaction) * BATCH_SIZE,
+                                    offset + sizeof(header) + STATE_CHUNK_SIZE);
+             if (bytes_written != sizeof(Transaction) * BATCH_SIZE) {
+                perror("Error writing transactions in commit thread");
              }
              fsync(fd);
-
-             free(buffer);
              free(job->state_snapshot);
-             free(job->transactions);
+             free(job->transactions);  // Free the transaction batch.
              free(job);
          }
     }
@@ -319,6 +314,7 @@ void* transaction_reader_thread_func(void* arg) {
          size_t items = fread(batch, sizeof(Transaction), BATCH_SIZE, fp);
          if (items != BATCH_SIZE) {
               if (feof(fp)) {
+                 // End-of-file reached; free batch and exit loop.
                  free(batch);
                  break;
               } else {
@@ -345,7 +341,7 @@ int compare_doubles(const void *a, const void *b) {
 }
 
 // ----------------------
-// Reconstruction function.
+// Reconstruction function (unchanged from original).
 // ----------------------
 int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     uint32_t latest_batch = 0;
@@ -391,7 +387,7 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
     
-    // Attempt to reconstruct state from an existing log file.
+    // If an old log file exists, attempt to reconstruct the state.
     int recovered_batch = -1;
     int log_fd = open(LOG_FILE, O_RDWR);
     if (log_fd >= 0) {
@@ -420,10 +416,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     
-    // Pre-allocate the log file if needed.
+    // Pre-allocate the log file (if not already large enough).
     preallocate_log_file_posix(LOG_FILE);
     
-    // Initialize transaction queue and start the transaction reader thread.
+    // Initialize transaction queue and start transaction reader thread.
     TransactionQueue transaction_queue;
     init_transaction_queue(&transaction_queue, NUMBER_OF_BATCHES);
     
@@ -454,7 +450,7 @@ int main(int argc, char **argv) {
     }
     double total_processing_time = 0.0;
     
-    // Processing loop (verbose per-batch logging removed).
+    // Processing loop.
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double start_time = get_time_ms();
         
@@ -477,7 +473,7 @@ int main(int argc, char **argv) {
             break;
         }
         
-        // Create and enqueue a commit job.
+        // Create a commit job.
         CommitJob *job = malloc(sizeof(CommitJob));
         if (!job) {
             perror("Error allocating commit job");
@@ -486,12 +482,16 @@ int main(int argc, char **argv) {
         job->batch_num = batch_num;
         job->state_snapshot = state_snapshot;
         job->transactions = transaction_batch;
+        
+        // Enqueue the commit job.
         enqueue_job(&commit_queue, job);
         
         double end_time = get_time_ms();
         double batch_duration = end_time - start_time;
         batch_times[batch_num] = batch_duration;
         total_processing_time += batch_duration;
+        
+        printf("Batch %u processed in %.3f ms.\n", batch_num, batch_duration);
     }
     
     // Signal commit thread that no more jobs will be enqueued.
@@ -504,7 +504,7 @@ int main(int argc, char **argv) {
     pthread_join(commit_thread, NULL);
     pthread_join(transaction_reader_thread, NULL);
     
-    // Compute and print performance metrics.
+    // Compute performance metrics.
     double average = total_processing_time / NUMBER_OF_BATCHES;
     double *sorted_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!sorted_times) {
