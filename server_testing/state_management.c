@@ -268,7 +268,7 @@ void* commit_thread_func(void* arg) {
              header.write_set_count = BATCH_SIZE;
              header.reserved = 0;
              
-             uint64_t bytes_written;
+             ssize_t bytes_written;
              // Write header.
              bytes_written = pwrite(fd, &header, sizeof(header), offset);
              if (bytes_written != sizeof(header)) {
@@ -490,6 +490,8 @@ int main(int argc, char **argv) {
         double batch_duration = end_time - start_time;
         batch_times[batch_num] = batch_duration;
         total_processing_time += batch_duration;
+        
+        printf("Batch %u processed in %.3f ms.\n", batch_num, batch_duration);
     }
     
     // Signal commit thread that no more jobs will be enqueued.
