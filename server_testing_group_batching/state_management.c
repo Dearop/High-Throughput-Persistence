@@ -514,15 +514,17 @@ int main(int argc, char **argv) {
             // Process each transaction: update the state and record the updated balances.
             for (int j = 0; j < BATCH_SIZE; j++) {
                 Transaction txn = transaction_batch[j];
-                // Apply the transaction to the state.
-                state[txn.sender] -= txn.amount;
-                state[txn.receiver] += txn.amount;
-                
-                // Record the updated balances in the write-set.
-                write_set[j].sender_address = txn.sender;
-                write_set[j].sender_balance = (uint32_t) state[txn.sender];
-                write_set[j].receiver_address = txn.receiver;
-                write_set[j].receiver_balance = (uint32_t) state[txn.receiver];
+                if(state[txn.sender] > 0){
+                    // Apply the transaction to the state.
+                    state[txn.sender] -= txn.amount;
+                    state[txn.receiver] += txn.amount;
+
+                    // Record the updated balances in the write-set.
+                    write_set[j].sender_address = txn.sender;
+                    write_set[j].sender_balance = (uint32_t) state[txn.sender];
+                    write_set[j].receiver_address = txn.receiver;
+                    write_set[j].receiver_balance = (uint32_t) state[txn.receiver];
+                }
             }
             // Free the original transaction batch now that we've built the write-set.
             free(transaction_batch);
