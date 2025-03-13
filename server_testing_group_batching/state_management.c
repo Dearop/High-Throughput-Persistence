@@ -420,7 +420,7 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
 // Main function.
 // ----------------------
 int main(int argc, char **argv) {
-    clock_t start = clock();
+    u_int64_t start = get_time_ms();
     // Allocate the state array.
     int64_t *state = calloc(SMALL_ACCOUNT_COUNT + 1, sizeof(int64_t));
     if (!state) {
@@ -612,8 +612,7 @@ int main(int argc, char **argv) {
     destroy_commit_queue(&commit_queue);
     destroy_transaction_group_queue(&transaction_group_queue);
     
-    clock_t end = clock();
-    double total_time_ms = (double)(end - start) * 1000 / CLOCKS_PER_SEC;
-    printf("Total time taken: %.3f ms\n", total_time_ms);
+    u_int64_t end = get_time_ms();
+    printf("Total time taken: %.3f ms\n", end - start);
     return 0;
 }
