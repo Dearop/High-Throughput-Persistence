@@ -12,11 +12,11 @@
 // Definitions and constants.
 #define BATCH_SIZE          (1 << 16)            // 2^16 transactions per batch
 #define NUMBER_OF_BATCHES   5000                   // Number of batches
-#define SMALL_ACCOUNT_COUNT 2000000UL            // Total number of accounts
+#define SMALL_ACCOUNT_COUNT 2000000UL              // Total number of accounts
 
 // Ring log parameters.
-#define RING_SIZE         8                      // Number of checkpoint slots in the log.
-#define STATE_CHUNK_SIZE  (512 * 1024)           // 512KB state chunk per checkpoint.
+#define RING_SIZE         8                        // Number of checkpoint slots in the log.
+#define STATE_CHUNK_SIZE  (512 * 1024)             // 512KB state chunk per checkpoint.
 #define STATE_CHUNK_COUNT (STATE_CHUNK_SIZE / sizeof(int64_t))  // Number of int64_t elements in the state chunk.
     
 // Write-set size is the batch of transactions.
@@ -25,7 +25,10 @@
 // A checkpoint slot consists of a header, the state chunk, and the write-set.
 #define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
 #define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
-#define LOG_FILE          "checkpoint_log.dat"   // Single log file with ring structure.
+#define LOG_FILE          "checkpoint_log.dat"     // Single log file with ring structure.
+
+// Backpressure threshold: if the commit queue reaches this many jobs, slow down reading.
+#define COMMIT_QUEUE_THRESHOLD 100
 
 // Dummy transaction structure.
 typedef struct {
@@ -142,9 +145,9 @@ void init_commit_queue(CommitQueue *queue, int capacity) {
 
 void enqueue_job(CommitQueue *queue, CommitJob *job) {
     pthread_mutex_lock(&queue->mutex);
-    if (queue->size == queue->capacity) {
-        fprintf(stderr, "Commit queue full, exiting.\n");
-        exit(EXIT_FAILURE);
+    // Instead of immediately exiting when full, wait until there is space.
+    while (queue->size == queue->capacity) {
+         pthread_cond_wait(&queue->cond, &queue->mutex);
     }
     queue->jobs[queue->rear] = job;
     queue->rear = (queue->rear + 1) % queue->capacity;
@@ -159,6 +162,8 @@ CommitJob* dequeue_job(CommitQueue *queue) {
         job = queue->jobs[queue->front];
         queue->front = (queue->front + 1) % queue->capacity;
         queue->size--;
+        // Signal waiting producers that space is available.
+        pthread_cond_signal(&queue->cond);
     }
     return job;
 }
@@ -268,7 +273,7 @@ void* commit_thread_func(void* arg) {
              header.write_set_count = BATCH_SIZE;
              header.reserved = 0;
              
-             ssize_t bytes_written;
+             uint64_t bytes_written;
              // Write header.
              bytes_written = pwrite(fd, &header, sizeof(header), offset);
              if (bytes_written != sizeof(header)) {
@@ -287,7 +292,7 @@ void* commit_thread_func(void* arg) {
              }
              fsync(fd);
              free(job->state_snapshot);
-             free(job->transactions);  // Free the transaction batch.
+             free(job->transactions);
              free(job);
          }
     }
@@ -314,7 +319,6 @@ void* transaction_reader_thread_func(void* arg) {
          size_t items = fread(batch, sizeof(Transaction), BATCH_SIZE, fp);
          if (items != BATCH_SIZE) {
               if (feof(fp)) {
-                 // End-of-file reached; free batch and exit loop.
                  free(batch);
                  break;
               } else {
@@ -341,7 +345,7 @@ int compare_doubles(const void *a, const void *b) {
 }
 
 // ----------------------
-// Reconstruction function (unchanged from original).
+// Reconstruction function.
 // ----------------------
 int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     uint32_t latest_batch = 0;
@@ -472,6 +476,15 @@ int main(int argc, char **argv) {
             free(state_snapshot);
             break;
         }
+        
+        // Backpressure: if the commit queue is too full, wait to let processing catch up.
+        pthread_mutex_lock(&commit_queue.mutex);
+        while (commit_queue.size >= COMMIT_QUEUE_THRESHOLD) {
+            pthread_mutex_unlock(&commit_queue.mutex);
+            usleep(1000);  // sleep for 1ms
+            pthread_mutex_lock(&commit_queue.mutex);
+        }
+        pthread_mutex_unlock(&commit_queue.mutex);
         
         // Create a commit job.
         CommitJob *job = malloc(sizeof(CommitJob));
