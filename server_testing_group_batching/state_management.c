@@ -22,15 +22,19 @@
 #define STATE_CHUNK_SIZE  (512 * 1024)           // 512KB state chunk per checkpoint.
 #define STATE_CHUNK_COUNT (STATE_CHUNK_SIZE / sizeof(int64_t))  // Number of int64_t elements.
     
-// Write-set size is the batch of transactions.
-#define WRITE_SET_SIZE    (BATCH_SIZE * sizeof(Transaction))
+// New write-set structure that will be stored in the log.
+// This structure will contain the final balances for the sender and receiver after each transaction is applied.
+typedef struct {
+    uint64_t sender_address;
+    uint32_t sender_balance;
+    uint64_t receiver_address;
+    uint32_t receiver_balance;
+} TransactionWriteSet;
 
-// A checkpoint slot consists of a header, the state chunk, and the write-set.
-#define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
-#define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
-#define LOG_FILE          "checkpoint_log.dat"   // Single log file with ring structure.
+// Write-set size is now computed based on TransactionWriteSet.
+#define WRITE_SET_SIZE    (BATCH_SIZE * sizeof(TransactionWriteSet))
 
-// Dummy transaction structure.
+// Dummy transaction structure (remains unchanged for reading from transactions.bin).
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
@@ -93,7 +97,7 @@ void preallocate_log_file_posix(const char *filename) {
          exit(EXIT_FAILURE);
     }
     off_t fsize = st.st_size;
-    off_t expected = RING_SIZE * CHECKPOINT_SLOT_SIZE;
+    off_t expected = RING_SIZE * (sizeof(CheckpointHeader) + STATE_CHUNK_SIZE + WRITE_SET_SIZE);
     if (fsize < expected) {
          if (ftruncate(fd, expected) != 0) {
               perror("ftruncate error");
@@ -105,15 +109,17 @@ void preallocate_log_file_posix(const char *filename) {
     close(fd);
 }
 
+#define LOG_FILE          "checkpoint_log.dat"   // Single log file with ring structure.
+
 // ----------------------
 // Structures for parallel commit
 // ----------------------
 
-// Each commit job contains the batch number, a copy of the state chunk, and a pointer to the transaction batch.
+// Each commit job contains the batch number, a copy of the state chunk, and the computed transaction write-set.
 typedef struct {
     uint32_t batch_num;
-    int64_t *state_snapshot;   // Should have STATE_CHUNK_COUNT elements.
-    Transaction *transactions; // Transaction batch pointer.
+    int64_t *state_snapshot;          // Should have STATE_CHUNK_COUNT elements.
+    TransactionWriteSet *write_set;   // Computed write-set pointer.
 } CommitJob;
 
 // A simple thread-safe queue for commit jobs.
@@ -269,7 +275,7 @@ void* commit_thread_func(void* arg) {
          if (job) {
              // Compute ring slot offset.
              uint32_t slot_index = job->batch_num % RING_SIZE;
-             off_t offset = slot_index * CHECKPOINT_SLOT_SIZE;
+             off_t offset = slot_index * (sizeof(CheckpointHeader) + STATE_CHUNK_SIZE + WRITE_SET_SIZE);
              // Prepare checkpoint header.
              CheckpointHeader header;
              header.batch_num = job->batch_num;
@@ -288,15 +294,15 @@ void* commit_thread_func(void* arg) {
              if (bytes_written != sizeof(int64_t) * STATE_CHUNK_COUNT) {
                 perror("Error writing state snapshot in commit thread");
              }
-             // Write transactions (the write-set).
-             bytes_written = pwrite(fd, job->transactions, sizeof(Transaction) * BATCH_SIZE,
+             // Write transaction write-set.
+             bytes_written = pwrite(fd, job->write_set, sizeof(TransactionWriteSet) * BATCH_SIZE,
                                     offset + sizeof(header) + STATE_CHUNK_SIZE);
-             if (bytes_written != sizeof(Transaction) * BATCH_SIZE) {
-                perror("Error writing transactions in commit thread");
+             if (bytes_written != sizeof(TransactionWriteSet) * BATCH_SIZE) {
+                perror("Error writing transaction write-set in commit thread");
              }
              fsync(fd);
              free(job->state_snapshot);
-             free(job->transactions);  // Free the transaction batch.
+             free(job->write_set);
              free(job);
          }
     }
@@ -385,7 +391,7 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     
     // Scan all slots in the ring.
     for (uint32_t i = 0; i < RING_SIZE; i++) {
-        off_t offset = i * CHECKPOINT_SLOT_SIZE;
+        off_t offset = i * (sizeof(CheckpointHeader) + STATE_CHUNK_SIZE + WRITE_SET_SIZE);
         ssize_t bytes = pread(fd, &header, sizeof(header), offset);
         if (bytes != sizeof(header))
             continue;
@@ -400,7 +406,7 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
         printf("No valid checkpoint found in log.\n");
         return -1;
     }
-    off_t offset = latest_slot * CHECKPOINT_SLOT_SIZE + sizeof(CheckpointHeader);
+    off_t offset = latest_slot * (sizeof(CheckpointHeader) + STATE_CHUNK_SIZE + WRITE_SET_SIZE) + sizeof(CheckpointHeader);
     ssize_t read_bytes = pread(fd, state, sizeof(int64_t) * STATE_CHUNK_COUNT, offset);
     if (read_bytes != sizeof(int64_t) * STATE_CHUNK_COUNT) {
         perror("Error reading state chunk during reconstruction");
@@ -455,7 +461,6 @@ int main(int argc, char **argv) {
     preallocate_log_file_posix(LOG_FILE);
     
     // Initialize transaction group queue and start transaction reader thread.
-    // Here, we set the queue capacity to NUMBER_OF_BATCHES / BATCH_GROUP_SIZE (rounded up).
     int group_queue_capacity = (NUMBER_OF_BATCHES + BATCH_GROUP_SIZE - 1) / BATCH_GROUP_SIZE;
     TransactionGroupQueue transaction_group_queue;
     init_transaction_group_queue(&transaction_group_queue, group_queue_capacity);
@@ -495,8 +500,32 @@ int main(int argc, char **argv) {
             break;
         for (int i = 0; i < group->num_batches; i++) {
             double start_time_ms = get_time_ms();
-            // Dummy update to state.
-            state[0] += BATCH_SIZE;
+            
+            // Retrieve the transaction batch from the group.
+            Transaction *transaction_batch = group->batches[i];
+            
+            // Allocate a write-set array to record updated balances for each transaction.
+            TransactionWriteSet *write_set = malloc(BATCH_SIZE * sizeof(TransactionWriteSet));
+            if (!write_set) {
+                perror("Error allocating transaction write-set");
+                exit(EXIT_FAILURE);
+            }
+            
+            // Process each transaction: update the state and record the updated balances.
+            for (int j = 0; j < BATCH_SIZE; j++) {
+                Transaction txn = transaction_batch[j];
+                // Apply the transaction to the state.
+                state[txn.sender] -= txn.amount;
+                state[txn.receiver] += txn.amount;
+                
+                // Record the updated balances in the write-set.
+                write_set[j].sender_address = txn.sender;
+                write_set[j].sender_balance = (uint32_t) state[txn.sender];
+                write_set[j].receiver_address = txn.receiver;
+                write_set[j].receiver_balance = (uint32_t) state[txn.receiver];
+            }
+            // Free the original transaction batch now that we've built the write-set.
+            free(transaction_batch);
             
             // Create a snapshot of the state chunk.
             int64_t *state_snapshot = malloc(STATE_CHUNK_SIZE);
@@ -506,9 +535,6 @@ int main(int argc, char **argv) {
             }
             memcpy(state_snapshot, state, STATE_CHUNK_SIZE);
             
-            // Retrieve the transaction batch from the group.
-            Transaction *transaction_batch = group->batches[i];
-            
             // Create a commit job.
             CommitJob *job = malloc(sizeof(CommitJob));
             if (!job) {
@@ -517,7 +543,7 @@ int main(int argc, char **argv) {
             }
             job->batch_num = processed_batches;
             job->state_snapshot = state_snapshot;
-            job->transactions = transaction_batch;
+            job->write_set = write_set;
             
             // Enqueue the commit job.
             enqueue_job(&commit_queue, job);
