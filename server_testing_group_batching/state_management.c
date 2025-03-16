@@ -613,6 +613,6 @@ int main(int argc, char **argv) {
     destroy_transaction_group_queue(&transaction_group_queue);
     
     u_int64_t end = get_time_ms();
-    printf("Total time taken: %.3f ms\n", end - start);
+    printf("Total time taken: %%lld.3 ms\n", end - start);
     return 0;
 }
