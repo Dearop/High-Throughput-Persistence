@@ -8,8 +8,12 @@
 #define NUMBER_OF_BATCHES 5000      // Total number of batches to generate
 #define TX_FILE "transactions.bin"
 #define SMALL_ACCOUNT_COUNT 2000000UL   
+// Use a high bit (bit 63) to mark an expensive transaction.
+#define EXPENSIVE_FLAG (1ULL << 63)
+// Set probability (in percent) for a transaction to be marked expensive.
+#define EXPENSIVE_PROB 5
 
-// Transaction structure remains small.
+// Transaction structure remains the same.
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
@@ -57,13 +61,18 @@ int main(void) {
                 while (idx_receiver == idx_sender) {
                     idx_receiver = rand_r(&seed) % SMALL_ACCOUNT_COUNT;
                 }
-                batch[i].sender   = addresses[idx_sender];
+                // With EXPENSIVE_PROB% chance, mark this transaction as expensive.
+                if (rand_r(&seed) % 100 < EXPENSIVE_PROB) {
+                    batch[i].sender = addresses[idx_sender] | EXPENSIVE_FLAG;
+                } else {
+                    batch[i].sender = addresses[idx_sender];
+                }
                 batch[i].receiver = addresses[idx_receiver];
-                batch[i].amount   = rand_r(&seed) % (1 << 16);
+                batch[i].amount = rand_r(&seed) % (1 << 16);
             }
         }
         
-        // File writing remains sequential.
+        // Write the batch sequentially.
         size_t written = fwrite(batch, sizeof(Transaction), BATCH_SIZE, txFile);
         if (written != BATCH_SIZE) {
             perror("Error writing transaction batch");

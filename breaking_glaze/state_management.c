@@ -11,6 +11,8 @@
 #define BATCH_SIZE          (1 << 16)            // 2^16 transactions per batch
 #define NUMBER_OF_BATCHES   5000                   // Number of batches
 #define SMALL_ACCOUNT_COUNT 2000000UL            // Total number of accounts
+// Must match the generator flag.
+#define EXPENSIVE_FLAG      (1ULL << 63)          
 
 // Ring log parameters.
 #define RING_SIZE         8                      // Number of checkpoint slots in the log.
@@ -133,8 +135,7 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     return 0;
 }
 
-// Expensive operation: allocate a large temporary buffer and memset it.
-// This function is called for every transaction.
+// An expensive operation called for expensive transactions.
 void expensive_operation(void) {
     const size_t EXPENSIVE_SIZE = 1 << 20; // 1 MB
     char *buffer = malloc(EXPENSIVE_SIZE);
@@ -144,15 +145,22 @@ void expensive_operation(void) {
     }
 }
 
-// Apply function: update state according to a transaction, then call an expensive operation.
+// Apply function: process the transaction, checking for an expensive flag.
 void apply(const Transaction *tx, int64_t *state) {
-    // Standard balance update.
-    if (tx->sender < SMALL_ACCOUNT_COUNT)
-         state[tx->sender] -= tx->amount;
+    uint64_t sender = tx->sender;
+    int is_expensive = 0;
+    // Check if the expensive flag is set.
+    if (sender & EXPENSIVE_FLAG) {
+        is_expensive = 1;
+        sender &= ~EXPENSIVE_FLAG; // Clear the flag before using the sender.
+    }
+    if (sender < SMALL_ACCOUNT_COUNT)
+         state[sender] -= tx->amount;
     if (tx->receiver < SMALL_ACCOUNT_COUNT)
          state[tx->receiver] += tx->amount;
-    // Additionally, perform a heavy memory operation.
-    expensive_operation();
+    if (is_expensive) {
+         expensive_operation();
+    }
 }
 
 // For performance metrics: compare two doubles.
@@ -199,10 +207,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     
-    // Pre-allocate the log file (if not already large enough).
+    // Pre-allocate the log file.
     preallocate_log_file_posix(LOG_FILE);
     
-    // Open the log file for writing checkpoints.
+    // Open the log file for writing.
     int fd_log = open(LOG_FILE, O_RDWR);
     if (fd_log < 0) {
          perror("Error opening log file for writing");
@@ -219,7 +227,6 @@ int main(int argc, char **argv) {
          exit(EXIT_FAILURE);
     }
     
-    // Array for collecting batch processing times.
     double *batch_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!batch_times) {
         perror("Error allocating batch_times");
@@ -234,7 +241,6 @@ int main(int argc, char **argv) {
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double start_time_ms = get_time_ms();
         
-        // Read a transaction batch from the transactions file.
         Transaction *transaction_batch = malloc(BATCH_SIZE * sizeof(Transaction));
         if (!transaction_batch) {
             perror("Failed to allocate transaction batch");
@@ -252,12 +258,10 @@ int main(int argc, char **argv) {
             }
         }
         
-        // Apply each transaction to the state.
         for (unsigned int i = 0; i < BATCH_SIZE; i++) {
             apply(&transaction_batch[i], state);
         }
         
-        // Create a snapshot of the state chunk.
         int64_t *state_snapshot = malloc(STATE_CHUNK_SIZE);
         if (!state_snapshot) {
             perror("Error allocating state snapshot");
@@ -265,10 +269,8 @@ int main(int argc, char **argv) {
         }
         memcpy(state_snapshot, state, STATE_CHUNK_SIZE);
         
-        // Compute ring slot offset.
         uint32_t slot_index = batch_num % RING_SIZE;
         off_t offset = slot_index * CHECKPOINT_SLOT_SIZE;
-        // Prepare checkpoint header.
         CheckpointHeader header;
         header.batch_num = batch_num;
         header.state_chunk_count = STATE_CHUNK_COUNT;
@@ -276,17 +278,14 @@ int main(int argc, char **argv) {
         header.reserved = 0;
         
         ssize_t bytes_written;
-        // Write header.
         bytes_written = pwrite(fd_log, &header, sizeof(header), offset);
         if (bytes_written != sizeof(header)) {
             perror("Error writing header");
         }
-        // Write state snapshot.
         bytes_written = pwrite(fd_log, state_snapshot, sizeof(int64_t) * STATE_CHUNK_COUNT, offset + sizeof(header));
         if (bytes_written != sizeof(int64_t) * STATE_CHUNK_COUNT) {
             perror("Error writing state snapshot");
         }
-        // Write transactions (the write-set).
         bytes_written = pwrite(fd_log, transaction_batch, sizeof(Transaction) * BATCH_SIZE,
                                offset + sizeof(header) + STATE_CHUNK_SIZE);
         if (bytes_written != sizeof(Transaction) * BATCH_SIZE) {
@@ -306,11 +305,9 @@ int main(int argc, char **argv) {
     }
     uint64_t end = get_time_ms();
     
-    // Clean up file handles.
     fclose(fp_transactions);
     close(fd_log);
     
-    // Compute performance metrics.
     double average = total_processing_time / NUMBER_OF_BATCHES;
     double *sorted_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!sorted_times) {
@@ -332,7 +329,6 @@ int main(int argc, char **argv) {
     printf("90th percentile batch time: %.3f ms\n", p90);
     printf("99th percentile batch time: %.3f ms\n", p99);
     
-    // Compute and write final state chunk hash.
     uint64_t state_hash = fnv1a_hash(state, STATE_CHUNK_COUNT);
     printf("Final state chunk hash: %llu\n", state_hash);
     FILE *hash_fp = fopen("state_hash.dat", "wb");
