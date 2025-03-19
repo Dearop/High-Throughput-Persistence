@@ -149,7 +149,7 @@ int compare_doubles(const void *a, const void *b) {
 
 // Main function using a single thread.
 int main(int argc, char **argv) {
-    clock_t start = clock();
+    clock_t start = get_time_ms();
     // Allocate the state array.
     int64_t *state = calloc(SMALL_ACCOUNT_COUNT + 1, sizeof(int64_t));
     if (!state) {
@@ -334,8 +334,7 @@ int main(int argc, char **argv) {
     free(batch_times);
     free(sorted_times);
     
-    clock_t end = clock();
-    double total_time_ms = (double)(end - start) * 1000 / CLOCKS_PER_SEC;
-    printf("Total time taken: %.3f ms\n", total_time_ms);
+    clock_t end = get_time_ms();
+    printf("Total time taken: %.3f ms\n", end - start);
     return 0;
 }
