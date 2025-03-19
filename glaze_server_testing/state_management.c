@@ -334,6 +334,6 @@ int main(int argc, char **argv) {
     free(batch_times);
     free(sorted_times);
     
-    printf("Total time taken: %.3f ms\n", end - start);
+    printf("Total time taken: %.3ld ms\n", end - start);
     return 0;
 }
