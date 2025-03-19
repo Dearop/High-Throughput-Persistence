@@ -12,7 +12,7 @@
 #define NUMBER_OF_BATCHES   5000                   // Number of batches
 #define SMALL_ACCOUNT_COUNT 2000000UL            // Total number of accounts
 // Must match the generator flag.
-#define EXPENSIVE_FLAG      (1ULL << 63)          
+#define EXPENSIVE_FLAG      (1ULL << 32)          
 
 // Ring log parameters.
 #define RING_SIZE         8                      // Number of checkpoint slots in the log.

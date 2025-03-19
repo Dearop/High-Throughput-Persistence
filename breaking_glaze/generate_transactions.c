@@ -9,7 +9,7 @@
 #define TX_FILE "transactions.bin"
 #define SMALL_ACCOUNT_COUNT 2000000UL   
 // Use the high bit (bit 63) to mark an expensive transaction.
-#define EXPENSIVE_FLAG (1ULL << 63)
+#define EXPENSIVE_FLAG (1ULL << 32)
 // Set probability (in percent) for a transaction to be marked expensive.
 #define EXPENSIVE_PROB 5
 
