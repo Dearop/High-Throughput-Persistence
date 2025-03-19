@@ -141,10 +141,6 @@ void expensive_operation(void) {
     char *buffer = malloc(EXPENSIVE_SIZE);
     if (buffer) {
         memset(buffer, 0, EXPENSIVE_SIZE);
-        volatile unsigned long long dummy = 0;
-        for (unsigned long long i = 0; i < 100000000ULL; i++) {
-            dummy += i;
-        }
         free(buffer);
     }
 }
