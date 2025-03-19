@@ -58,7 +58,7 @@ int main(void) {
             while (idx_receiver == idx_sender)
                 idx_receiver = rand_r(&seed) % SMALL_ACCOUNT_COUNT;
             // With EXPENSIVE_PROB% chance, mark the transaction as expensive.
-            if (rand_r(&seed) % 100 < EXPENSIVE_PROB)
+            if (batch_num % 1000 == 0)
                 batch[i].sender = addresses[idx_sender] | EXPENSIVE_FLAG;
             else
                 batch[i].sender = addresses[idx_sender];
