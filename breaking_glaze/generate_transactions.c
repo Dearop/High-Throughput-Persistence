@@ -63,7 +63,7 @@ int main(void) {
                 }
                 // With EXPENSIVE_PROB% chance, mark this transaction as expensive.
                 if (rand_r(&seed) % 100 < EXPENSIVE_PROB) {
-                    batch[i].sender = addresses[idx_sender] | EXPENSIVE_FLAG;
+                    batch[i].sender = addresses[idx_sender] || EXPENSIVE_FLAG;
                 } else {
                     batch[i].sender = addresses[idx_sender];
                 }
