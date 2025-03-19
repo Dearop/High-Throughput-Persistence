@@ -8,10 +8,10 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-// Definitions and constants.
 #define BATCH_SIZE          (1 << 16)            // 2^16 transactions per batch
 #define NUMBER_OF_BATCHES   5000                   // Number of batches
 #define SMALL_ACCOUNT_COUNT 2000000UL            // Total number of accounts
+#define PAYLOAD_SIZE        (1 << 12)            // Must match generator: 4096 integers per transaction
 
 // Ring log parameters.
 #define RING_SIZE         8                      // Number of checkpoint slots in the log.
@@ -26,22 +26,12 @@
 #define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
 #define LOG_FILE          "checkpoint_log.dat"   // Single log file with ring structure.
 
-// Define transaction types.
-typedef enum {
-    TX_TRANSFER = 0,
-    TX_MASS_ZERO = 1
-} TxType;
-
-// Updated transaction structure.
+// Updated transaction structure with huge payload.
 typedef struct {
-    uint32_t op_type; // TX_TRANSFER or TX_MASS_ZERO
-    // For TX_TRANSFER:
     uint64_t sender;
     uint64_t receiver;
     uint32_t amount;
-    // For TX_MASS_ZERO:
-    uint64_t start_index;
-    uint64_t length;
+    int payload[PAYLOAD_SIZE];
 } Transaction;
 
 // Checkpoint header structure.
@@ -66,7 +56,7 @@ uint64_t fnv1a_hash(int64_t *data, size_t len) {
     return hash;
 }
 
-// Returns current wall-clock time in milliseconds.
+// Returns current time in milliseconds.
 double get_time_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -112,7 +102,7 @@ void preallocate_log_file_posix(const char *filename) {
     close(fd);
 }
 
-// Reconstruction function (unchanged from original).
+// Reconstruction function.
 int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     uint32_t latest_batch = 0;
     int latest_slot = -1;
@@ -147,24 +137,14 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
 
 // Apply function: update state according to a transaction.
 void apply(const Transaction *tx, int64_t *state) {
-    if (tx->op_type == TX_TRANSFER) {
-        // For transfers, subtract amount from sender and add to receiver.
-        if (tx->sender < SMALL_ACCOUNT_COUNT)
-             state[tx->sender] -= tx->amount;
-        if (tx->receiver < SMALL_ACCOUNT_COUNT)
-             state[tx->receiver] += tx->amount;
-    } else if (tx->op_type == TX_MASS_ZERO) {
-        // For mass-zero transactions, zero out a region of the state.
-        if (tx->start_index < SMALL_ACCOUNT_COUNT) {
-            uint64_t len = tx->length;
-            if (tx->start_index + len > SMALL_ACCOUNT_COUNT)
-                len = SMALL_ACCOUNT_COUNT - tx->start_index;
-            memset(state + tx->start_index, 0, len * sizeof(int64_t));
-        }
-    }
+    // For simplicity, apply only the basic balance update.
+    if (tx->sender < SMALL_ACCOUNT_COUNT)
+         state[tx->sender] -= tx->amount;
+    if (tx->receiver < SMALL_ACCOUNT_COUNT)
+         state[tx->receiver] += tx->amount;
 }
 
-// For performance metrics: compare two doubles.
+// Compare function for qsort.
 int compare_doubles(const void *a, const void *b) {
     double diff = (*(double *)a) - (*(double *)b);
     return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
@@ -219,7 +199,7 @@ int main(int argc, char **argv) {
          exit(EXIT_FAILURE);
     }
     
-    // Open transactions file for reading.
+    // Open the transactions file for reading.
     FILE *fp_transactions = fopen("transactions.bin", "rb");
     if (!fp_transactions) {
          perror("Error opening transactions.bin for reading");
@@ -243,7 +223,7 @@ int main(int argc, char **argv) {
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double start_time_ms = get_time_ms();
         
-        // Read a transaction batch from the transactions file.
+        // Read a transaction batch from the file.
         Transaction *transaction_batch = malloc(BATCH_SIZE * sizeof(Transaction));
         if (!transaction_batch) {
             perror("Failed to allocate transaction batch");
@@ -295,7 +275,7 @@ int main(int argc, char **argv) {
         if (bytes_written != sizeof(int64_t) * STATE_CHUNK_COUNT) {
             perror("Error writing state snapshot");
         }
-        // Write transactions (the write-set).
+        // Write the transaction batch (the write-set).
         bytes_written = pwrite(fd_log, transaction_batch, sizeof(Transaction) * BATCH_SIZE,
                                offset + sizeof(header) + STATE_CHUNK_SIZE);
         if (bytes_written != sizeof(Transaction) * BATCH_SIZE) {
@@ -314,7 +294,7 @@ int main(int argc, char **argv) {
         printf("Batch %u processed in %.3f ms.\n", batch_num, batch_duration);
     }
     uint64_t end = get_time_ms();
-
+    
     // Clean up file handles.
     fclose(fp_transactions);
     close(fd_log);
@@ -352,7 +332,6 @@ int main(int argc, char **argv) {
         perror("Error opening state_hash.dat for writing");
     }
     
-    // Clean up.
     free(state);
     free(batch_times);
     free(sorted_times);
