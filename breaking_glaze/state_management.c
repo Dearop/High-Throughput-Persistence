@@ -11,7 +11,6 @@
 #define BATCH_SIZE          (1 << 16)            // 2^16 transactions per batch
 #define NUMBER_OF_BATCHES   5000                   // Number of batches
 #define SMALL_ACCOUNT_COUNT 2000000UL            // Total number of accounts
-#define PAYLOAD_SIZE        (1 << 12)            // Must match generator: 4096 integers per transaction
 
 // Ring log parameters.
 #define RING_SIZE         8                      // Number of checkpoint slots in the log.
@@ -26,12 +25,11 @@
 #define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
 #define LOG_FILE          "checkpoint_log.dat"   // Single log file with ring structure.
 
-// Updated transaction structure with huge payload.
+// Transaction structure remains unchanged.
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
     uint32_t amount;
-    int payload[PAYLOAD_SIZE];
 } Transaction;
 
 // Checkpoint header structure.
@@ -135,16 +133,29 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     return 0;
 }
 
-// Apply function: update state according to a transaction.
+// Expensive operation: allocate a large temporary buffer and memset it.
+// This function is called for every transaction.
+void expensive_operation(void) {
+    const size_t EXPENSIVE_SIZE = 1 << 20; // 1 MB
+    char *buffer = malloc(EXPENSIVE_SIZE);
+    if (buffer) {
+        memset(buffer, 0, EXPENSIVE_SIZE);
+        free(buffer);
+    }
+}
+
+// Apply function: update state according to a transaction, then call an expensive operation.
 void apply(const Transaction *tx, int64_t *state) {
-    // For simplicity, apply only the basic balance update.
+    // Standard balance update.
     if (tx->sender < SMALL_ACCOUNT_COUNT)
          state[tx->sender] -= tx->amount;
     if (tx->receiver < SMALL_ACCOUNT_COUNT)
          state[tx->receiver] += tx->amount;
+    // Additionally, perform a heavy memory operation.
+    expensive_operation();
 }
 
-// Compare function for qsort.
+// For performance metrics: compare two doubles.
 int compare_doubles(const void *a, const void *b) {
     double diff = (*(double *)a) - (*(double *)b);
     return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
@@ -199,7 +210,7 @@ int main(int argc, char **argv) {
          exit(EXIT_FAILURE);
     }
     
-    // Open the transactions file for reading.
+    // Open transactions file for reading.
     FILE *fp_transactions = fopen("transactions.bin", "rb");
     if (!fp_transactions) {
          perror("Error opening transactions.bin for reading");
@@ -223,7 +234,7 @@ int main(int argc, char **argv) {
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double start_time_ms = get_time_ms();
         
-        // Read a transaction batch from the file.
+        // Read a transaction batch from the transactions file.
         Transaction *transaction_batch = malloc(BATCH_SIZE * sizeof(Transaction));
         if (!transaction_batch) {
             perror("Failed to allocate transaction batch");
@@ -275,7 +286,7 @@ int main(int argc, char **argv) {
         if (bytes_written != sizeof(int64_t) * STATE_CHUNK_COUNT) {
             perror("Error writing state snapshot");
         }
-        // Write the transaction batch (the write-set).
+        // Write transactions (the write-set).
         bytes_written = pwrite(fd_log, transaction_batch, sizeof(Transaction) * BATCH_SIZE,
                                offset + sizeof(header) + STATE_CHUNK_SIZE);
         if (bytes_written != sizeof(Transaction) * BATCH_SIZE) {

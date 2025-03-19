@@ -2,29 +2,28 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
-#include <omp.h>
+#include <omp.h>    
 
-#define BATCH_SIZE (1 << 16)       // 2^16 transactions per batch
-#define NUMBER_OF_BATCHES 5000       // Total number of batches to generate
+#define BATCH_SIZE (1 << 16)      // 2^16 transactions per batch
+#define NUMBER_OF_BATCHES 5000      // Total number of batches to generate
 #define TX_FILE "transactions.bin"
-#define SMALL_ACCOUNT_COUNT 2000000UL
-#define PAYLOAD_SIZE (1 << 12)       // 4096 integers per transaction
+#define SMALL_ACCOUNT_COUNT 2000000UL   
 
-// Updated transaction structure with a huge payload.
+// Transaction structure remains small.
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
     uint32_t amount;
-    int payload[PAYLOAD_SIZE];
 } Transaction;
 
 int main(void) {
-    // Allocate a fixed set of addresses.
+    // Dynamically allocate a fixed set of addresses.
     uint64_t *addresses = malloc(SMALL_ACCOUNT_COUNT * sizeof(uint64_t));
     if (!addresses) {
         perror("Error allocating memory for addresses");
         exit(EXIT_FAILURE);
     }
+    
     for (unsigned i = 0; i < SMALL_ACCOUNT_COUNT; i++) {
         addresses[i] = i + 1;  // Generate unique 64-bit values.
     }
@@ -61,14 +60,10 @@ int main(void) {
                 batch[i].sender   = addresses[idx_sender];
                 batch[i].receiver = addresses[idx_receiver];
                 batch[i].amount   = rand_r(&seed) % (1 << 16);
-                // Populate the huge payload with random data.
-                for (size_t j = 0; j < PAYLOAD_SIZE; j++) {
-                    batch[i].payload[j] = rand_r(&seed);
-                }
             }
         }
         
-        // Write the batch sequentially to disk.
+        // File writing remains sequential.
         size_t written = fwrite(batch, sizeof(Transaction), BATCH_SIZE, txFile);
         if (written != BATCH_SIZE) {
             perror("Error writing transaction batch");
