@@ -76,7 +76,7 @@ void write_state_to_file(const char *filename, int64_t *state, size_t count) {
     fclose(fp);
 }
 
-// Pre-allocate the log file to the expected size using POSIX calls.
+// Pre-allocate the log file to the expected size.
 void preallocate_log_file_posix(const char *filename) {
     int fd = open(filename, O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
@@ -108,7 +108,6 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     int latest_slot = -1;
     CheckpointHeader header;
     
-    // Scan all slots in the ring.
     for (uint32_t i = 0; i < RING_SIZE; i++) {
         off_t offset = i * CHECKPOINT_SLOT_SIZE;
         ssize_t bytes = pread(fd, &header, sizeof(header), offset);
@@ -135,24 +134,28 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     return 0;
 }
 
-// An expensive operation called for expensive transactions.
+// A very expensive operation.
+// Allocates roughly 1GB and runs a 100-million-iteration loop.
 void expensive_operation(void) {
-    const size_t EXPENSIVE_SIZE = 2 << 25; // 1 GB
+    const size_t EXPENSIVE_SIZE = (1ULL << 30); // 1 GB
     char *buffer = malloc(EXPENSIVE_SIZE);
     if (buffer) {
         memset(buffer, 0, EXPENSIVE_SIZE);
+        volatile unsigned long long dummy = 0;
+        for (unsigned long long i = 0; i < 100000000ULL; i++) {
+            dummy += i;
+        }
         free(buffer);
     }
 }
 
-// Apply function: process the transaction, checking for an expensive flag.
+// Apply function: processes a transaction and calls expensive_operation only if flagged.
 void apply(const Transaction *tx, int64_t *state) {
     uint64_t sender = tx->sender;
     int is_expensive = 0;
-    // Check if the expensive flag is set.
     if (sender & EXPENSIVE_FLAG) {
         is_expensive = 1;
-        sender &= ~EXPENSIVE_FLAG; // Clear the flag before using the sender.
+        sender &= ~EXPENSIVE_FLAG; // Clear the flag.
     }
     if (sender < SMALL_ACCOUNT_COUNT)
          state[sender] -= tx->amount;
@@ -163,22 +166,20 @@ void apply(const Transaction *tx, int64_t *state) {
     }
 }
 
-// For performance metrics: compare two doubles.
+// Compare function for qsort.
 int compare_doubles(const void *a, const void *b) {
     double diff = (*(double *)a) - (*(double *)b);
     return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
 }
 
-// Main function using a single thread.
+// Main function.
 int main(int argc, char **argv) {
-    // Allocate the state array.
     int64_t *state = calloc(SMALL_ACCOUNT_COUNT + 1, sizeof(int64_t));
     if (!state) {
         perror("Error allocating state");
         exit(EXIT_FAILURE);
     }
     
-    // If an old log file exists, attempt to reconstruct the state.
     int recovered_batch = -1;
     int log_fd = open(LOG_FILE, O_RDWR);
     if (log_fd >= 0) {
@@ -201,16 +202,13 @@ int main(int argc, char **argv) {
         close(log_fd);
     }
     
-    // If running in "recover" mode, exit after reconstruction.
     if (argc > 1 && strcmp(argv[1], "recover") == 0) {
         free(state);
         return 0;
     }
     
-    // Pre-allocate the log file.
     preallocate_log_file_posix(LOG_FILE);
     
-    // Open the log file for writing.
     int fd_log = open(LOG_FILE, O_RDWR);
     if (fd_log < 0) {
          perror("Error opening log file for writing");
@@ -218,7 +216,6 @@ int main(int argc, char **argv) {
          exit(EXIT_FAILURE);
     }
     
-    // Open transactions file for reading.
     FILE *fp_transactions = fopen("transactions.bin", "rb");
     if (!fp_transactions) {
          perror("Error opening transactions.bin for reading");
