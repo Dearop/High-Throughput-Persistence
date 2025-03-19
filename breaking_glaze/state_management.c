@@ -137,7 +137,7 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
 
 // An expensive operation called for expensive transactions.
 void expensive_operation(void) {
-    const size_t EXPENSIVE_SIZE = 2 << 25; // 2 GB
+    const size_t EXPENSIVE_SIZE = 1 << 30; // 1 GB
     char *buffer = malloc(EXPENSIVE_SIZE);
     if (buffer) {
         memset(buffer, 0, EXPENSIVE_SIZE);
