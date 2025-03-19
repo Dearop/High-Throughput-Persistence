@@ -149,7 +149,6 @@ int compare_doubles(const void *a, const void *b) {
 
 // Main function using a single thread.
 int main(int argc, char **argv) {
-    clock_t start = get_time_ms();
     // Allocate the state array.
     int64_t *state = calloc(SMALL_ACCOUNT_COUNT + 1, sizeof(int64_t));
     if (!state) {
@@ -217,7 +216,7 @@ int main(int argc, char **argv) {
     }
     double total_processing_time = 0.0;
     
-    // Processing loop.
+    uint64_t start = get_time_ms();
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double start_time_ms = get_time_ms();
         
@@ -291,7 +290,8 @@ int main(int argc, char **argv) {
         
         printf("Batch %u processed in %.3f ms.\n", batch_num, batch_duration);
     }
-    
+    u_int64_t end = get_time_ms();
+
     // Clean up file handles.
     fclose(fp_transactions);
     close(fd_log);
@@ -334,7 +334,6 @@ int main(int argc, char **argv) {
     free(batch_times);
     free(sorted_times);
     
-    clock_t end = get_time_ms();
     printf("Total time taken: %.3f ms\n", end - start);
     return 0;
 }
