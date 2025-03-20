@@ -20,6 +20,7 @@ typedef struct {
     uint32_t amount;
 } Transaction;
 
+
 int main(void) {
     uint64_t *addresses = malloc(SMALL_ACCOUNT_COUNT * sizeof(uint64_t));
     if (!addresses) {
