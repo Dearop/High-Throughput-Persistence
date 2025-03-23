@@ -10,7 +10,7 @@
 
 // --- Definitions and constants ---
 
-// Transaction and state parameters.
+// Transaction and state parameters. 
 #define BATCH_SIZE          (1 << 16)          // 2^16 transactions per batch
 #define NUMBER_OF_BATCHES   50                 
 #define SMALL_ACCOUNT_COUNT 2000000UL         
@@ -24,6 +24,14 @@
 // Over a full cycle (8 batches) the worst-case is 16 * BATCH_SIZE modifications per chunk.
 #define MAX_WRITE_SET_COUNT (16 * BATCH_SIZE)
 #define WRITE_SET_CHUNK_SIZE (MAX_WRITE_SET_COUNT * sizeof(WriteSetEntry))
+
+// --- Operation Encoding ---
+// Top 4 bits of the sender/receiver encode the function.
+// The remaining 60 bits encode data (e.g., account index or offset).
+#define FUNC_MASK   0xF000000000000000UL
+#define DATA_MASK   0x0FFFFFFFFFFFFFFFUL
+#define GET_FUNC(x) ((uint8_t)((x) >> 60))
+#define GET_DATA(x) ((x) & DATA_MASK)
 
 // --- Crash Resistance: Checkpoint Header ---
 #define CHECKPOINT_MAGIC 0xC0CAC01A
@@ -149,6 +157,7 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
             fprintf(stderr, "Slot %u has unexpected state_chunk_count\n", slot);
             continue;
         }
+        // Read the baseline state chunk.
         int64_t *chunk = malloc(STATE_CHUNK_SIZE);
         if (!chunk) {
             perror("Allocation error during recovery");
@@ -160,29 +169,55 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
             free(chunk);
             continue;
         }
+        // Read the write-set area.
         void *ws_area = malloc(WRITE_SET_CHUNK_SIZE);
         if (!ws_area) {
             perror("Allocation error during recovery (write set)");
             free(chunk);
             continue;
         }
-        bytes = pread(fd, ws_area, WRITE_SET_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
+        bytes = pread(fd, ws_area, WRITE_SET_CHUNK_SIZE,
+                      offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
         if (bytes != WRITE_SET_CHUNK_SIZE) {
             perror("Error reading write set during recovery");
             free(chunk);
             free(ws_area);
             continue;
         }
+        // Verify checksum.
         uint32_t cs1 = compute_checksum(chunk, STATE_CHUNK_SIZE);
         uint32_t cs2 = compute_checksum(ws_area, WRITE_SET_CHUNK_SIZE);
         if ((cs1 ^ cs2) != header.checksum) {
-            fprintf(stderr, "Slot %u checksum mismatch! (Computed: 0x%x, Expected: 0x%x)\n",
+            fprintf(stderr,
+                    "Slot %u checksum mismatch! (Computed: 0x%x, Expected: 0x%x)\n",
                     slot, cs1 ^ cs2, header.checksum);
             free(chunk);
             free(ws_area);
             continue;
         }
+        
+        // First, copy the baseline state for this chunk into the full state.
         memcpy(state + header.chunk_offset, chunk, STATE_CHUNK_SIZE);
+        
+        // Now “replay” the modifications recorded in the write set.
+        WriteSetEntry *entries = (WriteSetEntry *)ws_area;
+        for (uint32_t i = 0; i < header.write_set_count; i++) {
+            uint8_t op = GET_FUNC(entries[i].address);
+            uint64_t addr = GET_DATA(entries[i].address);
+            // Make sure the address falls in the expected range for this chunk.
+            if (addr < header.chunk_offset || addr >= header.chunk_offset + STATE_CHUNK_COUNT) {
+                fprintf(stderr, "Write set entry %u address %llu out of range for chunk starting at %u\n",
+                        i, addr, header.chunk_offset);
+                continue;
+            }
+            // For both p2p (op==0) and memset (op==1), update the state.
+            if (op == 0 || op == 1) {
+                state[addr] = entries[i].balance;
+            } else {
+                fprintf(stderr, "Unknown op code %u in write set entry %u\n", op, i);
+            }
+        }
+        
         free(chunk);
         free(ws_area);
         *last_batch = header.batch_num;
@@ -190,23 +225,65 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     return 0;
 }
 
-// --- Transaction Application ---
-// For each transaction, update the state and record modifications into the appropriate accumulator.
-void apply_transaction(const Transaction *tx, int64_t *state,
-                       WriteSetEntry **ws_accum, int *ws_count) {
-    if (tx->sender < SMALL_ACCOUNT_COUNT) {
-        state[tx->sender] -= tx->amount;
-        uint32_t chunk = tx->sender / STATE_CHUNK_COUNT;
-        ws_accum[chunk][ws_count[chunk]].address = tx->sender;
-        ws_accum[chunk][ws_count[chunk]].balance = state[tx->sender];
-        ws_count[chunk]++;
+// --- Operation Application ---
+// This new function decodes the first 4 bits of the sender and receiver.
+// Operation types:
+//   0: p2p transaction. (Lower 60 bits of sender/receiver are account indexes.)
+//   1: memset operation. (Sender lower bits = start index, receiver lower bits = count, and amount is the value.)
+void apply(const Transaction *tx, int64_t *state,
+           WriteSetEntry **ws_accum, int *ws_count) {
+    uint8_t sender_func = GET_FUNC(tx->sender);
+    uint8_t receiver_func = GET_FUNC(tx->receiver);
+    uint64_t sender_data = GET_DATA(tx->sender);
+    uint64_t receiver_data = GET_DATA(tx->receiver);
+
+    // p2p transaction: both function codes are zero.
+    if (sender_func == 0 && receiver_func == 0) {
+        if (sender_data < SMALL_ACCOUNT_COUNT) {
+            state[sender_data] -= tx->amount;
+            uint32_t chunk = sender_data / STATE_CHUNK_COUNT;
+            if (ws_count[chunk] >= MAX_WRITE_SET_COUNT) {
+                fprintf(stderr, "Write-set overflow in chunk %u (p2p sender)!\n", chunk);
+                exit(EXIT_FAILURE);
+            }
+            ws_accum[chunk][ws_count[chunk]].address = (0UL << 60) | sender_data;
+            ws_accum[chunk][ws_count[chunk]].balance = state[sender_data];
+            ws_count[chunk]++;
+        }
+        if (receiver_data < SMALL_ACCOUNT_COUNT) {
+            state[receiver_data] += tx->amount;
+            uint32_t chunk = receiver_data / STATE_CHUNK_COUNT;
+            if (ws_count[chunk] >= MAX_WRITE_SET_COUNT) {
+                fprintf(stderr, "Write-set overflow in chunk %u (p2p receiver)!\n", chunk);
+                exit(EXIT_FAILURE);
+            }
+            ws_accum[chunk][ws_count[chunk]].address = (0UL << 60) | receiver_data;
+            ws_accum[chunk][ws_count[chunk]].balance = state[receiver_data];
+            ws_count[chunk]++;
+        }
     }
-    if (tx->receiver < SMALL_ACCOUNT_COUNT) {
-        state[tx->receiver] += tx->amount;
-        uint32_t chunk = tx->receiver / STATE_CHUNK_COUNT;
-        ws_accum[chunk][ws_count[chunk]].address = tx->receiver;
-        ws_accum[chunk][ws_count[chunk]].balance = state[tx->receiver];
-        ws_count[chunk]++;
+    // memset operation: both function codes are 1.
+    else if (sender_func == 1 && receiver_func == 1) {
+        if (sender_data < SMALL_ACCOUNT_COUNT && sender_data + receiver_data <= SMALL_ACCOUNT_COUNT) {
+            for (uint64_t i = sender_data; i < sender_data + receiver_data; i++) {
+                state[i] = tx->amount;
+                uint32_t chunk = i / STATE_CHUNK_COUNT;
+                if (ws_count[chunk] >= MAX_WRITE_SET_COUNT) {
+                    fprintf(stderr, "Write-set overflow in chunk %u (memset)!\n", chunk);
+                    exit(EXIT_FAILURE);
+                }
+                ws_accum[chunk][ws_count[chunk]].address = (1UL << 60) | i;
+                ws_accum[chunk][ws_count[chunk]].balance = state[i];
+                ws_count[chunk]++;
+            }
+        } else {
+            fprintf(stderr, "Invalid memset operation range: start %llu, count %llu\n",
+                    sender_data, receiver_data);
+        }
+    }
+    else {
+        fprintf(stderr, "Unknown or mismatched function codes: sender 0x%x, receiver 0x%x\n",
+                sender_func, receiver_func);
     }
 }
 
@@ -306,7 +383,7 @@ int main(int argc, char **argv) {
             }
         }
         for (unsigned int i = 0; i < BATCH_SIZE; i++) {
-            apply_transaction(&transaction_batch[i], state, ws_accum, ws_count);
+            apply(&transaction_batch[i], state, ws_accum, ws_count);
         }
         double batch_end = get_time_ms();
         
@@ -338,7 +415,6 @@ int main(int argc, char **argv) {
                     perror("Error writing write set to log");
                 if (pwrite(log_fd, &header, CHECKPOINT_HEADER_SIZE, offset) != CHECKPOINT_HEADER_SIZE)
                     perror("Error writing checkpoint header");
-                // Call fsync after writing each slot.
                 fsync(log_fd);
                 free(state_snapshot);
                 ws_count[slot] = 0;
