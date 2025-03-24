@@ -66,7 +66,7 @@ typedef struct {
 // This combined buffer will let us do one large copy to the destination.
 typedef struct __attribute__((packed)) {
     CheckpointHeader header;               // [Header]
-    int64_t state_array[STATE_CHUNK_COUNT]; // [State chunk]
+    int64_t state_array[STATE_CHUNK_COUNT];  // [State chunk]
     WriteSetEntry ws_array[MAX_WRITE_SET_COUNT]; // [Write-set]
 } CombinedCommitBuffer;
 
@@ -274,36 +274,30 @@ static inline void apply(const Transaction *tx,
     }
 }
 
-// Single function to commit a chunk into the mapped file buffer, *without* msync
+// Modified commit function that reuses a preallocated commit buffer.
 static void commit_slot_for_index_nosync(uint32_t slot_index,
                                          uint32_t batch_num,
                                          int64_t *state,
                                          WriteSetEntry **ws_accum,
                                          int *ws_count,
-                                         void *mapped_region)
+                                         void *mapped_region,
+                                         CombinedCommitBuffer *commit_buf)
 {
-    // Allocate the combined commit buffer on the heap
-    CombinedCommitBuffer *tempBuf = malloc(CHECKPOINT_SLOT_SIZE);
-    if (!tempBuf) {
-        perror("malloc in commit_slot_for_index_nosync");
-        exit(EXIT_FAILURE);
-    }
-    
     // Fill the header
-    tempBuf->header.magic             = CHECKPOINT_MAGIC;
-    tempBuf->header.batch_num         = batch_num;
-    tempBuf->header.chunk_offset      = slot_index * STATE_CHUNK_COUNT;
-    tempBuf->header.state_chunk_count = STATE_CHUNK_COUNT;
-    tempBuf->header.write_set_count   = ws_count[slot_index];
+    commit_buf->header.magic             = CHECKPOINT_MAGIC;
+    commit_buf->header.batch_num         = batch_num;
+    commit_buf->header.chunk_offset      = slot_index * STATE_CHUNK_COUNT;
+    commit_buf->header.state_chunk_count = STATE_CHUNK_COUNT;
+    commit_buf->header.write_set_count   = ws_count[slot_index];
 
-    // Copy state chunk into the temporary buffer
-    memcpy(tempBuf->state_array,
+    // Copy state chunk into the commit buffer
+    memcpy(commit_buf->state_array,
            state + slot_index * STATE_CHUNK_COUNT,
            STATE_CHUNK_SIZE);
 
     // Copy only the used portion of the write set
     size_t ws_used_bytes = ws_count[slot_index] * sizeof(WriteSetEntry);
-    memcpy(tempBuf->ws_array, ws_accum[slot_index], ws_used_bytes);
+    memcpy(commit_buf->ws_array, ws_accum[slot_index], ws_used_bytes);
 
     // Calculate total bytes to copy (header + state chunk + write set)
     size_t total_bytes = CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + ws_used_bytes;
@@ -313,13 +307,10 @@ static void commit_slot_for_index_nosync(uint32_t slot_index,
     char *dest = (char *)mapped_region + offset;
 
     // Copy the data to the mapped region using non-temporal memcpy
-    nt_memcpy(dest, tempBuf, total_bytes);
+    nt_memcpy(dest, commit_buf, total_bytes);
 
     // Reset the write-set count for this slot
     ws_count[slot_index] = 0;
-
-    // Free the heap-allocated buffer
-    free(tempBuf);
 }
 
 int main(int argc, char **argv) {
@@ -429,6 +420,16 @@ int main(int argc, char **argv) {
         committed_batch[i] = -1;
     }
 
+    // --- Allocate commit buffers for each slot (to be reused) ---
+    CombinedCommitBuffer *commit_buffers[RING_SIZE];
+    for (uint32_t slot = 0; slot < RING_SIZE; slot++) {
+        commit_buffers[slot] = malloc(CHECKPOINT_SLOT_SIZE);
+        if (!commit_buffers[slot]) {
+            perror("Error allocating commit buffer");
+            exit(EXIT_FAILURE);
+        }
+    }
+
     // Process each batch
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double batch_start = get_time_ms();
@@ -448,7 +449,7 @@ int main(int argc, char **argv) {
         // Commit each slot if needed (msync is now handled by the dedicated thread)
         for (uint32_t slot = 0; slot < RING_SIZE; slot++) {
             if ((int)batch_num > committed_batch[slot]) {
-                commit_slot_for_index_nosync(slot, batch_num, state, ws_accum, ws_count, mapped_region);
+                commit_slot_for_index_nosync(slot, batch_num, state, ws_accum, ws_count, mapped_region, commit_buffers[slot]);
                 committed_batch[slot] = batch_num;
             }
         }
@@ -508,6 +509,7 @@ int main(int argc, char **argv) {
     free(state);
     for (uint32_t i = 0; i < RING_SIZE; i++) {
         free(ws_accum[i]);
+        free(commit_buffers[i]);
     }
     free(batch_times);
     free(sorted_times);
