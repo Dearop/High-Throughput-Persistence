@@ -5,29 +5,29 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <pthread.h>  // For thread creation
 
 // --- Definitions and constants ---
 
-// Transaction and state parameters. 
-#define BATCH_SIZE          (1 << 16)          // 2^16 transactions per batch
-#define NUMBER_OF_BATCHES   50                 
-#define SMALL_ACCOUNT_COUNT 2000000UL         
+// Transaction and state parameters.
+#define BATCH_SIZE          (1 << 16)  // 2^16 transactions per batch
+#define NUMBER_OF_BATCHES   50
+#define SMALL_ACCOUNT_COUNT 2000000UL
 
-// We split the full state into 8 chunks.
+// We split the full state into 10 chunks for simplicity.
 #define RING_SIZE 10
 #define STATE_CHUNK_COUNT (SMALL_ACCOUNT_COUNT / RING_SIZE)
 #define STATE_CHUNK_SIZE  (STATE_CHUNK_COUNT * sizeof(int64_t))
 
 // For each transaction, worst-case a transaction produces 2 modifications.
-// Over a full cycle (8 batches) the worst-case is 16 * BATCH_SIZE modifications per chunk.
+// Over a full cycle the worst-case is 16 * BATCH_SIZE modifications per chunk.
 #define MAX_WRITE_SET_COUNT (16 * BATCH_SIZE)
 #define WRITE_SET_CHUNK_SIZE (MAX_WRITE_SET_COUNT * sizeof(WriteSetEntry))
 
 // --- Operation Encoding ---
-// Top 4 bits of the sender/receiver encode the function.
-// The remaining 60 bits encode data (e.g., account index or offset).
 #define FUNC_MASK   0xF000000000000000UL
 #define DATA_MASK   0x0FFFFFFFFFFFFFFFUL
 #define GET_FUNC(x) ((uint8_t)((x) >> 60))
@@ -37,12 +37,11 @@
 #define CHECKPOINT_MAGIC 0xC0CAC01A
 
 typedef struct {
-    uint32_t magic;            // Must equal CHECKPOINT_MAGIC when completely written.
-    uint32_t batch_num;        // Latest batch number in this cycle.
-    uint32_t chunk_offset;     // Starting index in the full state array.
+    uint32_t magic;            // Must equal CHECKPOINT_MAGIC.
+    uint32_t batch_num;        // Latest batch number committed.
+    uint32_t chunk_offset;     // Starting index in full state.
     uint32_t state_chunk_count;// Should equal STATE_CHUNK_COUNT.
     uint32_t write_set_count;  // Number of valid write-set entries.
-    uint32_t checksum;         // Checksum computed over state chunk and write-set area.
 } CheckpointHeader;
 
 #define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
@@ -61,21 +60,37 @@ typedef struct {
 
 typedef struct {
     uint64_t address;
-    int64_t balance;
+    int64_t  balance;
 } WriteSetEntry;
 
-// --- Utility Functions ---
+// This combined buffer will let us do one large copy to the destination.
+typedef struct __attribute__((packed)) {
+    CheckpointHeader header;               // [Header]
+    int64_t state_array[STATE_CHUNK_COUNT]; // [State chunk]
+    WriteSetEntry ws_array[MAX_WRITE_SET_COUNT]; // [Write-set]
+} CombinedCommitBuffer;
 
-// Simple 32-bit FNV-1a checksum.
-uint32_t compute_checksum(const void *data, size_t size) {
-    const unsigned char *p = data;
-    uint32_t hash = 2166136261U;
-    for (size_t i = 0; i < size; i++) {
-        hash ^= p[i];
-        hash *= 16777619U;
+// --- Thread Data for msync thread ---
+typedef struct {
+    void *mapped_region;
+    size_t size;
+    volatile int running; // Flag to signal when to stop
+} msync_thread_data;
+
+void *msync_thread_func(void *arg) {
+    msync_thread_data *data = (msync_thread_data *)arg;
+    // Loop until signaled to stop.
+    while (data->running) {
+        // Flush the entire checkpoint region asynchronously.
+        msync(data->mapped_region, data->size, MS_ASYNC);
+        // Sleep for 10ms before next flush.
+        struct timespec ts = {0, 10 * 1000 * 1000}; // 10ms
+        nanosleep(&ts, NULL);
     }
-    return hash;
+    return NULL;
 }
+
+// --- Utility Functions ---
 
 int compare_doubles(const void *a, const void *b) {
     double diff = (*(const double *)a) - (*(const double *)b);
@@ -86,6 +101,7 @@ uint64_t fnv1a_hash(int64_t *data, size_t len) {
     uint64_t hash = 14695981039346656037UL;
     for (size_t i = 0; i < len; i++) {
         uint64_t val = (uint64_t)data[i];
+        // 8 bytes per element
         for (int j = 0; j < 8; j++) {
             uint8_t byte = (val >> (j * 8)) & 0xFF;
             hash ^= byte;
@@ -104,24 +120,24 @@ double get_time_ms() {
 void preallocate_log_file_posix(const char *filename) {
     int fd = open(filename, O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
-         perror("Error opening log file for pre-allocation");
-         exit(EXIT_FAILURE);
+        perror("Error opening log file for pre-allocation");
+        exit(EXIT_FAILURE);
     }
     struct stat st;
     if (fstat(fd, &st) != 0) {
-         perror("fstat error");
-         close(fd);
-         exit(EXIT_FAILURE);
+        perror("fstat error");
+        close(fd);
+        exit(EXIT_FAILURE);
     }
     off_t fsize = st.st_size;
     off_t expected = RING_SIZE * CHECKPOINT_SLOT_SIZE;
     if (fsize < expected) {
-         if (ftruncate(fd, expected) != 0) {
-              perror("ftruncate error");
-              close(fd);
-              exit(EXIT_FAILURE);
-         }
-         fsync(fd);
+        if (ftruncate(fd, expected) != 0) {
+            perror("ftruncate error");
+            close(fd);
+            exit(EXIT_FAILURE);
+        }
+        fsync(fd);
     }
     close(fd);
 }
@@ -139,7 +155,6 @@ void write_state_to_file(const char *filename, int64_t *state, size_t count) {
 }
 
 // --- Recovery ---
-// Read each checkpoint slot and reassemble the full state from valid slots.
 int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     for (uint32_t slot = 0; slot < RING_SIZE; slot++) {
         off_t offset = slot * CHECKPOINT_SLOT_SIZE;
@@ -157,7 +172,7 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
             fprintf(stderr, "Slot %u has unexpected state_chunk_count\n", slot);
             continue;
         }
-        // Read the baseline state chunk.
+        // Read chunk
         int64_t *chunk = malloc(STATE_CHUNK_SIZE);
         if (!chunk) {
             perror("Allocation error during recovery");
@@ -169,7 +184,7 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
             free(chunk);
             continue;
         }
-        // Read the write-set area.
+        // Read write set
         void *ws_area = malloc(WRITE_SET_CHUNK_SIZE);
         if (!ws_area) {
             perror("Allocation error during recovery (write set)");
@@ -184,40 +199,29 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
             free(ws_area);
             continue;
         }
-        // Verify checksum.
-        uint32_t cs1 = compute_checksum(chunk, STATE_CHUNK_SIZE);
-        uint32_t cs2 = compute_checksum(ws_area, WRITE_SET_CHUNK_SIZE);
-        if ((cs1 ^ cs2) != header.checksum) {
-            fprintf(stderr,
-                    "Slot %u checksum mismatch! (Computed: 0x%x, Expected: 0x%x)\n",
-                    slot, cs1 ^ cs2, header.checksum);
-            free(chunk);
-            free(ws_area);
-            continue;
-        }
-        
-        // First, copy the baseline state for this chunk into the full state.
+
+        // Copy chunk into the correct place
         memcpy(state + header.chunk_offset, chunk, STATE_CHUNK_SIZE);
-        
-        // Now “replay” the modifications recorded in the write set.
+
+        // Reapply writes
         WriteSetEntry *entries = (WriteSetEntry *)ws_area;
         for (uint32_t i = 0; i < header.write_set_count; i++) {
             uint8_t op = GET_FUNC(entries[i].address);
             uint64_t addr = GET_DATA(entries[i].address);
-            // Make sure the address falls in the expected range for this chunk.
-            if (addr < header.chunk_offset || addr >= header.chunk_offset + STATE_CHUNK_COUNT) {
-                fprintf(stderr, "Write set entry %u address %llu out of range for chunk starting at %u\n",
-                        i, addr, header.chunk_offset);
+            if (addr < header.chunk_offset ||
+                addr >= header.chunk_offset + STATE_CHUNK_COUNT)
+            {
+                fprintf(stderr, "Write set entry %u address %llu out of range for chunk start %u\n",
+                        i, (long long)addr, header.chunk_offset);
                 continue;
             }
-            // For both p2p (op==0) and memset (op==1), update the state.
             if (op == 0 || op == 1) {
                 state[addr] = entries[i].balance;
             } else {
                 fprintf(stderr, "Unknown op code %u in write set entry %u\n", op, i);
             }
         }
-        
+
         free(chunk);
         free(ws_area);
         *last_batch = header.batch_num;
@@ -225,78 +229,106 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     return 0;
 }
 
-// --- Operation Application ---
-// This new function decodes the first 4 bits of the sender and receiver.
-// Operation types:
-//   0: p2p transaction. (Lower 60 bits of sender/receiver are account indexes.)
-//   1: memset operation. (Sender lower bits = start index, receiver lower bits = count, and amount is the value.)
-void apply(const Transaction *tx, int64_t *state,
-           WriteSetEntry **ws_accum, int *ws_count) {
+static inline void nt_memcpy(void *dest, const void *src, size_t n) {
+    memcpy(dest, src, n);
+}
+
+static inline void apply(const Transaction *tx,
+                         int64_t *state,
+                         WriteSetEntry **ws_accum,
+                         int *ws_count)
+{
     uint8_t sender_func = GET_FUNC(tx->sender);
     uint8_t receiver_func = GET_FUNC(tx->receiver);
     uint64_t sender_data = GET_DATA(tx->sender);
     uint64_t receiver_data = GET_DATA(tx->receiver);
 
-    // p2p transaction: both function codes are zero.
+    // Example p2p or memset logic
     if (sender_func == 0 && receiver_func == 0) {
-        if (sender_data < SMALL_ACCOUNT_COUNT) {
+        // p2p
+        if (state[sender_data] > tx->amount) {
             state[sender_data] -= tx->amount;
-            uint32_t chunk = sender_data / STATE_CHUNK_COUNT;
-            if (ws_count[chunk] >= MAX_WRITE_SET_COUNT) {
-                fprintf(stderr, "Write-set overflow in chunk %u (p2p sender)!\n", chunk);
-                exit(EXIT_FAILURE);
-            }
-            ws_accum[chunk][ws_count[chunk]].address = (0UL << 60) | sender_data;
-            ws_accum[chunk][ws_count[chunk]].balance = state[sender_data];
-            ws_count[chunk]++;
         }
-        if (receiver_data < SMALL_ACCOUNT_COUNT) {
+        uint32_t chunk_s = sender_data / STATE_CHUNK_COUNT;
+        ws_accum[chunk_s][ws_count[chunk_s]].address = (0UL << 60) | sender_data;
+        ws_accum[chunk_s][ws_count[chunk_s]].balance = state[sender_data];
+        ws_count[chunk_s]++;
+
+        if (state[receiver_data] > tx->amount) {
             state[receiver_data] += tx->amount;
-            uint32_t chunk = receiver_data / STATE_CHUNK_COUNT;
-            if (ws_count[chunk] >= MAX_WRITE_SET_COUNT) {
-                fprintf(stderr, "Write-set overflow in chunk %u (p2p receiver)!\n", chunk);
-                exit(EXIT_FAILURE);
-            }
-            ws_accum[chunk][ws_count[chunk]].address = (0UL << 60) | receiver_data;
-            ws_accum[chunk][ws_count[chunk]].balance = state[receiver_data];
+        }
+        uint32_t chunk_r = receiver_data / STATE_CHUNK_COUNT;
+        ws_accum[chunk_r][ws_count[chunk_r]].address = (0UL << 60) | receiver_data;
+        ws_accum[chunk_r][ws_count[chunk_r]].balance = state[receiver_data];
+        ws_count[chunk_r]++;
+    }
+    else if (sender_func == 1 && receiver_func == 1) {
+        // memset-like
+        for (uint64_t i = sender_data; i < sender_data + receiver_data; i++) {
+            state[i] = tx->amount;
+            uint32_t chunk = i / STATE_CHUNK_COUNT;
+            ws_accum[chunk][ws_count[chunk]].address = (1UL << 60) | i;
+            ws_accum[chunk][ws_count[chunk]].balance = tx->amount;
             ws_count[chunk]++;
         }
-    }
-    // memset operation: both function codes are 1.
-    else if (sender_func == 1 && receiver_func == 1) {
-        if (sender_data < SMALL_ACCOUNT_COUNT && sender_data + receiver_data <= SMALL_ACCOUNT_COUNT) {
-            for (uint64_t i = sender_data; i < sender_data + receiver_data; i++) {
-                state[i] = tx->amount;
-                uint32_t chunk = i / STATE_CHUNK_COUNT;
-                if (ws_count[chunk] >= MAX_WRITE_SET_COUNT) {
-                    fprintf(stderr, "Write-set overflow in chunk %u (memset)!\n", chunk);
-                    exit(EXIT_FAILURE);
-                }
-                ws_accum[chunk][ws_count[chunk]].address = (1UL << 60) | i;
-                ws_accum[chunk][ws_count[chunk]].balance = state[i];
-                ws_count[chunk]++;
-            }
-        } else {
-            fprintf(stderr, "Invalid memset operation range: start %llu, count %llu\n",
-                    sender_data, receiver_data);
-        }
-    }
-    else {
-        fprintf(stderr, "Unknown or mismatched function codes: sender 0x%x, receiver 0x%x\n",
-                sender_func, receiver_func);
     }
 }
 
-// --- Main Function ---
-// Process batches. Every RING_SIZE batches (or at the end), write a full checkpoint cycle.
-// For each checkpoint slot, write the state chunk and write-set area, then commit the slot by writing the header and calling fsync.
+// Single function to commit a chunk into the mapped file buffer, *without* msync
+static void commit_slot_for_index_nosync(uint32_t slot_index,
+                                         uint32_t batch_num,
+                                         int64_t *state,
+                                         WriteSetEntry **ws_accum,
+                                         int *ws_count,
+                                         void *mapped_region)
+{
+    // Allocate the combined commit buffer on the heap
+    CombinedCommitBuffer *tempBuf = malloc(CHECKPOINT_SLOT_SIZE);
+    if (!tempBuf) {
+        perror("malloc in commit_slot_for_index_nosync");
+        exit(EXIT_FAILURE);
+    }
+    
+    // Fill the header
+    tempBuf->header.magic             = CHECKPOINT_MAGIC;
+    tempBuf->header.batch_num         = batch_num;
+    tempBuf->header.chunk_offset      = slot_index * STATE_CHUNK_COUNT;
+    tempBuf->header.state_chunk_count = STATE_CHUNK_COUNT;
+    tempBuf->header.write_set_count   = ws_count[slot_index];
+
+    // Copy state chunk into the temporary buffer
+    memcpy(tempBuf->state_array,
+           state + slot_index * STATE_CHUNK_COUNT,
+           STATE_CHUNK_SIZE);
+
+    // Copy only the used portion of the write set
+    size_t ws_used_bytes = ws_count[slot_index] * sizeof(WriteSetEntry);
+    memcpy(tempBuf->ws_array, ws_accum[slot_index], ws_used_bytes);
+
+    // Calculate total bytes to copy (header + state chunk + write set)
+    size_t total_bytes = CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + ws_used_bytes;
+
+    // Destination offset in the mapped region
+    size_t offset = slot_index * CHECKPOINT_SLOT_SIZE;
+    char *dest = (char *)mapped_region + offset;
+
+    // Copy the data to the mapped region using non-temporal memcpy
+    nt_memcpy(dest, tempBuf, total_bytes);
+
+    // Reset the write-set count for this slot
+    ws_count[slot_index] = 0;
+
+    // Free the heap-allocated buffer
+    free(tempBuf);
+}
+
 int main(int argc, char **argv) {
     int64_t *state = calloc(SMALL_ACCOUNT_COUNT, sizeof(int64_t));
     if (!state) {
         perror("Error allocating state");
         exit(EXIT_FAILURE);
     }
-    
+
     // Allocate per-chunk write-set accumulators.
     WriteSetEntry *ws_accum[RING_SIZE];
     int ws_count[RING_SIZE] = {0};
@@ -307,8 +339,8 @@ int main(int argc, char **argv) {
             exit(EXIT_FAILURE);
         }
     }
-    
-    // Recovery.
+
+    // Recovery
     int recovered_batch = -1;
     int log_fd = open(LOG_FILE, O_RDWR);
     if (log_fd >= 0) {
@@ -320,10 +352,11 @@ int main(int argc, char **argv) {
                 uint64_t stored_hash;
                 fread(&stored_hash, sizeof(uint64_t), 1, hash_fp);
                 fclose(hash_fp);
-                if (hash == stored_hash)
+                if (hash == stored_hash) {
                     printf("Reconstructed state hash matches stored hash: %llu\n", hash);
-                else {
-                    printf("Reconstructed state hash mismatch! Computed: %llu, Stored: %llu\n", hash, stored_hash);
+                } else {
+                    printf("Reconstructed state hash mismatch! Computed: %llu, Stored: %llu\n",
+                           (long long)hash, (long long)stored_hash);
                     write_state_to_file("reconstructed_state.txt", state, SMALL_ACCOUNT_COUNT);
                 }
             }
@@ -335,141 +368,113 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
-    
+
     preallocate_log_file_posix(LOG_FILE);
     log_fd = open(LOG_FILE, O_RDWR);
     if (log_fd < 0) {
-         perror("Error opening log file for writing");
-         free(state);
-         exit(EXIT_FAILURE);
+        perror("Error opening log file for writing");
+        free(state);
+        exit(EXIT_FAILURE);
     }
-    
-    // Allocate a reusable transaction batch buffer.
+
+    // Memory-map the entire checkpoint file.
+    size_t checkpoint_file_size = RING_SIZE * CHECKPOINT_SLOT_SIZE;
+    void *mapped_region = mmap(NULL, checkpoint_file_size,
+                               PROT_READ | PROT_WRITE, MAP_SHARED, log_fd, 0);
+    if (mapped_region == MAP_FAILED) {
+        perror("mmap failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // --- Create a dedicated msync thread ---
+    pthread_t msync_thread;
+    msync_thread_data msync_data;
+    msync_data.mapped_region = mapped_region;
+    msync_data.size = checkpoint_file_size;
+    msync_data.running = 1;
+    if (pthread_create(&msync_thread, NULL, msync_thread_func, &msync_data) != 0) {
+        perror("Error creating msync thread");
+        exit(EXIT_FAILURE);
+    }
+
     Transaction *transaction_batch = malloc(BATCH_SIZE * sizeof(Transaction));
     if (!transaction_batch) {
         perror("Failed to allocate transaction batch buffer");
         exit(EXIT_FAILURE);
     }
-    
+
     FILE *fp_transactions = fopen(TX_FILE, "rb");
     if (!fp_transactions) {
-         perror("Error opening transactions file for reading");
-         free(state);
-         free(transaction_batch);
-         close(log_fd);
-         exit(EXIT_FAILURE);
+        perror("Error opening transactions file for reading");
+        free(state);
+        free(transaction_batch);
+        exit(EXIT_FAILURE);
     }
-    
+
     double *batch_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!batch_times) {
         perror("Error allocating batch_times");
         free(state);
         free(transaction_batch);
         fclose(fp_transactions);
-        close(log_fd);
         exit(EXIT_FAILURE);
     }
+
     double total_processing_time = 0.0;
-    uint64_t start_total = get_time_ms();
-    
+    double start_total = get_time_ms();
+
+    // Track last committed batch per slot
+    int committed_batch[RING_SIZE];
+    for (uint32_t i = 0; i < RING_SIZE; i++) {
+        committed_batch[i] = -1;
+    }
+
+    // Process each batch
     for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double batch_start = get_time_ms();
+
+        // Read one batch from the transaction file
         size_t items = fread(transaction_batch, sizeof(Transaction), BATCH_SIZE, fp_transactions);
-        if (items != BATCH_SIZE) {
-            if (feof(fp_transactions)) break;
-            else {
-                perror("Error reading transactions file");
-                break;
-            }
+        if (items < BATCH_SIZE) {
+            // partial read or EOF
+            break;
         }
+
+        // Apply all transactions in the batch
         for (unsigned int i = 0; i < BATCH_SIZE; i++) {
             apply(&transaction_batch[i], state, ws_accum, ws_count);
         }
-        double batch_end = get_time_ms();
-        
-        // Every RING_SIZE batches, write a full checkpoint cycle.
-        if ((batch_num + 1) % RING_SIZE == 0) {
-            for (uint32_t slot = 0; slot < RING_SIZE; slot++) {
-                int64_t *state_snapshot = malloc(STATE_CHUNK_SIZE);
-                if (!state_snapshot) {
-                    perror("Error allocating state snapshot");
-                    exit(EXIT_FAILURE);
-                }
-                memcpy(state_snapshot, state + slot * STATE_CHUNK_COUNT, STATE_CHUNK_SIZE);
-                uint32_t cs1 = compute_checksum(state_snapshot, STATE_CHUNK_SIZE);
-                uint32_t cs2 = compute_checksum(ws_accum[slot], WRITE_SET_CHUNK_SIZE);
-                uint32_t combined_checksum = cs1 ^ cs2;
-                
-                CheckpointHeader header;
-                header.magic = CHECKPOINT_MAGIC;
-                header.batch_num = batch_num;  // Latest batch in this cycle.
-                header.chunk_offset = slot * STATE_CHUNK_COUNT;
-                header.state_chunk_count = STATE_CHUNK_COUNT;
-                header.write_set_count = ws_count[slot];
-                header.checksum = combined_checksum;
-                
-                off_t offset = slot * CHECKPOINT_SLOT_SIZE;
-                if (pwrite(log_fd, state_snapshot, STATE_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE) != STATE_CHUNK_SIZE)
-                    perror("Error writing state snapshot");
-                if (pwrite(log_fd, ws_accum[slot], WRITE_SET_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE) != WRITE_SET_CHUNK_SIZE)
-                    perror("Error writing write set to log");
-                if (pwrite(log_fd, &header, CHECKPOINT_HEADER_SIZE, offset) != CHECKPOINT_HEADER_SIZE)
-                    perror("Error writing checkpoint header");
-                fsync(log_fd);
-                free(state_snapshot);
-                ws_count[slot] = 0;
+
+        // Commit each slot if needed (msync is now handled by the dedicated thread)
+        for (uint32_t slot = 0; slot < RING_SIZE; slot++) {
+            if ((int)batch_num > committed_batch[slot]) {
+                commit_slot_for_index_nosync(slot, batch_num, state, ws_accum, ws_count, mapped_region);
+                committed_batch[slot] = batch_num;
             }
         }
+
+        double batch_end = get_time_ms();
         double duration = batch_end - batch_start;
         batch_times[batch_num] = duration;
         total_processing_time += duration;
-        printf("Batch %u processed in %.3f ms.\n", batch_num, duration);
-    }
-    
-    // Final checkpoint cycle if NUMBER_OF_BATCHES is not a multiple of RING_SIZE.
-    if (NUMBER_OF_BATCHES % RING_SIZE != 0) {
-        void *empty_ws = calloc(1, WRITE_SET_CHUNK_SIZE);
-        if (!empty_ws) {
-            perror("Error allocating empty write-set area");
-            exit(EXIT_FAILURE);
+
+        // Optional debug output
+        if ((batch_num % 10) == 0) {
+            printf("Batch %u processed in %.3f ms.\n", batch_num, duration);
         }
-        for (uint32_t slot = 0; slot < RING_SIZE; slot++) {
-            int64_t *state_snapshot = malloc(STATE_CHUNK_SIZE);
-            if (!state_snapshot) {
-                perror("Error allocating state snapshot");
-                exit(EXIT_FAILURE);
-            }
-            memcpy(state_snapshot, state + slot * STATE_CHUNK_COUNT, STATE_CHUNK_SIZE);
-            uint32_t cs1 = compute_checksum(state_snapshot, STATE_CHUNK_SIZE);
-            uint32_t cs2 = compute_checksum(empty_ws, WRITE_SET_CHUNK_SIZE);
-            uint32_t combined_checksum = cs1 ^ cs2;
-            
-            CheckpointHeader header;
-            header.magic = CHECKPOINT_MAGIC;
-            header.batch_num = NUMBER_OF_BATCHES - 1;
-            header.chunk_offset = slot * STATE_CHUNK_COUNT;
-            header.state_chunk_count = STATE_CHUNK_COUNT;
-            header.write_set_count = 0;
-            header.checksum = combined_checksum;
-            
-            off_t offset = slot * CHECKPOINT_SLOT_SIZE;
-            if (pwrite(log_fd, state_snapshot, STATE_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE) != STATE_CHUNK_SIZE)
-                perror("Error writing final state snapshot");
-            if (pwrite(log_fd, empty_ws, WRITE_SET_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE) != WRITE_SET_CHUNK_SIZE)
-                perror("Error writing final write set to log");
-            if (pwrite(log_fd, &header, CHECKPOINT_HEADER_SIZE, offset) != CHECKPOINT_HEADER_SIZE)
-                perror("Error writing final checkpoint header");
-            fsync(log_fd);
-            free(state_snapshot);
-        }
-        free(empty_ws);
     }
-    
-    uint64_t end_total = get_time_ms();
+
+    // Signal the msync thread to stop and wait for it to finish.
+    msync_data.running = 0;
+    pthread_join(msync_thread, NULL);
+
+    munmap(mapped_region, checkpoint_file_size);
     fclose(fp_transactions);
     close(log_fd);
-    
+
+    double end_total = get_time_ms();
     double average = total_processing_time / NUMBER_OF_BATCHES;
+
     double *sorted_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if (!sorted_times) {
         perror("Error allocating sorted_times");
@@ -482,16 +487,16 @@ int main(int argc, char **argv) {
     double median = sorted_times[NUMBER_OF_BATCHES / 2];
     double p90 = sorted_times[(int)(NUMBER_OF_BATCHES * 0.9) - 1];
     double p99 = sorted_times[(int)(NUMBER_OF_BATCHES * 0.99) - 1];
-    
+
     printf("\nPerformance Metrics (ms):\n");
     printf("Total processing time: %.3f ms\n", total_processing_time);
     printf("Average batch time: %.3f ms\n", average);
     printf("Median batch time: %.3f ms\n", median);
     printf("90th percentile batch time: %.3f ms\n", p90);
     printf("99th percentile batch time: %.3f ms\n", p99);
-    
+
     uint64_t state_hash = fnv1a_hash(state, SMALL_ACCOUNT_COUNT);
-    printf("Final full state hash: %llu\n", state_hash);
+    printf("Final full state hash: %llu\n", (long long)state_hash);
     FILE *hash_fp = fopen("state_hash.dat", "wb");
     if (hash_fp) {
         fwrite(&state_hash, sizeof(uint64_t), 1, hash_fp);
@@ -499,7 +504,7 @@ int main(int argc, char **argv) {
     } else {
         perror("Error opening state_hash.dat for writing");
     }
-    
+
     free(state);
     for (uint32_t i = 0; i < RING_SIZE; i++) {
         free(ws_accum[i]);
@@ -507,7 +512,7 @@ int main(int argc, char **argv) {
     free(batch_times);
     free(sorted_times);
     free(transaction_batch);
-    
+
     printf("Total time taken: %.3f ms\n", (double)(end_total - start_total));
     return 0;
 }
