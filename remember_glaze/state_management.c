@@ -239,18 +239,22 @@ static void commit_chunk_v2(uint32_t cycle, uint32_t chunk_index,
                             Transaction **restrict tx_accum,
                             int *restrict tx_count,
                             void *restrict mapped_region,
-                            TxSlot *restrict prealloc_tx_slot)
+                            TxSlot *restrict prealloc_tx_slot,
+                            int log_fd)   // <--- New parameter for file descriptor
 {
+    // Compute slot index (as before).
     size_t slot_index = cycle * RING_SIZE + chunk_index;
     size_t snap_offset = CHECKPOINT_HEADER_SIZE + slot_index * sizeof(SnapshotSlot);
     size_t tx_offset = CHECKPOINT_HEADER_SIZE + TOTAL_SNAPSHOT_SLOTS * sizeof(SnapshotSlot) + slot_index * sizeof(TxSlot);
     
+    // Prepare the snapshot slot for the chunk.
     SnapshotSlot snap_slot;
     snap_slot.batch_num = batch_num;
     snap_slot.chunk_offset = chunk_index * STATE_CHUNK_COUNT;
     memcpy(snap_slot.state, state + chunk_index * STATE_CHUNK_COUNT, STATE_CHUNK_SIZE);
     nt_memcpy((char*)mapped_region + snap_offset, &snap_slot, sizeof(SnapshotSlot));
     
+    // Prepare the transaction slot for the chunk.
     prealloc_tx_slot->base_snapshot_slot = chunk_index;
     prealloc_tx_slot->batch_num = batch_num;
     prealloc_tx_slot->tx_count = tx_count[chunk_index];
@@ -258,7 +262,21 @@ static void commit_chunk_v2(uint32_t cycle, uint32_t chunk_index,
     memcpy(prealloc_tx_slot->transactions, tx_accum[chunk_index], tx_bytes);
     nt_memcpy((char*)mapped_region + tx_offset, prealloc_tx_slot, sizeof(TxSlot));
     
+    // Clear the per-chunk transaction count.
     tx_count[chunk_index] = 0;
+    
+    // Flush the updated SnapshotSlot region synchronously.
+    if(msync((char*)mapped_region + snap_offset, sizeof(SnapshotSlot), MS_SYNC) < 0) {
+        perror("msync snapshot slot failed");
+    }
+    // Flush the updated TxSlot region synchronously.
+    if(msync((char*)mapped_region + tx_offset, sizeof(TxSlot), MS_SYNC) < 0) {
+        perror("msync transaction slot failed");
+    }
+    // Finally, flush the file descriptor to disk.
+    if(fsync(log_fd) < 0) {
+        perror("fsync failed");
+    }
 }
 
 // --- Transaction Application Function ---
@@ -497,8 +515,7 @@ int main(int argc, char **argv) {
         // Determine which chunk to commit for this batch.
         uint32_t chunk = batch_num % RING_SIZE;
         uint32_t cycle = (batch_num / RING_SIZE) % CYCLES;
-        commit_chunk_v2(cycle, chunk, batch_num, state, tx_accum, tx_count, mapped_region, prealloc_tx_slots[chunk]);
-        if(((batch_num + 1) % RING_SIZE == 0) && (batch_num > 0))
+        commit_chunk_v2(cycle, chunk, batch_num, state, tx_accum, tx_count, mapped_region, prealloc_tx_slots[chunk], log_fd);        if(((batch_num + 1) % RING_SIZE == 0) && (batch_num > 0))
             header->oldest_cycle = cycle;
         
         double batch_end = get_time_ms();
