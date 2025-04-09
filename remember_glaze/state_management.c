@@ -12,7 +12,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <inttypes.h>
-#include <omp.h> // For OpenMP
+#include <omp.h>
 
 // --- Definitions and Constants ---
 
@@ -26,38 +26,38 @@
 #define STATE_CHUNK_SIZE    (STATE_CHUNK_COUNT * sizeof(int64_t))
 
 // Maximum number of transactions per chunk (worst-case)
-#define MAX_TX_COUNT        (16 * BATCH_SIZE)
+#define MAX_TX_COUNT        (BATCH_SIZE)
 
 // Magic number for identification.
 #define CHECKPOINT_MAGIC    0xC0CAC01A
 
 // --- Checkpoint Header Structure ---
-// Now includes an "oldest_cycle" field (0 or 1).
 typedef struct {
     uint32_t magic;
     uint32_t version;
     uint32_t oldest_cycle; // Cycle (0 or 1) that is the older copy.
 } CheckpointHeader;
-
 #define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
 
 // --- Ring Log Layout ---
-// We maintain two complete cycles.
 #define CYCLES 2
 #define TOTAL_SNAPSHOT_SLOTS (RING_SIZE * CYCLES)
 #define TOTAL_TX_SLOTS       (RING_SIZE * CYCLES)
 #define TOTAL_CHECKPOINT_SIZE (CHECKPOINT_HEADER_SIZE + TOTAL_SNAPSHOT_SLOTS * sizeof(struct SnapshotSlot) + TOTAL_TX_SLOTS * sizeof(struct TxSlot))
 
 // --- Operation Encoding ---
-// Each 64-bit field encodes an operation: upper 4 bits for op code, lower 60 bits for data.
 #define FUNC_MASK   0xF000000000000000UL
 #define DATA_MASK   0x0FFFFFFFFFFFFFFFUL
 #define GET_FUNC(x) ((uint8_t)((x) >> 60))
 #define GET_DATA(x) ((x) & DATA_MASK)
 
+// --- Likely/Unlikely Macros ---
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)
+
 // --- Data Structures ---
 
-// Transaction structure (unchanged).
+// Transaction structure.
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
@@ -66,16 +66,16 @@ typedef struct {
 
 // Snapshot slot stores a chunk's state.
 typedef struct SnapshotSlot {
-    uint32_t batch_num;           // Batch when snapshot was taken
-    uint32_t chunk_offset;        // Starting index in full state
+    uint32_t batch_num;             // Batch when snapshot was taken
+    uint32_t chunk_offset;          // Starting index in full state
     int64_t state[STATE_CHUNK_COUNT]; // The state values for this chunk
 } SnapshotSlot;
 
 // Transaction slot stores the transactions applied since the snapshot.
 typedef struct TxSlot {
-    uint32_t base_snapshot_slot;  // Index into the snapshot ring (0 to RING_SIZE-1)
-    uint32_t batch_num;           // Batch when recorded
-    uint32_t tx_count;            // Number of transactions recorded
+    uint32_t base_snapshot_slot;    // Index into the snapshot ring (0 to RING_SIZE-1)
+    uint32_t batch_num;             // Batch when recorded
+    uint32_t tx_count;              // Number of transactions recorded
     Transaction transactions[MAX_TX_COUNT]; // The transactions
 } TxSlot;
 
@@ -136,19 +136,18 @@ typedef struct {
     size_t size;
     volatile int running;
 } msync_thread_data;
-
 void *msync_thread_func(void *arg) {
     msync_thread_data *data = (msync_thread_data *)arg;
     while(data->running) {
         msync(data->mapped_region, data->size, MS_ASYNC);
-        struct timespec ts = {0, 10 * 1000 * 1000}; // sleep for 10ms
+        struct timespec ts = {0, 10 * 1000 * 1000}; // sleep 10ms
         nanosleep(&ts, NULL);
     }
     return NULL;
 }
 
 // --- Recovery Function ---
-// Always run recovery: load base state from the older cycle, then replay transactions from the newer.
+// Recovers the state from the checkpoint file.
 int recover_state(int fd, int64_t *restrict state, int *last_batch) {
     CheckpointHeader header;
     ssize_t bytes = pread(fd, &header, sizeof(header), 0);
@@ -164,7 +163,6 @@ int recover_state(int fd, int64_t *restrict state, int *last_batch) {
     SnapshotSlot *snap_slot = malloc(sizeof(SnapshotSlot));
     if(!snap_slot) { perror("malloc snap_slot failed"); free(tx_slot); exit(EXIT_FAILURE); }
 
-    // Recover base state from the older cycle (parallelized over chunks).
     #pragma omp parallel for
     for(uint32_t chunk = 0; chunk < RING_SIZE; chunk++) {
         off_t snap_offset = CHECKPOINT_HEADER_SIZE + ((oldest_cycle * RING_SIZE + chunk) * sizeof(SnapshotSlot));
@@ -181,7 +179,6 @@ int recover_state(int fd, int64_t *restrict state, int *last_batch) {
         }
     }
     
-    // Replay transactions from the newer cycle.
     #pragma omp parallel for
     for(uint32_t chunk = 0; chunk < RING_SIZE; chunk++) {
         off_t tx_offset = CHECKPOINT_HEADER_SIZE + TOTAL_SNAPSHOT_SLOTS * sizeof(SnapshotSlot) +
@@ -235,8 +232,7 @@ int recover_state(int fd, int64_t *restrict state, int *last_batch) {
 }
 
 // --- Optimized Commit Function ---
-// In this revised design, each batch commits only one chunk (batch_num % RING_SIZE)
-// using the preallocated TxSlot buffer for that chunk.
+// Commits the in-memory state of one chunk (along with the transaction log) into the memory-mapped checkpoint file.
 static void commit_chunk_v2(uint32_t cycle, uint32_t chunk_index,
                             uint32_t batch_num,
                             int64_t *restrict state,
@@ -265,8 +261,8 @@ static void commit_chunk_v2(uint32_t cycle, uint32_t chunk_index,
     tx_count[chunk_index] = 0;
 }
 
-// --- Transaction Application ---
-// Applies a transaction to the in-memory state and records it in the appropriate per-chunk accumulator.
+// --- Transaction Application Function ---
+// This inline function preserves the original (ordered) semantics.
 static inline void apply_tx(const Transaction *tx,
                              int64_t *restrict state,
                              Transaction **restrict tx_accum,
@@ -277,12 +273,14 @@ static inline void apply_tx(const Transaction *tx,
     uint64_t sidx = GET_DATA(tx->sender);
     uint64_t ridx = GET_DATA(tx->receiver);
     
-    if(sfunc == 0 && rfunc == 0) {
-        if(sidx >= SMALL_ACCOUNT_COUNT || ridx >= SMALL_ACCOUNT_COUNT) {
+    if(likely(sfunc == 0 && rfunc == 0)) {
+        // Check bounds.
+        if(unlikely(sidx >= SMALL_ACCOUNT_COUNT || ridx >= SMALL_ACCOUNT_COUNT)) {
             fprintf(stderr, "Out-of-bounds transaction index: sender %llu, receiver %llu\n",
                     (unsigned long long)sidx, (unsigned long long)ridx);
             return;
         }
+        // Ordered update.
         if(state[sidx] > tx->amount)
             state[sidx] -= tx->amount;
         if(state[ridx] > tx->amount)
@@ -312,6 +310,37 @@ static inline void apply_tx(const Transaction *tx,
             }
         }
     }
+}
+
+// --- Double-buffered Transaction Reader ---
+// This structure holds two transaction buffers to hide I/O latency.
+typedef struct {
+    Transaction *buffers[2]; // Two buffers
+    int current;             // Index of the buffer ready for processing
+    int ready[2];            // Flags: 1 means ready, 0 means not yet filled
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    FILE *fp;
+    int batches_read;
+} tx_double_buffer_t;
+
+void *reader_thread_func(void *arg) {
+    tx_double_buffer_t *db = (tx_double_buffer_t *)arg;
+    int buf = 0;
+    while(db->batches_read < NUMBER_OF_BATCHES) {
+        // Read the next batch into buffers[buf].
+        size_t items = fread(db->buffers[buf], sizeof(Transaction), BATCH_SIZE, db->fp);
+        pthread_mutex_lock(&db->mutex);
+        db->ready[buf] = 1;
+        pthread_cond_signal(&db->cond);
+        // Wait until main thread processes this buffer.
+        while(db->ready[buf] == 1)
+            pthread_cond_wait(&db->cond, &db->mutex);
+        pthread_mutex_unlock(&db->mutex);
+        buf = 1 - buf;
+        db->batches_read++;
+    }
+    return NULL;
 }
 
 // --- Main Routine ---
@@ -411,23 +440,31 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
     
-    // Open transactions file.
-    Transaction *transaction_batch = malloc(BATCH_SIZE * sizeof(Transaction));
-    if(!transaction_batch) { perror("Failed to allocate transaction batch buffer"); exit(EXIT_FAILURE); }
+    // Set up double buffering for reading transactions.
+    tx_double_buffer_t db;
+    pthread_mutex_init(&db.mutex, NULL);
+    pthread_cond_init(&db.cond, NULL);
+    db.buffers[0] = malloc(BATCH_SIZE * sizeof(Transaction));
+    db.buffers[1] = malloc(BATCH_SIZE * sizeof(Transaction));
+    db.current = 0;
+    db.ready[0] = 0;
+    db.ready[1] = 0;
+    db.batches_read = 0;
     FILE *fp_transactions = fopen(TX_FILE, "rb");
     if(!fp_transactions) {
         perror("Error opening transactions file for reading");
-        free(state);
-        free(transaction_batch);
+        exit(EXIT_FAILURE);
+    }
+    db.fp = fp_transactions;
+    pthread_t reader_thread;
+    if(pthread_create(&reader_thread, NULL, reader_thread_func, &db) != 0) {
+        perror("Error creating reader thread");
         exit(EXIT_FAILURE);
     }
     
     double *batch_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
     if(!batch_times) {
         perror("Error allocating batch_times");
-        free(state);
-        free(transaction_batch);
-        fclose(fp_transactions);
         exit(EXIT_FAILURE);
     }
     
@@ -435,25 +472,32 @@ int main(int argc, char **argv) {
     double start_total = get_time_ms();
     
     // --- Main Batch Loop ---
-    // For each batch, apply transactions then commit one chunk (batch_num % RING_SIZE).
     for(unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
         double batch_start = get_time_ms();
+        // Wait for the next batch to be ready.
+        pthread_mutex_lock(&db.mutex);
+        while(db.ready[db.current] == 0)
+            pthread_cond_wait(&db.cond, &db.mutex);
+        pthread_mutex_unlock(&db.mutex);
         
-        size_t items = fread(transaction_batch, sizeof(Transaction), BATCH_SIZE, fp_transactions);
-        if(items < BATCH_SIZE) break;
-        
-        // Apply each transaction (serially to preserve order).
+        // Process the batch using the already ordered transactions.
+        Transaction *transaction_batch = db.buffers[db.current];
         for(unsigned int i = 0; i < BATCH_SIZE; i++) {
             apply_tx(&transaction_batch[i], state, tx_accum, tx_count);
         }
         
-        // Determine which chunk to commit this batch.
+        // Mark the buffer as processed.
+        pthread_mutex_lock(&db.mutex);
+        db.ready[db.current] = 0;
+        pthread_cond_signal(&db.cond);
+        pthread_mutex_unlock(&db.mutex);
+        // Swap buffer index.
+        db.current = 1 - db.current;
+        
+        // Determine which chunk to commit for this batch.
         uint32_t chunk = batch_num % RING_SIZE;
-        // Determine current cycle based on how many full cycles have passed.
         uint32_t cycle = (batch_num / RING_SIZE) % CYCLES;
         commit_chunk_v2(cycle, chunk, batch_num, state, tx_accum, tx_count, mapped_region, prealloc_tx_slots[chunk]);
-        
-        // Optionally update header->oldest_cycle every full cycle.
         if(((batch_num + 1) % RING_SIZE == 0) && (batch_num > 0))
             header->oldest_cycle = cycle;
         
@@ -465,6 +509,8 @@ int main(int argc, char **argv) {
             printf("Batch %u processed in %.3f ms.\n", batch_num, duration);
     }
     
+    // Signal the reader thread to exit (if not all batches were read).
+    pthread_join(reader_thread, NULL);
     msync_data.running = 0;
     pthread_join(msync_thread, NULL);
     
@@ -487,7 +533,11 @@ int main(int argc, char **argv) {
     free(prealloc_tx_slots);
     free(tx_accum);
     free(batch_times);
-    free(transaction_batch);
+    free(db.buffers[0]);
+    free(db.buffers[1]);
+    
+    pthread_mutex_destroy(&db.mutex);
+    pthread_cond_destroy(&db.cond);
     
     return 0;
 }
