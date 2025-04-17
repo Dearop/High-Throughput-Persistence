@@ -17,11 +17,11 @@
 // --- Definitions and Constants ---
 
 #define BATCH_SIZE          (1 << 16)      // 65,536 transactions per batch
-#define NUMBER_OF_BATCHES   50
+#define NUMBER_OF_BATCHES   5000
 #define SMALL_ACCOUNT_COUNT 2000000UL
 
 // We split the full state into RING_SIZE chunks.
-#define RING_SIZE           10
+#define RING_SIZE           30
 #define STATE_CHUNK_COUNT   (SMALL_ACCOUNT_COUNT / RING_SIZE)
 #define STATE_CHUNK_SIZE    (STATE_CHUNK_COUNT * sizeof(int64_t))
 
@@ -260,7 +260,7 @@ int recover_state(int fd, int64_t *restrict state, int *last_batch)
     return 0;
 }
 
-// --- Optimized Commit Function ---
+// --- Commit Function ---
 // In this revised design, each batch commits only one chunk (batch_num % RING_SIZE)
 // using the preallocated TxSlot buffer for that chunk.
 static void commit_chunk_v2(uint32_t cycle, uint32_t chunk_index,
