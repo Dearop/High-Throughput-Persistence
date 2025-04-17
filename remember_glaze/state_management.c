@@ -149,86 +149,112 @@ void *msync_thread_func(void *arg) {
 
 // --- Recovery Function ---
 // Always run recovery: load base state from the older cycle, then replay transactions from the newer.
-int recover_state(int fd, int64_t *restrict state, int *last_batch) {
+// --- Recovery Function (serial version, no OpenMP) ---
+// Always run recovery: load base state from the older cycle, then replay
+// transactions from the newer cycle.  Returns 0 on success.
+int recover_state(int fd, int64_t *restrict state, int *last_batch)
+{
     CheckpointHeader header;
-    ssize_t bytes = pread(fd, &header, sizeof(header), 0);
-    if(bytes != sizeof(header) || header.magic != CHECKPOINT_MAGIC) {
+    ssize_t bytes = pread(fd, &header, sizeof header, 0);
+    if (bytes != (ssize_t)sizeof header || header.magic != CHECKPOINT_MAGIC) {
         fprintf(stderr, "Invalid or missing checkpoint header; skipping recovery.\n");
-        return 0;
+        return -1;
     }
-    uint32_t oldest_cycle = header.oldest_cycle;
-    uint32_t newest_cycle = (oldest_cycle + 1) % CYCLES;
 
-    TxSlot *tx_slot = malloc(sizeof(TxSlot));
-    if(!tx_slot) { perror("malloc tx_slot failed"); exit(EXIT_FAILURE); }
-    SnapshotSlot *snap_slot = malloc(sizeof(SnapshotSlot));
-    if(!snap_slot) { perror("malloc snap_slot failed"); free(tx_slot); exit(EXIT_FAILURE); }
+    uint32_t oldest_cycle  = header.oldest_cycle;          // 0 or 1
+    uint32_t newest_cycle  = (oldest_cycle + 1) % CYCLES;
 
-    // Recover base state from the older cycle (parallelized over chunks).
-    #pragma omp parallel for
-    for(uint32_t chunk = 0; chunk < RING_SIZE; chunk++) {
-        off_t snap_offset = CHECKPOINT_HEADER_SIZE + ((oldest_cycle * RING_SIZE + chunk) * sizeof(SnapshotSlot));
-        ssize_t b = pread(fd, snap_slot, sizeof(SnapshotSlot), snap_offset);
-        if(b != sizeof(SnapshotSlot)) {
-            fprintf(stderr, "Failed to read snapshot slot %u from cycle %u\n", chunk, oldest_cycle);
-            continue;
-        }
-        memcpy(state + chunk * STATE_CHUNK_COUNT, snap_slot->state, STATE_CHUNK_SIZE);
-        #pragma omp critical
-        {
-            if(snap_slot->batch_num > (uint32_t)(*last_batch))
-                *last_batch = snap_slot->batch_num;
-        }
+    /* Allocate temporary buffers once.  They are reused for every chunk.   */
+    SnapshotSlot *snap_slot = malloc(sizeof *snap_slot);
+    TxSlot       *tx_slot   = malloc(sizeof *tx_slot);
+    if (!snap_slot || !tx_slot) {
+        perror("malloc in recover_state");
+        free(tx_slot);
+        free(snap_slot);
+        return -1;
     }
-    
-    // Replay transactions from the newer cycle.
-    #pragma omp parallel for
-    for(uint32_t chunk = 0; chunk < RING_SIZE; chunk++) {
-        off_t tx_offset = CHECKPOINT_HEADER_SIZE + TOTAL_SNAPSHOT_SLOTS * sizeof(SnapshotSlot) +
-                          ((newest_cycle * RING_SIZE + chunk) * sizeof(TxSlot));
-        ssize_t b = pread(fd, tx_slot, sizeof(TxSlot), tx_offset);
-        if(b != sizeof(TxSlot)) {
-            fprintf(stderr, "Failed to read tx slot %u from cycle %u\n", chunk, newest_cycle);
+
+    *last_batch = -1;
+
+    /* -------- 1. Restore the base state from the *older* cycle -------- */
+    for (uint32_t chunk = 0; chunk < RING_SIZE; ++chunk) {
+        off_t snap_offset = CHECKPOINT_HEADER_SIZE
+                          + ((off_t)oldest_cycle * RING_SIZE + chunk)
+                          * sizeof *snap_slot;
+
+        ssize_t r = pread(fd, snap_slot, sizeof *snap_slot, snap_offset);
+        if (r != (ssize_t)sizeof *snap_slot) {
+            fprintf(stderr, "Failed to read snapshot slot %u (cycle %u)\n",
+                    chunk, oldest_cycle);
+            continue;                       // skip corrupt/missing slot
+        }
+
+        memcpy(state + (size_t)chunk * STATE_CHUNK_COUNT,
+               snap_slot->state, STATE_CHUNK_SIZE);
+
+        if ((int)snap_slot->batch_num > *last_batch)
+            *last_batch = (int)snap_slot->batch_num;
+    }
+
+    /* -------- 2. Replay transactions from the *newer* cycle -------- */
+    for (uint32_t chunk = 0; chunk < RING_SIZE; ++chunk) {
+        off_t tx_offset = CHECKPOINT_HEADER_SIZE
+                        + TOTAL_SNAPSHOT_SLOTS * sizeof *snap_slot
+                        + ((off_t)newest_cycle * RING_SIZE + chunk)
+                        * sizeof *tx_slot;
+
+        ssize_t r = pread(fd, tx_slot, sizeof *tx_slot, tx_offset);
+        if (r != (ssize_t)sizeof *tx_slot) {
+            fprintf(stderr, "Failed to read tx slot %u (cycle %u)\n",
+                    chunk, newest_cycle);
             continue;
         }
-        if(tx_slot->tx_count > MAX_TX_COUNT) {
-            fprintf(stderr, "Invalid tx_count %u in slot %u from cycle %u\n", tx_slot->tx_count, chunk, newest_cycle);
+
+        if (tx_slot->tx_count > MAX_TX_COUNT) {
+            fprintf(stderr, "Invalid tx_count %u in slot %u (cycle %u)\n",
+                    tx_slot->tx_count, chunk, newest_cycle);
             continue;
         }
-        for(uint32_t j = 0; j < tx_slot->tx_count; j++) {
+
+        /* Apply each transaction that touches this chunk. */
+        for (uint32_t j = 0; j < tx_slot->tx_count; ++j) {
             Transaction *tx = &tx_slot->transactions[j];
-            uint64_t sender_idx = GET_DATA(tx->sender);
-            uint64_t receiver_idx = GET_DATA(tx->receiver);
-            int applies = 0;
-            if(sender_idx >= chunk * STATE_CHUNK_COUNT && sender_idx < (chunk + 1) * STATE_CHUNK_COUNT)
-                applies = 1;
-            if(receiver_idx >= chunk * STATE_CHUNK_COUNT && receiver_idx < (chunk + 1) * STATE_CHUNK_COUNT)
-                applies = 1;
-            if(!applies) continue;
-            
-            uint8_t sfunc = GET_FUNC(tx->sender);
-            uint8_t rfunc = GET_FUNC(tx->receiver);
-            if(sfunc == 0 && rfunc == 0) {
-                if(state[sender_idx] > tx->amount)
-                    state[sender_idx] -= tx->amount;
-                if(state[receiver_idx] > tx->amount)
-                    state[receiver_idx] += tx->amount;
-            } else if(sfunc == 1 && rfunc == 1) {
-                uint64_t start = GET_DATA(tx->sender);
-                uint64_t len   = GET_DATA(tx->receiver);
-                for(uint64_t k = start; k < start + len; k++) {
-                    if(k >= chunk * STATE_CHUNK_COUNT && k < (chunk + 1) * STATE_CHUNK_COUNT)
+
+            uint8_t  sfunc = GET_FUNC (tx->sender);
+            uint8_t  rfunc = GET_FUNC (tx->receiver);
+            uint64_t sidx  = GET_DATA(tx->sender);
+            uint64_t ridx  = GET_DATA(tx->receiver);
+
+            /* Fast reject if neither endpoint lies in this chunk. */
+            uint64_t chunk_lo = (uint64_t)chunk * STATE_CHUNK_COUNT;
+            uint64_t chunk_hi = chunk_lo + STATE_CHUNK_COUNT;
+
+            int touches_chunk =
+                   (sidx >= chunk_lo && sidx < chunk_hi)
+                || (ridx >= chunk_lo && ridx < chunk_hi);
+
+            if (!touches_chunk)
+                continue;
+
+            if (sfunc == 0 && rfunc == 0) {
+                if (state[sidx] > tx->amount)
+                    state[sidx] -= tx->amount;
+                if (state[ridx] > tx->amount)
+                    state[ridx] += tx->amount;
+            } else if (sfunc == 1 && rfunc == 1) {     // range‑set op
+                uint64_t start = sidx;
+                uint64_t len   = ridx;
+                for (uint64_t k = start; k < start + len; ++k) {
+                    if (k >= chunk_lo && k < chunk_hi)
                         state[k] = tx->amount;
                 }
             }
         }
-        #pragma omp critical
-        {
-            if(tx_slot->batch_num > (uint32_t)(*last_batch))
-                *last_batch = tx_slot->batch_num;
-        }
+
+        if ((int)tx_slot->batch_num > *last_batch)
+            *last_batch = (int)tx_slot->batch_num;
     }
-    
+
     free(tx_slot);
     free(snap_slot);
     return 0;

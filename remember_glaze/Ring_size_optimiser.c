@@ -185,14 +185,15 @@ static double run_test_for_ring_size(uint32_t ring_size) {
     const uint32_t total_snapshot_slots = ring_size * CYCLES;
     const uint32_t total_tx_slots       = ring_size * CYCLES;
 
-    const size_t total_checkpoint_size  = 16 +   // header
+    const size_t header_size           = 16; // must match commit_chunk_v2
+    const size_t total_checkpoint_size = header_size +
         total_snapshot_slots * sizeof(SnapshotSlot) +
         total_tx_slots       * sizeof(TxSlot);
 
-    // full in‑memory state
+    /* -------------------- allocate working buffers -------------------- */
     int64_t *state = malloc(SMALL_ACCOUNT_COUNT * sizeof(int64_t));
     if (!state) { perror("malloc state"); exit(EXIT_FAILURE); }
-    for (uint64_t i = 0; i < SMALL_ACCOUNT_COUNT; ++i) state[i] = 1'000'000;
+    for (uint64_t i = 0; i < SMALL_ACCOUNT_COUNT; ++i) state[i] = 1000000; /* 1_000_000 tokens */
 
     Transaction **tx_accum = malloc(ring_size * sizeof(Transaction *));
     int          *tx_count = malloc(ring_size * sizeof(int));
@@ -206,6 +207,7 @@ static double run_test_for_ring_size(uint32_t ring_size) {
     void *mapped_region = calloc(1, total_checkpoint_size);
     if (!mapped_region) { perror("calloc mapped_region"); exit(EXIT_FAILURE); }
 
+    /* -------------------- main benchmark loop ------------------------ */
     double total_ms = 0.0;
 
     for (uint32_t batch_num = 0; batch_num < TEST_BATCHES; ++batch_num) {
@@ -227,8 +229,19 @@ static double run_test_for_ring_size(uint32_t ring_size) {
         total_ms += get_time_ms() - start_ms;
     }
 
-    // --- cleanup (intentionally leak per‑slot mallocs inside mapped_region, they
-    //     are small and would complicate the demo) --------------------------------
+    /* -------------------- explicit cleanup to avoid leaks ------------ */
+    for (uint32_t i = 0; i < total_snapshot_slots; ++i) {
+        SnapshotSlot *snap = (SnapshotSlot *)((char *)mapped_region +
+                               header_size + i * sizeof(SnapshotSlot));
+        free(snap->state);
+    }
+    for (uint32_t i = 0; i < total_tx_slots; ++i) {
+        TxSlot *txs = (TxSlot *)((char *)mapped_region +
+                         header_size + total_snapshot_slots * sizeof(SnapshotSlot) +
+                         i * sizeof(TxSlot));
+        free(txs->transactions);
+    }
+
     free(state);
     for (uint32_t i = 0; i < ring_size; ++i) free(tx_accum[i]);
     free(tx_accum);
@@ -236,6 +249,7 @@ static double run_test_for_ring_size(uint32_t ring_size) {
     free(mapped_region);
 
     return total_ms / TEST_BATCHES;
+}
 }
 
 // -----------------------------------------------------------------------------
