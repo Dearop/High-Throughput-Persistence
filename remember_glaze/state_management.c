@@ -17,7 +17,7 @@
 // --- Definitions and Constants ---
 
 #define BATCH_SIZE          (1 << 16)      // 65,536 transactions per batch
-#define NUMBER_OF_BATCHES   125000
+#define NUMBER_OF_BATCHES   50
 #define SMALL_ACCOUNT_COUNT 2000000UL
 
 // We split the full state into RING_SIZE chunks.
@@ -345,7 +345,6 @@ static inline void apply_tx(const Transaction *tx,
 #define TX_FILE  "transactions.bin"
 
 int main(int argc, char **argv) {
-    printf("Debug: Starting program\n");
     
     // Allocate full state with proper alignment.
     int64_t *state;
@@ -385,7 +384,8 @@ int main(int argc, char **argv) {
         }
     }
     
-    // Always perform recovery.
+    // Recovery 
+    double start_recovery = get_time_ms();
     int recovered_batch = -1;
     int log_fd = open(LOG_FILE, O_RDWR);
     if(log_fd >= 0) {
@@ -394,6 +394,8 @@ int main(int argc, char **argv) {
             printf("Recovered state up to batch %d.\n", recovered_batch);
         close(log_fd);
     }
+    double end_recovery = get_time_ms();
+    printf("Total recovery time : %f ms\n", end_recovery - start_recovery);
     
     preallocate_log_file(LOG_FILE);
     log_fd = open(LOG_FILE, O_RDWR);
