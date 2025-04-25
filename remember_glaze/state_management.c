@@ -21,7 +21,7 @@
 #define SMALL_ACCOUNT_COUNT 2000000UL
 
 // We split the full state into RING_SIZE chunks.
-#define RING_SIZE           30
+#define RING_SIZE           32
 #define STATE_CHUNK_COUNT   (SMALL_ACCOUNT_COUNT / RING_SIZE)
 #define STATE_CHUNK_SIZE    (STATE_CHUNK_COUNT * sizeof(int64_t))
 
