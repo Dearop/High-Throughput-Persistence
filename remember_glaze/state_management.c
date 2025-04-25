@@ -17,7 +17,7 @@
 // --- Definitions and Constants ---
 
 #define BATCH_SIZE          (1 << 16)      // 65,536 transactions per batch
-#define NUMBER_OF_BATCHES   50
+#define NUMBER_OF_BATCHES   5000
 #define SMALL_ACCOUNT_COUNT 2000000UL
 
 // We split the full state into RING_SIZE chunks.
