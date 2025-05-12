@@ -1,0 +1,54 @@
+--- dump_state_diff starting (comparing 2000000 accounts, reporting max 50) ---
+  ◇ MISMATCH @ idx 0         reference = 173           recovered = 0           
+  ◇ MISMATCH @ idx 1         reference = 935           recovered = 0           
+  ◇ MISMATCH @ idx 2         reference = 477           recovered = 0           
+  ◇ MISMATCH @ idx 3         reference = 128           recovered = 0           
+  ◇ MISMATCH @ idx 4         reference = 139           recovered = 0           
+  ◇ MISMATCH @ idx 5         reference = 363           recovered = 0           
+  ◇ MISMATCH @ idx 6         reference = 415           recovered = 0           
+  ◇ MISMATCH @ idx 7         reference = 119           recovered = 0           
+  ◇ MISMATCH @ idx 8         reference = 275           recovered = 0           
+  ◇ MISMATCH @ idx 9         reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 10        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 11        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 12        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 13        reference = 300           recovered = 0           
+  ◇ MISMATCH @ idx 14        reference = 203           recovered = 0           
+  ◇ MISMATCH @ idx 15        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 16        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 17        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 18        reference = 970           recovered = 0           
+  ◇ MISMATCH @ idx 19        reference = 923           recovered = 0           
+  ◇ MISMATCH @ idx 20        reference = 18            recovered = 0           
+  ◇ MISMATCH @ idx 21        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 22        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 23        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 24        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 25        reference = 132           recovered = 0           
+  ◇ MISMATCH @ idx 26        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 27        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 28        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 29        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 30        reference = 253           recovered = 0           
+  ◇ MISMATCH @ idx 31        reference = 383           recovered = 0           
+  ◇ MISMATCH @ idx 32        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 33        reference = 281           recovered = 0           
+  ◇ MISMATCH @ idx 34        reference = 760           recovered = 0           
+  ◇ MISMATCH @ idx 35        reference = 938           recovered = 0           
+  ◇ MISMATCH @ idx 36        reference = 706           recovered = 0           
+  ◇ MISMATCH @ idx 37        reference = 864           recovered = 0           
+  ◇ MISMATCH @ idx 38        reference = 1247          recovered = 0           
+  ◇ MISMATCH @ idx 39        reference = 278           recovered = 0           
+  ◇ MISMATCH @ idx 40        reference = 938           recovered = 0           
+  ◇ MISMATCH @ idx 41        reference = 938           recovered = 0           
+  ◇ MISMATCH @ idx 42        reference = 704           recovered = 0           
+  ◇ MISMATCH @ idx 43        reference = 938           recovered = 0           
+  ◇ MISMATCH @ idx 44        reference = 938           recovered = 0           
+  ◇ MISMATCH @ idx 45        reference = 182           recovered = 0           
+  ◇ MISMATCH @ idx 46        reference = 938           recovered = 0           
+  ◇ MISMATCH @ idx 47        reference = 941           recovered = 0           
+  ◇ MISMATCH @ idx 48        reference = 938           recovered = 0           
+  ◇ MISMATCH @ idx 49        reference = 700           recovered = 0           
+  ... reporting capped at 50 mismatches ...
+dump_state_diff: 50 account(s) differ. Reporting capped at 50.
+--- dump_state_diff finished ---

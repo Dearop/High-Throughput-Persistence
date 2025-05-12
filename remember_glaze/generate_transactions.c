@@ -7,7 +7,7 @@
 #define BATCH_SIZE          (1ULL << 16)
 #define NUMBER_OF_BATCHES   128
 #define TOTAL_TRANSACTIONS  (BATCH_SIZE * NUMBER_OF_BATCHES)
-#define SMALL_ACCOUNT_COUNT 2000000UL
+#define SMALL_ACCOUNT_COUNT  2000000UL  
 
 // --- Operation Encoding ---
 // Top 4 bits hold the op code, remaining 60 bits hold data.
@@ -18,7 +18,7 @@
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
-    uint32_t amount;
+    uint64_t amount;
 } Transaction;
 
 int main(void) {
