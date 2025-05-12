@@ -1,0 +1,703 @@
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <pthread.h>
+#include <inttypes.h>
+// #include <omp.h> // OpenMP not strictly needed for this refactoring, can be added if parallelizing apply_tx is desired
+
+// --- Definitions and Constants ---
+
+#define BATCH_SIZE              (1 << 16)      // 65,536 transactions per batch
+#define SMALL_ACCOUNT_COUNT     2000000UL      // Target number of accounts
+#define ACCOUNT_SIZE            8 // Use sizeof for clarity and portability
+
+// State Chunk configuration
+#define TARGET_CHUNK_DATA_BYTES (512 * 1024)   // Approx 512KB per state chunk
+#define ACCOUNTS_PER_STATE_CHUNK (TARGET_CHUNK_DATA_BYTES / ACCOUNT_SIZE) // Number of accounts in one state chunk
+#if ACCOUNTS_PER_STATE_CHUNK == 0
+    #error "ACCOUNTS_PER_STATE_CHUNK is zero, TARGET_CHUNK_DATA_BYTES is too small for even one account."
+#endif
+
+// NUM_STATE_CHUNKS is the number of chunks needed to cover all accounts, also defines the ring size for checkpointing cycle
+#define NUM_STATE_CHUNKS        ((SMALL_ACCOUNT_COUNT + ACCOUNTS_PER_STATE_CHUNK - 1) / ACCOUNTS_PER_STATE_CHUNK)
+#define PADDED_ACCOUNT_COUNT    (NUM_STATE_CHUNKS * ACCOUNTS_PER_STATE_CHUNK) // Actual size of state array to be a multiple of chunk size
+
+// Magic number for identification.
+#define CHECKPOINT_MAGIC        0xC0CAC01B
+
+// Hash file for state verification
+#define STATE_HASH_FILE         "state_hash_v2.dat"
+#define LOG_FILE                "checkpoint_log_v2.dat"
+#define TX_FILE                 "transactions.bin"
+
+// --- Checkpoint Header Structure ---
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t oldest_cycle;      // Cycle (0 or 1) that is the older complete copy.
+    uint32_t num_state_chunks;  // For verification: NUM_STATE_CHUNKS
+    uint32_t accounts_per_chunk;// For verification: ACCOUNTS_PER_STATE_CHUNK
+} CheckpointHeader;
+
+#define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
+
+// --- Ring Log Layout ---
+#define CYCLES 2 // We maintain two complete copies (cycles) of the state chunks and tx logs
+#define TOTAL_SNAPSHOT_SLOTS (NUM_STATE_CHUNKS * CYCLES)
+#define TOTAL_TX_SLOTS       (NUM_STATE_CHUNKS * CYCLES)
+
+// --- Operation Encoding ---
+#define FUNC_MASK   0xF000000000000000UL
+#define DATA_MASK   0x0FFFFFFFFFFFFFFFUL
+#define GET_FUNC(x) ((uint8_t)((x) >> 60))
+#define GET_DATA(x) ((x) & DATA_MASK)
+
+// --- Data Structures ---
+
+typedef struct {
+    uint64_t sender;
+    uint64_t receiver;
+    uint32_t amount;
+} Transaction;
+
+typedef struct SnapshotSlot {
+    uint32_t batch_num;
+    uint32_t chunk_idx_in_ring;
+    int64_t state_data[ACCOUNTS_PER_STATE_CHUNK];
+} SnapshotSlot;
+
+typedef struct TxSlot {
+    uint32_t batch_num;
+    uint32_t tx_count;
+    Transaction transactions[BATCH_SIZE];
+} TxSlot;
+
+typedef struct {
+    uint64_t hash;
+    uint32_t batch_num_for_hash;
+} StateHash;
+
+typedef struct {
+    Transaction tx;
+    uint32_t original_batch_num;
+} TransactionWithBatchNum;
+
+// --Debug Functions --
+static void dump_state_diff(const int64_t *a,
+                const int64_t *b,
+                size_t          count,
+                size_t          max_report)
+{
+    size_t mismatches = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        if (a[i] != b[i]) {
+            if (mismatches < max_report) {
+                fprintf(stderr,
+                        "  ◇ MISMATCH @ idx %-8zu  saved = %-12" PRId64
+                        "  recovered = %-12" PRId64 "\n",
+                        i, a[i], b[i]);
+            }
+            ++mismatches;
+        }
+    }
+
+    if (mismatches == 0) {
+        printf("Self-test: recovery produced an **identical** state "
+               "(%zu accounts)\n", count);
+    } else {
+        fprintf(stderr,
+                "Self-test: %zu account(s) differ after in-process "
+                "recovery\n", mismatches);
+    }
+}
+
+// --- Utility Functions ---
+
+double get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+static inline void nt_memcpy(void *dest, const void *src, size_t n) {
+    memcpy(dest, src, n);
+}
+
+int compare_tx_with_batch_num(const void *a, const void *b) {
+    TransactionWithBatchNum *tx_a = (TransactionWithBatchNum *)a;
+    TransactionWithBatchNum *tx_b = (TransactionWithBatchNum *)b;
+    if (tx_a->original_batch_num < tx_b->original_batch_num) return -1;
+    if (tx_a->original_batch_num > tx_b->original_batch_num) return 1;
+    return 0;
+}
+
+// --- Asynchronous Flush (msync) Thread ---
+typedef struct {
+    void *mapped_region;
+    size_t size;
+    volatile int running;
+} msync_thread_data;
+
+void *msync_thread_func(void *arg) {
+    msync_thread_data *data = (msync_thread_data *)arg;
+    while (data->running) {
+        msync(data->mapped_region, data->size, MS_ASYNC);
+        struct timespec ts = {0, 10 * 1000 * 1000}; // sleep for 10ms
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+// --- Transaction Application to In-Memory State ---
+static inline void apply_transaction_to_state_array(const Transaction *tx, int64_t *restrict state_array) {
+    uint8_t sfunc = GET_FUNC(tx->sender);
+    uint8_t rfunc = GET_FUNC(tx->receiver);
+    uint64_t sidx = GET_DATA(tx->sender);
+    uint64_t ridx = GET_DATA(tx->receiver);
+
+    if (sfunc == 0 && rfunc == 0) { // Simple Transfer
+        if (sidx >= SMALL_ACCOUNT_COUNT || ridx >= SMALL_ACCOUNT_COUNT) {
+            return;
+        }
+        if (state_array[sidx] >= tx->amount) {
+            state_array[sidx] -= tx->amount;
+            state_array[ridx] += tx->amount;
+        }
+    } else if (sfunc == 1 && rfunc == 1) { // Range Set
+        uint64_t start_idx = sidx;
+        uint64_t len       = GET_DATA(tx->receiver);
+        if (len == 0 || start_idx + len > SMALL_ACCOUNT_COUNT) {
+            return;
+        }
+        for (uint64_t i = 0; i < len; ++i) {
+            state_array[start_idx + i] = tx->amount;
+        }
+    }
+}
+
+// --- Checkpoint Commit Function ---
+static void commit_batch_data_to_log(
+    uint32_t current_cycle,
+    uint32_t slot_idx_in_cycle,
+    uint32_t current_batch_num,
+    const int64_t *restrict full_state_array,
+    const Transaction *restrict current_transaction_batch,
+    uint32_t num_tx_in_current_batch,
+    void *restrict mapped_log_region,
+    SnapshotSlot *restrict temp_snap_slot,
+    TxSlot *restrict temp_tx_slot
+) {
+    size_t snapshot_slot_array_offset = CHECKPOINT_HEADER_SIZE;
+    size_t tx_slot_array_offset = snapshot_slot_array_offset + TOTAL_SNAPSHOT_SLOTS * sizeof(SnapshotSlot);
+    size_t overall_slot_idx = current_cycle * NUM_STATE_CHUNKS + slot_idx_in_cycle;
+    size_t final_snap_offset = snapshot_slot_array_offset + overall_slot_idx * sizeof(SnapshotSlot);
+    size_t final_tx_offset   = tx_slot_array_offset + overall_slot_idx * sizeof(TxSlot);
+
+    temp_snap_slot->batch_num = current_batch_num;
+    temp_snap_slot->chunk_idx_in_ring = slot_idx_in_cycle;
+    const int64_t *source_state_chunk_ptr = full_state_array + (size_t)slot_idx_in_cycle * ACCOUNTS_PER_STATE_CHUNK;
+    nt_memcpy(temp_snap_slot->state_data, source_state_chunk_ptr, ACCOUNTS_PER_STATE_CHUNK * ACCOUNT_SIZE);
+    nt_memcpy((char*)mapped_log_region + final_snap_offset, temp_snap_slot, sizeof(SnapshotSlot));
+
+    temp_tx_slot->batch_num = current_batch_num;
+    temp_tx_slot->tx_count = num_tx_in_current_batch;
+    nt_memcpy(temp_tx_slot->transactions, current_transaction_batch, num_tx_in_current_batch * sizeof(Transaction));
+    nt_memcpy((char*)mapped_log_region + final_tx_offset, temp_tx_slot, sizeof(TxSlot));
+}
+
+// --- Recovery Function ---
+int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover, int *last_recovered_batch_num) {
+    CheckpointHeader header;
+    ssize_t bytes = pread(log_fd, &header, sizeof(header), 0);
+    if (bytes != (ssize_t)sizeof(header) || header.magic != CHECKPOINT_MAGIC) {
+        fprintf(stderr, "Recovery: Invalid or missing checkpoint header (magic: 0x%x, expected: 0x%x, bytes: %zd). Skipping recovery.\n", header.magic, CHECKPOINT_MAGIC, bytes);
+        return -1;
+    }
+    if (header.num_state_chunks != NUM_STATE_CHUNKS || header.accounts_per_chunk != ACCOUNTS_PER_STATE_CHUNK) {
+        fprintf(stderr, "Recovery: Log file parameters mismatch. Cannot recover.\n");
+        return -1;
+    }
+
+    printf("Recovery: Valid checkpoint header. Oldest cycle: %u. Log params: %u chunks, %u acc/chunk.\n",
+           header.oldest_cycle, header.num_state_chunks, header.accounts_per_chunk);
+
+    uint32_t oldest_cycle = header.oldest_cycle;
+    uint32_t newest_cycle = (oldest_cycle + 1) % CYCLES;
+    *last_recovered_batch_num = -1; // Initialize
+
+    SnapshotSlot *current_snap_slot = malloc(sizeof(SnapshotSlot));
+    TxSlot *current_tx_slot = malloc(sizeof(TxSlot));
+    if (!current_snap_slot || !current_tx_slot) {
+        perror("Recovery: malloc for slot buffers failed");
+        free(current_snap_slot); free(current_tx_slot);
+        return -1;
+    }
+
+    // Step 1: Restore base state from all chunks in the 'oldest_cycle'
+    // state_array_to_recover is assumed to be pre-zeroed before this function is called.
+    printf("Recovery Step 1: Loading base state from oldest_cycle (%u) snapshots.\n", oldest_cycle);
+    size_t snapshot_slot_array_offset = CHECKPOINT_HEADER_SIZE;
+    int max_batch_in_oldest_snapshots = -1;
+
+    for (uint32_t chunk_k = 0; chunk_k < NUM_STATE_CHUNKS; ++chunk_k) {
+        off_t snap_offset_in_file = snapshot_slot_array_offset +
+                                   ((off_t)oldest_cycle * NUM_STATE_CHUNKS + chunk_k) * sizeof(SnapshotSlot);
+        
+        memset(current_snap_slot, 0, sizeof(SnapshotSlot)); 
+        ssize_t read_bytes = pread(log_fd, current_snap_slot, sizeof(SnapshotSlot), snap_offset_in_file);
+        
+        if (read_bytes != (ssize_t)sizeof(SnapshotSlot)) {
+            fprintf(stderr, "Recovery: Failed/short read for snapshot slot %u (cycle %u, read %zd/%zu bytes). Chunk data remains from pre-zeroed state.\n", 
+                    chunk_k, oldest_cycle, read_bytes, sizeof(SnapshotSlot));
+            continue; 
+        }
+        
+        size_t dest_offset_in_state_array = (size_t)chunk_k * ACCOUNTS_PER_STATE_CHUNK;
+        if (dest_offset_in_state_array + ACCOUNTS_PER_STATE_CHUNK <= PADDED_ACCOUNT_COUNT) {
+             nt_memcpy(state_array_to_recover + dest_offset_in_state_array,
+                       current_snap_slot->state_data,
+                       ACCOUNTS_PER_STATE_CHUNK * ACCOUNT_SIZE);
+            if ((int)current_snap_slot->batch_num > max_batch_in_oldest_snapshots) {
+                max_batch_in_oldest_snapshots = (int)current_snap_slot->batch_num;
+            }
+        } else {
+            fprintf(stderr, "Recovery: Snapshot slot %u (cycle %u) out of bounds. Skipped.\n", chunk_k, oldest_cycle);
+        }
+    }
+    printf("Recovery Step 1: Base state loaded. Max batch from oldest_cycle snapshots: %d.\n", max_batch_in_oldest_snapshots);
+    if (max_batch_in_oldest_snapshots != -1) { 
+        *last_recovered_batch_num = max_batch_in_oldest_snapshots;
+    } else { 
+        *last_recovered_batch_num = -1; 
+    }
+
+
+    printf("Recovery Step 2: Applying transactions from newest_cycle (%u) TxSlots > batch %d.\n", newest_cycle, *last_recovered_batch_num);
+    size_t tx_slot_array_offset = snapshot_slot_array_offset + TOTAL_SNAPSHOT_SLOTS * sizeof(SnapshotSlot);
+    TransactionWithBatchNum *tx_buffer_for_sorting = malloc(NUM_STATE_CHUNKS * BATCH_SIZE * sizeof(TransactionWithBatchNum));
+    if (!tx_buffer_for_sorting) {
+        perror("Recovery: malloc for tx_buffer_for_sorting failed");
+        free(current_snap_slot); free(current_tx_slot);
+        return -1;
+    }
+    size_t total_tx_to_apply_count = 0;
+    int max_batch_in_newest_tx_filtered = -1;
+
+    for (uint32_t chunk_k = 0; chunk_k < NUM_STATE_CHUNKS; ++chunk_k) {
+        off_t tx_offset_in_file = tx_slot_array_offset +
+                                 ((off_t)newest_cycle * NUM_STATE_CHUNKS + chunk_k) * sizeof(TxSlot);
+        
+        memset(current_tx_slot, 0, sizeof(TxSlot)); 
+        ssize_t read_bytes = pread(log_fd, current_tx_slot, sizeof(TxSlot), tx_offset_in_file);
+
+        if (read_bytes != (ssize_t)sizeof(TxSlot)) {
+            fprintf(stderr, "Recovery: Failed/short read for TxSlot %u (cycle %u, read %zd/%zu bytes). Slot skipped.\n", 
+                    chunk_k, newest_cycle, read_bytes, sizeof(TxSlot));
+            continue; 
+        }
+
+        if ((int)current_tx_slot->batch_num > *last_recovered_batch_num) {
+            if (current_tx_slot->tx_count > BATCH_SIZE) { 
+                 fprintf(stderr, "Recovery: Invalid tx_count %u in TxSlot %u (cycle %u, batch %u). Clamping to BATCH_SIZE.\n",
+                         current_tx_slot->tx_count, chunk_k, newest_cycle, current_tx_slot->batch_num);
+                 current_tx_slot->tx_count = BATCH_SIZE; 
+            }
+            
+            if (current_tx_slot->tx_count > 0) { 
+                for (uint32_t tx_idx = 0; tx_idx < current_tx_slot->tx_count; ++tx_idx) {
+                    if (total_tx_to_apply_count < NUM_STATE_CHUNKS * BATCH_SIZE) {
+                        tx_buffer_for_sorting[total_tx_to_apply_count].tx = current_tx_slot->transactions[tx_idx];
+                        tx_buffer_for_sorting[total_tx_to_apply_count].original_batch_num = current_tx_slot->batch_num;
+                        total_tx_to_apply_count++;
+                    } else {
+                        fprintf(stderr, "Recovery: tx_buffer_for_sorting overflow.\n");
+                        goto end_tx_collection_filtered; 
+                    }
+                }
+                if ((int)current_tx_slot->batch_num > max_batch_in_newest_tx_filtered) {
+                    max_batch_in_newest_tx_filtered = (int)current_tx_slot->batch_num;
+                }
+            }
+        }
+    }
+end_tx_collection_filtered:;
+
+    if (total_tx_to_apply_count > 0) {
+        printf("Recovery: Collected %zu tx (newer than batch %d). Sorting & Applying...\n", total_tx_to_apply_count, *last_recovered_batch_num);
+        qsort(tx_buffer_for_sorting, total_tx_to_apply_count, sizeof(TransactionWithBatchNum), compare_tx_with_batch_num);
+        for (size_t i = 0; i < total_tx_to_apply_count; ++i) {
+            apply_transaction_to_state_array(&tx_buffer_for_sorting[i].tx, state_array_to_recover);
+        }
+        *last_recovered_batch_num = max_batch_in_newest_tx_filtered; 
+    } else {
+        printf("Recovery: No tx in newest_cycle newer than batch %d to apply.\n", *last_recovered_batch_num);
+    }
+    printf("Recovery Step 2: Tx replay complete. Final recovered batch: %d.\n", *last_recovered_batch_num);
+
+    free(tx_buffer_for_sorting);
+    free(current_snap_slot);
+    free(current_tx_slot);
+    return 0;
+}
+
+// --- State Hashing ---
+uint64_t compute_state_hash(const int64_t *state_array, size_t num_accounts_to_hash) {
+    uint64_t hash = 0x1234567890ABCDEFULL;
+    for (size_t i = 0; i < num_accounts_to_hash; i++) {
+        hash = (hash << 13) | (hash >> 51);
+        hash ^= (uint64_t)state_array[i];
+    }
+    return hash;
+}
+
+int save_state_hash_to_file(uint64_t hash_value, uint32_t batch_num_for_hash) {
+    StateHash hash_data = {hash_value, batch_num_for_hash};
+    FILE *file = fopen(STATE_HASH_FILE, "wb");
+    if (!file) {
+        perror("Error opening hash file for writing");
+        return -1;
+    }
+    if (fwrite(&hash_data, sizeof(hash_data), 1, file) != 1) {
+        perror("Error writing state hash to file");
+        fclose(file); return -1;
+    }
+    fclose(file);
+    printf("Saved state hash: 0x%016" PRIx64 " (batch %u) to %s\n", hash_value, batch_num_for_hash, STATE_HASH_FILE);
+    return 0;
+}
+
+int verify_recovered_state_hash(const int64_t *current_state_array, size_t num_accounts_to_hash, uint32_t batch_num_of_current_state) {
+    StateHash hash_data_from_file;
+    FILE *file = fopen(STATE_HASH_FILE, "rb");
+    if (!file) {
+        if (errno == ENOENT) {
+            printf("Hash Verify: No previous state hash file. Skipping.\n");
+            return 0;
+        }
+        perror("Hash Verify: Error opening hash file for reading");
+        return -1;
+    }
+    if (fread(&hash_data_from_file, sizeof(hash_data_from_file), 1, file) != 1) {
+        fprintf(stderr, "Hash Verify: Error reading state hash from file. Skipping.\n");
+        fclose(file); return 0; 
+    }
+    fclose(file);
+
+    uint64_t computed_hash_of_current_state = compute_state_hash(current_state_array, num_accounts_to_hash);
+
+    printf("Hash Verify: Current state (batch %u) hash: 0x%016" PRIx64 "\n",
+           batch_num_of_current_state, computed_hash_of_current_state);
+    printf("Hash Verify: Expected hash (batch %u) hash: 0x%016" PRIx64 "\n",
+           hash_data_from_file.batch_num_for_hash, hash_data_from_file.hash);
+
+    if (batch_num_of_current_state != hash_data_from_file.batch_num_for_hash) {
+        fprintf(stderr, "Hash Verify WARNING: Batch number mismatch! Current: %u, Saved: %u.\n",
+                batch_num_of_current_state, hash_data_from_file.batch_num_for_hash);
+        return 0; 
+    }
+    if (computed_hash_of_current_state != hash_data_from_file.hash) {
+        fprintf(stderr, "Hash Verify ERROR: State hash MISMATCH for batch %u!\n", batch_num_of_current_state);
+        return -1;
+    }
+    printf("Hash Verify: State hash for batch %u VERIFIED successfully!\n", batch_num_of_current_state);
+    return 0;
+}
+
+// --- File Pre-allocation ---
+void preallocate_and_init_log_file(const char *filename, size_t total_log_size) {
+    int fd = open(filename, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) { perror("Error opening log file"); exit(EXIT_FAILURE); }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { perror("fstat error on log file"); close(fd); exit(EXIT_FAILURE); }
+    
+    bool initialize_header = false;
+    if (st.st_size < (off_t)total_log_size) {
+        printf("Log file %s too small or new. Truncating/allocating and initializing header.\n", filename);
+        if (ftruncate(fd, total_log_size) != 0) { perror("ftruncate error"); close(fd); exit(EXIT_FAILURE); }
+        
+        if (posix_fallocate(fd, 0, total_log_size) != 0 && errno != ENOSPC) { 
+             perror("posix_fallocate warning (ignoring if ENOSPC and ftruncate succeeded)");
+        }
+        initialize_header = true;
+    } else { 
+        CheckpointHeader temp_header;
+        if (pread(fd, &temp_header, sizeof(temp_header), 0) != sizeof(temp_header) || 
+            temp_header.magic != CHECKPOINT_MAGIC ||
+            temp_header.num_state_chunks != NUM_STATE_CHUNKS || 
+            temp_header.accounts_per_chunk != ACCOUNTS_PER_STATE_CHUNK) {
+            printf("Log file %s exists but header invalid/mismatch. Re-initializing header.\n", filename);
+            initialize_header = true; 
+        } else {
+             printf("Log file %s exists with valid header and matching parameters.\n", filename);
+        }
+    }
+
+    if (initialize_header) {
+        CheckpointHeader h = {CHECKPOINT_MAGIC, 2, 0, NUM_STATE_CHUNKS, ACCOUNTS_PER_STATE_CHUNK};
+        if (pwrite(fd, &h, sizeof(h), 0) != sizeof(h)) { perror("Failed to write initial header"); close(fd); exit(EXIT_FAILURE); }
+        if (fsync(fd) != 0) { perror("Failed to fsync initial header"); } 
+        printf("Initialized log file header for %s.\n", filename);
+    }
+    close(fd);
+}
+
+// --- Main Routine ---
+// --- Main Routine ---
+int main(int argc, char **argv) {
+    printf("System Config: BATCH_SIZE=%u, ACCOUNTS=%lu, CHUNKS=%u, ACC_PER_CHUNK=%u, ACCOUNT_SIZE=%zu\n",
+           BATCH_SIZE, SMALL_ACCOUNT_COUNT, NUM_STATE_CHUNKS, ACCOUNTS_PER_STATE_CHUNK, ACCOUNT_SIZE);
+
+    if (NUM_STATE_CHUNKS == 0) { exit(EXIT_FAILURE); }
+
+    int64_t *main_state_array;
+    if (posix_memalign((void **)&main_state_array, 64, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE) != 0) {
+        perror("Error allocating main_state_array"); exit(EXIT_FAILURE);
+    }
+
+    // Intentionally not initializing here, will be zeroed before recovery or initialized if no recovery.
+    // If recovery happens, it populates. If not, we might want to initialize.
+    // For now, zeroing before recovery is the dominant path.
+
+    SnapshotSlot *temp_snap_slot = malloc(sizeof(SnapshotSlot));
+    TxSlot *temp_tx_slot = malloc(sizeof(TxSlot));
+    if (!temp_snap_slot || !temp_tx_slot) {
+        perror("Failed to allocate temporary commit slots"); free(main_state_array); exit(EXIT_FAILURE);
+    }
+
+    const size_t TOTAL_LOG_FILE_SIZE = CHECKPOINT_HEADER_SIZE +
+                                       TOTAL_SNAPSHOT_SLOTS * sizeof(SnapshotSlot) +
+                                       TOTAL_TX_SLOTS * sizeof(TxSlot);
+    preallocate_and_init_log_file(LOG_FILE, TOTAL_LOG_FILE_SIZE);
+
+    double rec_start_t = get_time_ms();
+    int log_fd_rec = open(LOG_FILE, O_RDONLY);
+    int recovered_batch = -1; // Batch number of the state successfully recovered
+
+    printf("Zeroing main_state_array before recovery attempt to ensure consistent base state...\n");
+    memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
+
+    if (log_fd_rec >= 0) {
+        printf("Attempting state recovery from %s\n", LOG_FILE);
+        if (recover_state_from_log(log_fd_rec, main_state_array, &recovered_batch) == 0) {
+            printf("Recovery function completed. State recovered up to batch %d (inclusive).\n", recovered_batch);
+            if (recovered_batch != -1) {
+                if (verify_recovered_state_hash(main_state_array, SMALL_ACCOUNT_COUNT, recovered_batch) != 0) {
+                    fprintf(stderr, "WARNING: Post-recovery state hash verification FAILED for batch %d.\n", recovered_batch);
+                    // Depending on policy, might exit or try to re-process all. For now, we continue.
+                } else {
+                    printf("Post-recovery state hash verification SUCCEEDED for batch %d.\n", recovered_batch);
+                }
+            } else {
+                 printf("Recovery resulted in 'before batch 0' state. No specific batch hash to verify against at this stage.\n");
+                 // If no recovery, initialize state array to defaults
+                 printf("Initializing main state array with default balances (%lu accounts, %zu MB) as recovery was to pre-batch 0.\n",
+                        PADDED_ACCOUNT_COUNT, (PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE) / (1024*1024));
+                 for (uint64_t i = 0; i < PADDED_ACCOUNT_COUNT; i++) main_state_array[i] = 1000000;
+            }
+        } else {
+            fprintf(stderr, "Recovery function reported an error. State remains zeroed.\n");
+            recovered_batch = -1;
+            // Initialize state array to defaults as recovery failed
+            printf("Initializing main state array with default balances (%lu accounts, %zu MB) due to recovery error.\n",
+                   PADDED_ACCOUNT_COUNT, (PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE) / (1024*1024));
+            for (uint64_t i = 0; i < PADDED_ACCOUNT_COUNT; i++) main_state_array[i] = 1000000;
+        }
+        close(log_fd_rec);
+    } else {
+        perror("CRITICAL: Failed to open log file for recovery reading. State remains zeroed.");
+        recovered_batch = -1;
+        // Initialize state array to defaults as log couldn't be opened for recovery
+        printf("Initializing main state array with default balances (%lu accounts, %zu MB) as log file could not be opened for recovery.\n",
+               PADDED_ACCOUNT_COUNT, (PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE) / (1024*1024));
+        for (uint64_t i = 0; i < PADDED_ACCOUNT_COUNT; i++) main_state_array[i] = 1000000;
+    }
+    printf("State recovery phase took: %.3f ms. Current state is for batch: %d\n", get_time_ms() - rec_start_t, recovered_batch);
+
+    int log_fd_mmap = open(LOG_FILE, O_RDWR);
+    if (log_fd_mmap < 0) { perror("CRITICAL: Failed to open log for mmap"); free(main_state_array); free(temp_snap_slot); free(temp_tx_slot); exit(EXIT_FAILURE); }
+
+    void *mapped_log_region = mmap(NULL, TOTAL_LOG_FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, log_fd_mmap, 0);
+    if (mapped_log_region == MAP_FAILED) {
+        perror("mmap failed");
+        close(log_fd_mmap);
+        free(main_state_array);
+        free(temp_snap_slot);
+        free(temp_tx_slot);
+        exit(EXIT_FAILURE);
+    }
+
+    CheckpointHeader *log_header_ptr = (CheckpointHeader*)mapped_log_region;
+    if (log_header_ptr->magic != CHECKPOINT_MAGIC) {
+        fprintf(stderr, "Log file magic incorrect after mmap. Header magic: 0x%x\n", log_header_ptr->magic);
+        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap); free(main_state_array); free(temp_snap_slot); free(temp_tx_slot); exit(EXIT_FAILURE);
+    }
+
+    pthread_t msync_pthread;
+    msync_thread_data msync_data = { mapped_log_region, TOTAL_LOG_FILE_SIZE, 1 };
+    if (pthread_create(&msync_pthread, NULL, msync_thread_func, &msync_data) != 0) {
+        perror("Error creating msync thread");
+        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE);
+        close(log_fd_mmap);
+        free(main_state_array);
+        free(temp_snap_slot);
+        free(temp_tx_slot);
+        exit(EXIT_FAILURE);
+    }
+
+    Transaction *tx_batch_buf = malloc(BATCH_SIZE * sizeof(Transaction));
+    if (!tx_batch_buf) { perror("Failed to allocate tx_batch_buf"); msync_data.running = 0; pthread_join(msync_pthread, NULL); munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap); free(main_state_array); free(temp_snap_slot); free(temp_tx_slot); exit(EXIT_FAILURE); }
+
+    FILE *fp_tx = fopen(TX_FILE, "rb");
+    if (!fp_tx) {
+        char err_buf[256];
+        sprintf(err_buf, "Error opening transactions file '%s'", TX_FILE);
+        perror(err_buf);
+        // ... (full cleanup) ...
+        msync_data.running = 0; pthread_join(msync_pthread, NULL);
+        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
+        free(tx_batch_buf); free(temp_snap_slot); free(temp_tx_slot); free(main_state_array);
+        exit(EXIT_FAILURE);
+    }
+
+    // --- START OF MODIFIED SECTION ---
+    int actual_next_batch_to_process_from_tx_file;
+    if (recovered_batch == -1) {
+        actual_next_batch_to_process_from_tx_file = 0; // Fresh start
+        printf("No recovery or recovery to pre-batch 0 state. Starting transaction processing from batch 0.\n");
+    } else {
+        actual_next_batch_to_process_from_tx_file = recovered_batch + 1;
+        printf("State recovered up to batch %d. Starting transaction processing from batch %d.\n", recovered_batch, actual_next_batch_to_process_from_tx_file);
+    }
+
+    // Initialize last_processed_batch_this_run to the batch number of the current state in main_state_array
+    int last_processed_batch_this_run = recovered_batch;
+    // current_batch_num_from_file is the batch number we are about to attempt to process from TX_FILE
+    // and use for checkpointing.
+    uint32_t current_batch_num_from_file = actual_next_batch_to_process_from_tx_file;
+
+    if (actual_next_batch_to_process_from_tx_file > 0) {
+        printf("Seeking in %s to batch %d (offset %ld bytes).\n", TX_FILE, actual_next_batch_to_process_from_tx_file, (long)actual_next_batch_to_process_from_tx_file * BATCH_SIZE * sizeof(Transaction));
+        if (fseek(fp_tx, (long)actual_next_batch_to_process_from_tx_file * BATCH_SIZE * sizeof(Transaction), SEEK_SET) != 0) {
+            char err_buf[256];
+            sprintf(err_buf, "fseek on tx file to batch %d failed", actual_next_batch_to_process_from_tx_file);
+            perror(err_buf);
+            // ... (full cleanup) ...
+            fclose(fp_tx);
+            msync_data.running = 0; pthread_join(msync_pthread, NULL);
+            munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
+            free(tx_batch_buf); free(temp_snap_slot); free(temp_tx_slot); free(main_state_array);
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        printf("Starting %s from the beginning (batch 0).\n", TX_FILE);
+        // fseek to 0 can be done explicitly if there's any doubt, but fopen("rb") followed by fread should start at beginning.
+        // if (fseek(fp_tx, 0L, SEEK_SET) != 0) { perror("fseek to beginning of tx file failed"); ... exit ... }
+    }
+    // --- END OF MODIFIED SECTION ---
+
+    double proc_start_t = get_time_ms();
+    uint32_t batches_processed_this_run_count = 0; // Counter for new batches processed in this run's loop
+
+    printf("Starting transaction processing loop. Attempting to read batch %u from %s.\n", current_batch_num_from_file, TX_FILE);
+
+    while(1) {
+        size_t num_tx_read = fread(tx_batch_buf, sizeof(Transaction), BATCH_SIZE, fp_tx);
+        if (num_tx_read == 0) {
+            if(feof(fp_tx)) {
+                printf("End of transaction file reached. No more transactions starting from batch %u.\n", actual_next_batch_to_process_from_tx_file);
+            } else {
+                char err_buf[256];
+                sprintf(err_buf, "Error reading transaction file while attempting to read batch %u", current_batch_num_from_file);
+                perror(err_buf);
+            }
+            break;
+        }
+
+        // Successfully read a batch, so apply and commit
+        for (size_t k = 0; k < num_tx_read; ++k) {
+            apply_transaction_to_state_array(&tx_batch_buf[k], main_state_array);
+        }
+
+        uint32_t chkpt_cycle = (current_batch_num_from_file / NUM_STATE_CHUNKS) % CYCLES;
+        uint32_t slot_in_cycle = current_batch_num_from_file % NUM_STATE_CHUNKS;
+        commit_batch_data_to_log(chkpt_cycle, slot_in_cycle, current_batch_num_from_file, main_state_array, tx_batch_buf, num_tx_read, mapped_log_region, temp_snap_slot, temp_tx_slot);
+
+        if (((current_batch_num_from_file + 1) % NUM_STATE_CHUNKS) == 0 && current_batch_num_from_file >= (NUM_STATE_CHUNKS -1) ) {
+            uint32_t completed_cycle = chkpt_cycle; // The cycle that just got filled
+            // The new oldest_cycle will be this completed_cycle, as the other one is now more up-to-date (or being written to)
+            log_header_ptr->oldest_cycle = completed_cycle;
+            // Ensure this critical header update is synced to disk
+            if (msync((void*)log_header_ptr, CHECKPOINT_HEADER_SIZE, MS_SYNC) != 0) {
+                 perror("CRITICAL: Failed to msync header update for oldest_cycle");
+                 // Potentially handle this more gracefully, e.g., attempt retry or shutdown safely
+            }
+            printf("Batch %u: Cycle %u fully checkpointed. Header's oldest_cycle updated to %u.\n", current_batch_num_from_file, completed_cycle, log_header_ptr->oldest_cycle);
+        }
+
+        if ((current_batch_num_from_file % 100) == 0 || num_tx_read < BATCH_SIZE) {
+            printf("Processed batch %u from %s (%zu tx)\n", current_batch_num_from_file, TX_FILE, num_tx_read);
+        }
+        
+        last_processed_batch_this_run = current_batch_num_from_file; // This batch has been fully processed and checkpointed
+        batches_processed_this_run_count++;
+        current_batch_num_from_file++; // Increment for the next batch number to be processed
+
+        if (num_tx_read < BATCH_SIZE) {
+            printf("Last batch from file (%u) was incomplete (%zu tx) or end of file reached.\n", last_processed_batch_this_run, num_tx_read);
+            break;
+        }
+    }
+    printf("--- End of transaction processing loop ---\n");
+    printf("Total NEW batches processed from %s in this run's loop: %u.\n", TX_FILE, batches_processed_this_run_count);
+    printf("State in memory is now reflective of batch %d being fully processed.\n", last_processed_batch_this_run);
+
+
+    if (last_processed_batch_this_run != -1) {
+        printf("Computing final state hash for batch %d (after this run's processing)...\n", last_processed_batch_this_run);
+        // Sample state BEFORE final hash
+        printf("Sample state BEFORE final hash (batch %d):\n", last_processed_batch_this_run);
+        for (int i = 0; i < 5 && i < SMALL_ACCOUNT_COUNT; ++i) {
+             printf("  main_state_array[%d] = %" PRId64 "\n", i, main_state_array[i]);
+        }
+        uint64_t final_hash = compute_state_hash(main_state_array, SMALL_ACCOUNT_COUNT);
+        printf("Computed final_hash: 0x%016" PRIx64 " for batch %d\n", final_hash, last_processed_batch_this_run);
+        save_state_hash_to_file(final_hash, last_processed_batch_this_run);
+    } else {
+        printf("No batches were processed or recovered to a valid state; skipping final hash saving.\n");
+    }
+
+    printf("Shutting down...\n");
+    msync_data.running = 0;
+    pthread_join(msync_pthread, NULL);
+    printf("msync thread joined.\n");
+
+    // Final sync before closing mmaped file descriptor
+    if (msync(mapped_log_region, TOTAL_LOG_FILE_SIZE, MS_SYNC) != 0) {
+        perror("Final msync of log data failed during cleanup");
+    }
+    if (fsync(log_fd_mmap) != 0) { perror("fsync of log_fd_mmap failed during cleanup"); }
+
+    if (munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE) != 0) { perror("munmap failed during cleanup"); }
+    fclose(fp_tx);
+    close(log_fd_mmap);
+    printf("Log unmapped and closed.\n");
+
+    free(tx_batch_buf);
+    free(temp_snap_slot);
+    free(temp_tx_slot);
+    free(main_state_array);
+    printf("Memory freed. Execution complete. Total processing time for this run's loop: %.3f ms\n", get_time_ms() - proc_start_t);
+
+    return 0;
+}
