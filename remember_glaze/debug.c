@@ -271,7 +271,8 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
         free(temp_snap_slot); free(temp_tx_slot); free(batch_of_snapshot_for_chunk);
         return -1;
     }
-    for(uint32_t i=0; i<NUM_STATE_CHUNKS; ++i) batch_of_snapshot_for_chunk[i] = -1; // Init to -1 (no snapshot loaded yet)
+    for(uint32_t i=0; i < NUM_STATE_CHUNKS; ++i) 
+      batch_of_snapshot_for_chunk[i] = -1; // Init to -1 (no snapshot loaded yet)
 
 
     // --- Step 1: Determine latest_chunk_saved_in_newest_cycle ---
@@ -315,7 +316,7 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
             if (read_bytes == (ssize_t)sizeof(SnapshotSlot) && temp_snap_slot->chunk_idx_in_ring == chunk_k) {
                 nt_memcpy(state_array_to_recover + (size_t)chunk_k * ACCOUNTS_PER_STATE_CHUNK,
                           temp_snap_slot->state_data, ACCOUNTS_PER_STATE_CHUNK * ACCOUNT_SIZE);
-                batch_of_snapshot_for_chunk[chunk_k] = (int)temp_snap_slot->batch_num; // Store batch of loaded snapshot
+                batch_of_snapshot_for_chunk[chunk_k] = (int)temp_snap_slot->batch_num; // Store batch number of loaded snapshot
                 if ((int)temp_snap_slot->batch_num > max_loaded_batch_overall) {
                     max_loaded_batch_overall = (int)temp_snap_slot->batch_num;
                 }
@@ -337,6 +338,7 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
             if (read_bytes == (ssize_t)sizeof(SnapshotSlot) && temp_snap_slot->chunk_idx_in_ring == chunk_k) {
                 nt_memcpy(state_array_to_recover + (size_t)chunk_k * ACCOUNTS_PER_STATE_CHUNK,
                           temp_snap_slot->state_data, ACCOUNTS_PER_STATE_CHUNK * ACCOUNT_SIZE);
+
                 batch_of_snapshot_for_chunk[chunk_k] = (int)temp_snap_slot->batch_num; // Store batch of loaded snapshot
                 if ((int)temp_snap_slot->batch_num > max_loaded_batch_overall) {
                     max_loaded_batch_overall = (int)temp_snap_slot->batch_num;
@@ -356,14 +358,18 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
     TransactionWithBatchNum *tx_buffer_for_sorting = malloc(max_possible_txs_to_collect * sizeof(TransactionWithBatchNum));
     if (!tx_buffer_for_sorting) {
         perror("Recovery: malloc for tx_buffer_for_sorting failed");
-        free(temp_snap_slot); free(temp_tx_slot); free(batch_of_snapshot_for_chunk);
+        free(temp_snap_slot); 
+        free(temp_tx_slot); 
+        free(batch_of_snapshot_for_chunk);
         return -1;
     }
     size_t collected_tx_count = 0;
     size_t tx_slot_array_offset = CHECKPOINT_HEADER_SIZE + TOTAL_SNAPSHOT_SLOTS * sizeof(SnapshotSlot);
-
+    
+    // Iterate through each chunk's tx slot batch
     for (uint32_t current_processing_chunk_idx = 0; current_processing_chunk_idx < NUM_STATE_CHUNKS; ++current_processing_chunk_idx) {
         uint32_t source_cycle_for_tx;
+        // This if is a bit shady - there is no source cycle for tx, we should go through every chunk we've loaded
         if (latest_chunk_saved_in_newest_cycle != -1 && (int)current_processing_chunk_idx <= latest_chunk_saved_in_newest_cycle) {
             source_cycle_for_tx = newest_cycle;
         } else {
@@ -376,78 +382,76 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
         ssize_t read_bytes = pread(log_fd, temp_tx_slot, sizeof(TxSlot), tx_offset_in_file);
 
         if (read_bytes == (ssize_t)sizeof(TxSlot)) {
-            // This TxSlot is associated with current_processing_chunk_idx.
-            // Its batch number is temp_tx_slot->batch_num.
-
-            if (temp_tx_slot->tx_count > BATCH_SIZE) {
-                fprintf(stderr, "Recovery WARNING: TxSlot for chunk %u (cycle %u, batch %u) has tx_count %u > BATCH_SIZE. Clamping.\n",
-                        current_processing_chunk_idx, source_cycle_for_tx, temp_tx_slot->batch_num, temp_tx_slot->tx_count);
-                temp_tx_slot->tx_count = BATCH_SIZE;
-            }
-
-            for (uint32_t tx_idx = 0; tx_idx < temp_tx_slot->tx_count; ++tx_idx) {
-                const Transaction *tx = &temp_tx_slot->transactions[tx_idx];
-                bool apply_this_tx = false;
-
-                uint8_t sfunc = GET_FUNC(tx->sender);
-                uint8_t rfunc = GET_FUNC(tx->receiver);
-                uint64_t sdata = GET_DATA(tx->sender);
-                uint64_t rdata = GET_DATA(tx->receiver);
-
-                // Check sender account
-                if (sdata < PADDED_ACCOUNT_COUNT) { // Ensure account index is valid
-                    uint32_t s_chunk_affected = sdata / ACCOUNTS_PER_STATE_CHUNK;
-                    if (s_chunk_affected < NUM_STATE_CHUNKS && s_chunk_affected <= current_processing_chunk_idx) { // Spatial rule
-                        if ((int)temp_tx_slot->batch_num > batch_of_snapshot_for_chunk[s_chunk_affected]) { // Temporal rule
-                            apply_this_tx = true;
-                        }
-                    }
-                }
-
-                // Check receiver account (if not already set to apply)
-                if (!apply_this_tx && rdata < PADDED_ACCOUNT_COUNT) { // Ensure account index is valid
-                     if (sfunc == 0 && rfunc == 0) { // Only for transfers, range set only has one "affected" primary region
-                        uint32_t r_chunk_affected = rdata / ACCOUNTS_PER_STATE_CHUNK;
-                        if (r_chunk_affected < NUM_STATE_CHUNKS && r_chunk_affected <= current_processing_chunk_idx) { // Spatial rule
-                            if ((int)temp_tx_slot->batch_num > batch_of_snapshot_for_chunk[r_chunk_affected]) { // Temporal rule
-                                apply_this_tx = true;
-                            }
-                        }
-                     }
-                }
-                
+          // Its batch number is temp_tx_slot->batch_num.
+          // This TxSlot is associated with current_processing_chunk_idx.
+          if (temp_tx_slot->tx_count > BATCH_SIZE) {
+              fprintf(stderr, "Recovery WARNING: TxSlot for chunk %u (cycle %u, batch %u) has tx_count %u > BATCH_SIZE. Clamping.\n",
+                      current_processing_chunk_idx, source_cycle_for_tx, temp_tx_slot->batch_num, temp_tx_slot->tx_count);
+              temp_tx_slot->tx_count = BATCH_SIZE;
+          }
+          // Iterate through the transactions inside current tx Slot batch
+          for (uint32_t tx_idx = 0; tx_idx < temp_tx_slot->tx_count; ++tx_idx) {
+              const Transaction *tx = &temp_tx_slot->transactions[tx_idx];
+              bool apply_this_tx = false;
+              uint8_t sfunc = GET_FUNC(tx->sender);
+              uint8_t rfunc = GET_FUNC(tx->receiver);
+              uint64_t sdata = GET_DATA(tx->sender);
+              uint64_t rdata = GET_DATA(tx->receiver);
+              //TODO: This is good 
+              // Check sender account
+              if (sdata < PADDED_ACCOUNT_COUNT) { // Ensure account index is valid
+                  // s_chunk_affected is the chunk index of the sender account
+                  uint32_t s_chunk_affected = sdata / ACCOUNTS_PER_STATE_CHUNK;
+                  // Semantically : if the sender account is in an earlier chunk than the current one we are processing, then it is an eligible tx
+                  if (s_chunk_affected < NUM_STATE_CHUNKS && s_chunk_affected < current_processing_chunk_idx) { // Spatial rule
+                      // Semantically : if the tx is from a later batch than the chunk containing the sender account, then it is an eligible tx
+                      if ((int)temp_tx_slot->batch_num > batch_of_snapshot_for_chunk[s_chunk_affected]) { // Temporal rule
+                          apply_this_tx = true;
+                      }
+                  }
+              }
+              // Check receiver account (if not already set to apply)
+              if (!apply_this_tx && rdata < PADDED_ACCOUNT_COUNT) { // Ensure account index is valid
+                   if (sfunc == 0 && rfunc == 0) { // Only for transfers, range set only has one "affected" primary region
+                      uint32_t r_chunk_affected = rdata / ACCOUNTS_PER_STATE_CHUNK;
+                      if (r_chunk_affected < NUM_STATE_CHUNKS && r_chunk_affected <= current_processing_chunk_idx) { // Spatial rule
+                          if ((int)temp_tx_slot->batch_num > batch_of_snapshot_for_chunk[r_chunk_affected]) { // Temporal rule
+                              apply_this_tx = true;
+                          }
+                      }
+                   }
+              }
                 // Check range for Range Set
-                if (sfunc == 1 && rfunc == 1) {
-                    uint64_t start_idx = sdata;
-                    uint64_t len = rdata;
-                    if (len > 0 && start_idx < PADDED_ACCOUNT_COUNT) {
-                        uint64_t end_idx_range = start_idx + len -1;
-                        if (end_idx_range >= PADDED_ACCOUNT_COUNT) end_idx_range = PADDED_ACCOUNT_COUNT -1;
-
-                        for (uint64_t acc_idx_in_range = start_idx; acc_idx_in_range <= end_idx_range; ++acc_idx_in_range) {
-                            uint32_t current_chunk_affected = acc_idx_in_range / ACCOUNTS_PER_STATE_CHUNK;
-                            if (current_chunk_affected < NUM_STATE_CHUNKS && current_chunk_affected <= current_processing_chunk_idx) { // Spatial rule
-                                if ((int)temp_tx_slot->batch_num > batch_of_snapshot_for_chunk[current_chunk_affected]) { // Temporal rule
-                                    apply_this_tx = true;
-                                    break; // Found one affected account in range that needs update
-                                }
-                            }
-                        }
-                    }
-                }
-
-
-                if (apply_this_tx) {
-                    if (collected_tx_count < max_possible_txs_to_collect) {
-                        tx_buffer_for_sorting[collected_tx_count].tx = *tx;
-                        tx_buffer_for_sorting[collected_tx_count].original_batch_num = temp_tx_slot->batch_num;
-                        collected_tx_count++;
-                    } else {
-                        fprintf(stderr, "Recovery ERROR: tx_buffer_for_sorting overflowed. Aborting collection.\n");
-                        goto end_tx_collection;
-                    }
-                }
-            }
+              //TODO: This is good
+              if (sfunc == 1 && rfunc == 1) {
+                  uint64_t start_idx = sdata;
+                  uint64_t len = rdata;
+                  if (len > 0 && start_idx < PADDED_ACCOUNT_COUNT) {
+                      uint64_t end_idx_range = start_idx + len -1;
+                      if (end_idx_range >= PADDED_ACCOUNT_COUNT) {
+                          end_idx_range = PADDED_ACCOUNT_COUNT -1;
+                      }
+                      for (uint64_t acc_idx_in_range = start_idx; acc_idx_in_range <= end_idx_range; ++acc_idx_in_range) {
+                          uint32_t current_chunk_affected = acc_idx_in_range / ACCOUNTS_PER_STATE_CHUNK;
+                          if (current_chunk_affected < NUM_STATE_CHUNKS && current_chunk_affected <= current_processing_chunk_idx) { // Spatial rule
+                              if ((int)temp_tx_slot->batch_num > batch_of_snapshot_for_chunk[current_chunk_affected]) { // Temporal rule
+                                  apply_this_tx = true;
+                              }
+                          }
+                      }
+                  }
+              }
+              if (apply_this_tx) {
+                  if (collected_tx_count < max_possible_txs_to_collect) {
+                      tx_buffer_for_sorting[collected_tx_count].tx = *tx;
+                      tx_buffer_for_sorting[collected_tx_count].original_batch_num = temp_tx_slot->batch_num;
+                      collected_tx_count++;
+                  } else {
+                      fprintf(stderr, "Recovery ERROR: tx_buffer_for_sorting overflowed. Aborting collection.\n");
+                      goto end_tx_collection;
+                  }
+              }
+          }
         }
     }
 end_tx_collection:;
@@ -634,32 +638,38 @@ int main(int argc, char **argv) {
     preallocate_and_init_log_file(LOG_FILE, TOTAL_LOG_FILE_SIZE);
 
     double rec_start_t = get_time_ms();
-    int log_fd_rec = open(LOG_FILE, O_RDONLY);
+    int log_fd_rec = -1; // Initialize to -1
+    
     int recovered_batch = -1;
     bool meaningful_state_recovered = false;
 
-    memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
-
-    if (log_fd_rec >= 0) {
-        if (recover_state_from_log(log_fd_rec, main_state_array, &recovered_batch) == 0) {
-            if (recovered_batch >= 0) {
-                meaningful_state_recovered = true;
-                printf("Recovery successful. State loaded reflects state AFTER batch %d.\n", recovered_batch);
-            } else {
-                printf("Recovery function finished, but no prior state (batch >= 0) could be established.\n");
-                memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE); // Re-zero
-            }
-        } else {
-            fprintf(stderr, "Recovery function reported a critical error.\n");
-            memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE); // Re-zero
-            recovered_batch = -1;
-        }
-        close(log_fd_rec);
+    // Check if the log file exists before attempting recovery
+    if (access(LOG_FILE, F_OK) != 0) {
+        printf("Recovery: %s not found. Skipping recovery phase.\\n", LOG_FILE);
+        // Ensure main_state_array is initialized if recovery is skipped
+        memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE); 
     } else {
-        if (!is_reference_run) { perror("CRITICAL: Failed to open log file for recovery"); exit(EXIT_FAILURE); }
-        else { printf("INFO: Log file %s not found (expected for fresh reference run).\n", LOG_FILE); }
+        log_fd_rec = open(LOG_FILE, O_RDONLY);
+        if (log_fd_rec < 0) {
+            perror("Recovery: Error opening log file for reading, even though it exists. Skipping recovery.");
+            // Ensure main_state_array is initialized if recovery is skipped
+            memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
+        } else {
+            printf("Attempting to recover state from %s\\n", LOG_FILE);
+            if (recover_state_from_log(log_fd_rec, main_state_array, &recovered_batch) == 0) {
+                meaningful_state_recovered = true;
+                printf("Recovery successful. Last recovered batch: %d\n", recovered_batch);
+            } else {
+                printf("Recovery from log failed or produced no meaningful state. Initializing state to zero.\\n");
+                memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE); // Initialize to zero if recovery fails
+                recovered_batch = -1; // Ensure this is reset
+            }
+            close(log_fd_rec);
+        }
     }
-    printf("State recovery phase took: %.3f ms. State reflects batch: %d.\n", get_time_ms() - rec_start_t, recovered_batch);
+    double rec_end_t = get_time_ms();
+    printf("Recovery phase took %.3f ms. Last recovered batch: %d. Meaningful state recovered: %s\\n",
+           rec_end_t - rec_start_t, recovered_batch, meaningful_state_recovered ? "yes" : "no");
 
     if (!meaningful_state_recovered) {
         printf("Initializing main state array with default balances as no prior state was recovered.\n");
@@ -739,9 +749,12 @@ int main(int argc, char **argv) {
             else perror("Error reading transaction file");
             break;
         }
+        // calculate transaction apply time
+        double tx_apply_start_t = get_time_ms();
         for (size_t k = 0; k < num_tx_read; ++k) {
             apply_transaction_to_state_array(&tx_batch_buf[k], main_state_array);
         }
+        double tx_apply_end_t = get_time_ms();
         uint32_t chkpt_cycle = (current_batch_num_in_loop / NUM_STATE_CHUNKS) % CYCLES;
         uint32_t slot_in_cycle = current_batch_num_in_loop % NUM_STATE_CHUNKS;
         commit_batch_data_to_log(chkpt_cycle, slot_in_cycle, current_batch_num_in_loop,
@@ -755,8 +768,8 @@ int main(int argc, char **argv) {
             printf("Batch %u: Cycle %u fully checkpointed. Header oldest_cycle updated to %u.\n",
                    current_batch_num_in_loop, chkpt_cycle, log_header_ptr->oldest_cycle);
         }
-        if ((current_batch_num_in_loop % 100) == 0 || num_tx_read < BATCH_SIZE) {
-            printf("Processed batch %u (%zu tx read).\n", current_batch_num_in_loop, num_tx_read);
+        if ((current_batch_num_in_loop % 10) == 0 || num_tx_read < BATCH_SIZE) {
+            printf("Processed batch %u (%zu tx read) in %.3f ms.\n", current_batch_num_in_loop, num_tx_read, tx_apply_end_t - tx_apply_start_t);
         }
         last_batch_processed_this_run = current_batch_num_in_loop;
         file_batches_processed_this_run_count++;
