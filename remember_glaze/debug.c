@@ -14,12 +14,11 @@
 #include <errno.h>
 #include <pthread.h>
 #include <inttypes.h>
-#include <limits.h> // Required for INT_MAX
 
 // --- Definitions and Constants ---
 
 #define BATCH_SIZE              (1ULL << 16)      // 65,536 transactions per batch
-#define SMALL_ACCOUNT_COUNT     100000       // Target number of accounts
+#define SMALL_ACCOUNT_COUNT     2000000UL       // Target number of accounts
 #define ACCOUNT_SIZE            8 // Use sizeof for clarity and portability
 
 // State Chunk configuration
@@ -178,7 +177,7 @@ int compare_tx_with_batch_num(const void *a, const void *b) {
 }
 
 // --- Transaction Application to In-Memory State ---
-static inline void apply_transaction_to_state_array(const Transaction *tx, int64_t *restrict state_array) {
+static inline bool apply_transaction_to_state_array(const Transaction *tx, int64_t *restrict state_array) {
     uint8_t sfunc = GET_FUNC(tx->sender);
     uint8_t rfunc = GET_FUNC(tx->receiver);
     uint64_t sidx = GET_DATA(tx->sender);
@@ -186,31 +185,34 @@ static inline void apply_transaction_to_state_array(const Transaction *tx, int64
 
     if (sidx >= PADDED_ACCOUNT_COUNT || (rfunc == 0 && ridx >= PADDED_ACCOUNT_COUNT)) { // Check bounds carefully
         // For range set, ridx is length, not an account index directly for bounds check here
-        if (sfunc == 0 && rfunc == 0) return; // Simple transfer out of bounds
-        if (sfunc == 1 && rfunc == 1 && sidx >= PADDED_ACCOUNT_COUNT) return; // Range set starts out of bounds
+        if (sfunc == 0 && rfunc == 0) return false; // Simple transfer out of bounds
+        if (sfunc == 1 && rfunc == 1) return false; // Range set starts out of bounds
     }
 
 
     if (sfunc == 0 && rfunc == 0) { // Simple Transfer
          if (sidx >= SMALL_ACCOUNT_COUNT || ridx >= SMALL_ACCOUNT_COUNT) { // Apply business logic bounds
-            return;
+            return false;
         }
         if (state_array[sidx] >= (int64_t)tx->amount) {
             state_array[sidx] -= tx->amount;
             state_array[ridx] += tx->amount;
+            return true;
         }
     } else if (sfunc == 1 && rfunc == 1) { // Range Set
         uint64_t start_idx = sidx;
         uint64_t len       = GET_DATA(tx->receiver); // ridx is len
-        if (len == 0) return;
+        if (len == 0) return false;
         // Apply business logic bounds for range set
-        if (start_idx >= SMALL_ACCOUNT_COUNT) return; // Entire range is outside interesting area
+        if (start_idx >= SMALL_ACCOUNT_COUNT) return false; // Entire range is outside interesting area
 
         for (uint64_t i = 0; i < len; ++i) {
-            if (start_idx + i >= SMALL_ACCOUNT_COUNT) break; // Stop if exceeding logical account limit
+            if (start_idx + i >= SMALL_ACCOUNT_COUNT) return true; // Stop if exceeding logical account limit
             state_array[start_idx + i] = (int64_t)tx->amount;
         }
+        return true;
     }
+    return false;
 }
 
 // --- Checkpoint Commit Function ---
@@ -252,7 +254,6 @@ static void commit_batch_data_to_log(
     // Perform a single msync for both snapshot and transaction data
     if (pagesize == -1) { // Should have been checked earlier, but as a safeguard
         perror("commit_batch_data_to_log: invalid pagesize");
-        // Potentially exit or handle error more gracefully
         return;
     }
 
@@ -429,31 +430,38 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
                 uint8_t rfunc = GET_FUNC(tx->receiver);
                 uint64_t sdata = GET_DATA(tx->sender);
                 uint64_t rdata = GET_DATA(tx->receiver);
-                
+
+                // Print transaction details
+                //printf("[REPLAY TX] Batch: %u, TX_idx: %u, Sender: 0x%016lx (Func: %u, Data: %lu), Receiver: 0x%016lx (Func: %u, Data: %lu), Amount: %lu\n",
+                //       temp_tx_slot->batch_num, // or curr_batch
+                //       tx_idx,
+                //       tx->sender, sfunc, sdata,
+                //       tx->receiver, rfunc, rdata,
+                //       tx->amount);
+
                 //printf("[DEBUG] Processing tx_idx=%u, sfunc=%u, rfunc=%u, sdata=%lu, rdata=%lu\n", tx_idx, sfunc, rfunc, sdata, rdata);
                 // Transfer transaction
+                
                 if (sfunc == 0 && rfunc == 0) {
+                    bool sender_in_this_chunk_scope = (sdata < PADDED_ACCOUNT_COUNT && (sdata / ACCOUNTS_PER_STATE_CHUNK) == currently_processing_chnk);
+                    bool receiver_in_this_chunk_scope = (rdata < PADDED_ACCOUNT_COUNT && (rdata / ACCOUNTS_PER_STATE_CHUNK) == currently_processing_chnk);
+                    bool can_transfer_based_on_current_sdata_in_array = (sdata < PADDED_ACCOUNT_COUNT);
                     bool counted = false;
-                    // Check sender account
-                    if (sdata >= 0 && sdata < PADDED_ACCOUNT_COUNT) { // Ensure account index is valid
-                        uint32_t s_chunk_affected = sdata / ACCOUNTS_PER_STATE_CHUNK;
-                        if (s_chunk_affected == currently_processing_chnk) {
-                           if( state_array_to_recover[sdata] >= (int64_t)tx->amount ) {
-                                state_array_to_recover[sdata] -= (int64_t)tx->amount;
-                                counted = true;
-                                ++collected_tx_count;
-                           }
+                    if (sender_in_this_chunk_scope) {
+                        if (can_transfer_based_on_current_sdata_in_array) {
+                            state_array_to_recover[sdata] -= (int64_t)tx->amount;
+                            ++collected_tx_count;
+                            counted = true;
                         }
                     }
-                    if (rdata >= 0 && rdata < PADDED_ACCOUNT_COUNT) { // Ensure account index is valid
-                        uint32_t r_chunk_affected = rdata / ACCOUNTS_PER_STATE_CHUNK;
-                        if (r_chunk_affected == currently_processing_chnk) {                        
-                            if( state_array_to_recover[sdata] >= (int64_t)tx->amount ) {
-                                if (counted == false) {
-                                    ++collected_tx_count;
-                                    counted = true;
-                                }
-                                state_array_to_recover[rdata] += (int64_t)tx->amount;
+                    
+                    if (receiver_in_this_chunk_scope) {
+                        // CRUCIAL: Use the SAME can_transfer decision. Do NOT re-evaluate based on potentially changed state_array_to_recover[sdata]
+                        if (can_transfer_based_on_current_sdata_in_array) { 
+                            state_array_to_recover[rdata] += (int64_t)tx->amount; 
+                             if (counted == false) {
+                                ++collected_tx_count;
+                                counted = true;
                             }
                         }
                     }
@@ -466,6 +474,7 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
                     if (start_idx >= 0 && start_idx < PADDED_ACCOUNT_COUNT) {
                         for (uint64_t i = 0; i < len; ++ i) {
                             uint32_t current_chunk_affected = (start_idx + i) / ACCOUNTS_PER_STATE_CHUNK;
+                            if (start_idx + i >= SMALL_ACCOUNT_COUNT) break;
                             if (current_chunk_affected == currently_processing_chnk) {
                                 state_array_to_recover[start_idx + i] = (int64_t)tx->amount;
                             }
@@ -712,6 +721,14 @@ int main(int argc, char **argv) {
     printf("Recovery phase took %.3f ms. Last recovered batch: %d. Meaningful state recovered: %s \n",
            rec_end_t - rec_start_t, recovered_batch, meaningful_state_recovered ? "yes" : "no");
 
+    // Print state after recovery or initial default initialization
+    //printf("--- State After Recovery/Initialisation (Reflects Batch: %d) ---\n", recovered_batch);
+    //for (uint64_t i = 0; i < SMALL_ACCOUNT_COUNT; ++i) {
+    //    printf("Account[%02lu]: %-12ld ", i, main_state_array[i]);
+    //    if ((i + 1) % 4 == 0 || i == SMALL_ACCOUNT_COUNT - 1) printf("\n");
+    //}
+    printf("--------------------------------------------------------------------\n");
+
     if (!meaningful_state_recovered) {
         printf("Initializing main state array with default balances as no prior state was recovered.\n");
         for (uint64_t i = 0; i < SMALL_ACCOUNT_COUNT; i++) main_state_array[i] = 1000000; // Init only logical accounts
@@ -819,7 +836,10 @@ int main(int argc, char **argv) {
 
         double tx_apply_start_t = get_time_ms();
         for (size_t k = 0; k < num_tx_read; ++k) {
-            apply_transaction_to_state_array(&tx_batch_buf[k], main_state_array);
+            bool curr_tx_applied = apply_transaction_to_state_array(&tx_batch_buf[k], main_state_array);
+            if (!curr_tx_applied) {
+                tx_batch_buf[k].amount = 0;
+            }
         }
         double tx_apply_end_t = get_time_ms();
 
@@ -893,8 +913,16 @@ int main(int argc, char **argv) {
 
     printf("--- Finished processing %s (%u batches this run) in %.3f ms ---\n",
            TX_FILE, file_batches_processed_this_run_count, get_time_ms() - proc_start_t_loop);
-    printf("Final state in memory reflects batch: %d\n", current_batch_num_in_loop);
+    //printf("Final state in memory reflects batch: %d\n", current_batch_num_in_loop);
     printf("[SUMMARY] Number of batches processed from %s in this run: %u\n", TX_FILE, file_batches_processed_this_run_count);
+
+    // Print state after all transactions for this run are processed
+    //printf("--- State After Processing All Transactions in This Run (Reflects Batch: %d) ---\n", current_batch_num_in_loop);
+    //for (uint64_t i = 0; i < SMALL_ACCOUNT_COUNT; ++i) {
+    //    printf("Account[%02lu]: %-12ld ", i, main_state_array[i]);
+    //    if ((i + 1) % 4 == 0 || i == SMALL_ACCOUNT_COUNT - 1) printf("\n");
+    //}
+    //printf("------------------------------------------------------------------------------------\n");
 
     int batch_for_final_hash_label = current_batch_num_in_loop;
     if (batch_for_final_hash_label >= 0) {
