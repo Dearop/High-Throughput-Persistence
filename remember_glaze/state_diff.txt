@@ -1,0 +1,3 @@
+--- dump_state_diff starting (comparing 2000000 accounts, reporting max 2000000) ---
+dump_state_diff: States are **identical** (2000000 accounts)
+--- dump_state_diff finished ---
