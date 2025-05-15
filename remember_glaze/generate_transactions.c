@@ -8,7 +8,6 @@
 #define NUMBER_OF_BATCHES   128
 #define TOTAL_TRANSACTIONS  (BATCH_SIZE * NUMBER_OF_BATCHES)
 #define SMALL_ACCOUNT_COUNT  2000000UL       // Target number of accounts
-#define SMALL_ACCOUNT_COUNT  2000000UL       // Target number of accounts
 
 // --- Operation Encoding ---
 // Top 4 bits hold the op code, remaining 60 bits hold data.
@@ -19,7 +18,6 @@
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
-    uint64_t amount;
     uint64_t amount;
 } Transaction;
 
@@ -35,73 +33,28 @@ int main(void) {
 
     //printf("--- Generating Transactions ---\n");
     for (uint64_t i = 0; i < TOTAL_TRANSACTIONS; i++) {
-        uint64_t op_type_flag; // 0 for P2P, 1 for Range Set
-        uint64_t display_sender, display_receiver_or_count, display_amount;
-
-        uint64_t op_type_flag; // 0 for P2P, 1 for Range Set
-        uint64_t display_sender, display_receiver_or_count, display_amount;
 
         double r = (double)rand() / RAND_MAX;
         if (r < 0.05) { // Range Set
-            op_type_flag = 1;
-        if (r < 0.05) { // Range Set
-            op_type_flag = 1;
             uint64_t start = rand() % SMALL_ACCOUNT_COUNT;
-            uint64_t max_len = SMALL_ACCOUNT_COUNT - start; // Corrected max_count to max_len for clarity
-            if (max_len == 0) max_len = 1; // Ensure count is at least 1 if start is the last account
-            if (max_len > 100) { // Keep original constraint if intended
-                max_len = 100;
             uint64_t max_len = SMALL_ACCOUNT_COUNT - start; // Corrected max_count to max_len for clarity
             if (max_len == 0) max_len = 1; // Ensure count is at least 1 if start is the last account
             if (max_len > 100) { // Keep original constraint if intended
                 max_len = 100;
             }
             uint64_t count = (rand() % max_len) + 1;
-            uint64_t count = (rand() % max_len) + 1;
             tx.sender = ENCODE_OP(1, start);
             tx.receiver = ENCODE_OP(1, count);
             tx.amount = rand() % 1000; // Value to set
 
-            display_sender = start;
-            display_receiver_or_count = count;
-            display_amount = tx.amount;
         } else { // P2P Transfer
-            op_type_flag = 0;
-            tx.amount = rand() % 1000; // Value to set
-
-            display_sender = start;
-            display_receiver_or_count = count;
-            display_amount = tx.amount;
-        } else { // P2P Transfer
-            op_type_flag = 0;
             uint64_t sender_index = rand() % SMALL_ACCOUNT_COUNT;
             uint64_t receiver_index = rand() % SMALL_ACCOUNT_COUNT;
-            // Ensure sender and receiver are different for a meaningful transfer, though not strictly required by problem
-            // while (receiver_index == sender_index) { receiver_index = rand() % SMALL_ACCOUNT_COUNT; }
             // Ensure sender and receiver are different for a meaningful transfer, though not strictly required by problem
             // while (receiver_index == sender_index) { receiver_index = rand() % SMALL_ACCOUNT_COUNT; }
             tx.sender = ENCODE_OP(0, sender_index);
             tx.receiver = ENCODE_OP(0, receiver_index);
             tx.amount = (rand() % 1000) + 1;
-
-            display_sender = sender_index;
-            display_receiver_or_count = receiver_index;
-            display_amount = tx.amount;
-        }
-        
-        //printf("Generated TX %lu: Type: %s, Sender/Start: %lu, Receiver/Count: %lu, Amount/Value: %lu (Raw Sender: 0x%016lx, Raw Receiver: 0x%016lx)\n",
-        //       i,
-        //       op_type_flag == 0 ? "P2P" : "RangeSet",
-        //       display_sender,
-        //       display_receiver_or_count,
-        //       display_amount,
-        //       tx.sender,
-        //       tx.receiver);
-
-
-            display_sender = sender_index;
-            display_receiver_or_count = receiver_index;
-            display_amount = tx.amount;
         }
         
         //printf("Generated TX %lu: Type: %s, Sender/Start: %lu, Receiver/Count: %lu, Amount/Value: %lu (Raw Sender: 0x%016lx, Raw Receiver: 0x%016lx)\n",
