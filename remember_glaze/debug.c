@@ -19,7 +19,7 @@
 // --- Definitions and Constants ---
 
 #define BATCH_SIZE              (1ULL << 16)      // 65,536 transactions per batch
-#define SMALL_ACCOUNT_COUNT     50000       // Target number of accounts
+#define SMALL_ACCOUNT_COUNT     100000       // Target number of accounts
 #define ACCOUNT_SIZE            8 // Use sizeof for clarity and portability
 
 // State Chunk configuration
@@ -300,14 +300,7 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
         // return -1; // Or attempt to use 0 anyway if deemed safe.
     }
 
-
     printf("Recovery: Valid checkpoint header. Using cycle 0.\n");
-
-    // uint32_t oldest_cycle = header.oldest_cycle; // MODIFIED: Not used directly like this
-    // uint32_t newest_cycle = (oldest_cycle + 1) % CYCLES; // MODIFIED: Always 0
-    const uint32_t recovery_cycle = 0; // Only one cycle to consider
-
-    *last_recovered_batch_num = -1; // Initialize
 
     ChunkSlot *temp_snap_slot = malloc(sizeof(ChunkSlot));
     BatchSlot *temp_tx_slot = malloc(sizeof(BatchSlot));
@@ -322,12 +315,12 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
     for(uint32_t i=0; i < NUM_STATE_CHUNKS; ++i)
       batch_number_of_chunk[i] = -1;
 
-    // --- Step 1: Determine latest_chunk_saved_in_cycle (simplified from newest_cycle) ---
+    // --- Step 1: Determine latest_chunk_saved_in_cycle ---
     int latest_chunk_idx_overall = -1; // Index of the chunk with the highest batch number
     int highest_batch_in_cycle = -1;
     size_t snapshot_slot_header_offset = CHECKPOINT_HEADER_SIZE;
 
-    printf("Recovery Sub-Step 1.1: Scanning cycle %u for latest saved chunk snapshot info...\n", recovery_cycle);
+    printf("Recovery Sub-Step 1.1: Scanning cycle for latest saved chunk snapshot info...\n");
     for (uint32_t chunk_k = 0; chunk_k < NUM_STATE_CHUNKS; ++chunk_k) {
         // Offset calculation for single cycle
         off_t snap_offset_in_file = snapshot_slot_header_offset + (off_t)chunk_k * sizeof(ChunkSlot);
@@ -347,17 +340,19 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
         }
     }
     if (latest_chunk_idx_overall != -1) {
-         printf("Recovery Sub-Step 1.1: Latest state information found in cycle %u corresponds to chunk %d (batch %d).\n",
-               recovery_cycle, latest_chunk_idx_overall, highest_batch_in_cycle);
+         printf("Recovery Sub-Step 1.1: Latest state information found in cycle corresponds to chunk %d (batch %d).\n",
+               latest_chunk_idx_overall, highest_batch_in_cycle);
     } else {
-        printf("Recovery Sub-Step 1.1: No valid snapshot chunks found in cycle %u. Cannot determine baseline state.\n", recovery_cycle);
+        printf("Recovery Sub-Step 1.1: No valid snapshot chunks found in cycle. Cannot determine baseline state.\n");
         // This is a critical failure if no snapshots are found.
-        free(temp_snap_slot); free(temp_tx_slot); free(batch_number_of_chunk);
+        free(temp_snap_slot); 
+        free(temp_tx_slot); 
+        free(batch_number_of_chunk);
         return -1;
     }
 
-    // --- Step 2: Load State Chunks from the single cycle ---
-    printf("Recovery Sub-Step 1.2: Loading state chunks from cycle %u...\n", recovery_cycle);
+    // --- Step 2: Load State Chunks---
+    printf("Recovery Sub-Step 1.2: Loading state chunks from cycle...\n");
     memset(state_array_to_recover, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
     int max_loaded_batch_overall = -1; // Will be same as highest_batch_in_cycle if all chunks are read
 
@@ -378,7 +373,7 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
             }
             //printf("[DEBUG] Loaded chunk_k=%u from cycle %u, batch_num=%d\n", chunk_k, recovery_cycle, temp_snap_slot->batch_num);
         } else {
-            fprintf(stderr, "Recovery WARNING: Failed to read/validate snapshot for chunk %u from cycle %u. State zeroed, batch -1.\n", chunk_k, recovery_cycle);
+            fprintf(stderr, "Recovery WARNING: Failed to read/validate snapshot for chunk %u from cycle. State zeroed, batch -1.\n", chunk_k);
             // batch_number_of_chunk[chunk_k] remains -1, state for this chunk is 0.
             // This is problematic, recovery might be impossible or state will be inconsistent.
             // For a single cycle system, all chunks should ideally be present and valid.
@@ -388,127 +383,105 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
     // If they differ significantly, it implies an inconsistent write or corruption.
 
     *last_recovered_batch_num = max_loaded_batch_overall;
-    printf("Recovery Sub-Step 1.2: Composite snapshot loaded from cycle %u. Effective batch: %d.\n", recovery_cycle, *last_recovered_batch_num);
+    printf("Recovery Sub-Step 1.2: Composite snapshot loaded from cycle. Effective batch: %d.\n", *last_recovered_batch_num);
 
     if (*last_recovered_batch_num == -1) {
         fprintf(stderr, "Recovery: Failed to load any valid snapshot data. Aborting recovery.\n");
         free(temp_snap_slot); free(temp_tx_slot); free(batch_number_of_chunk);
         return -1;
     }
-
+   
     // --- Step 3: Replay Transactions ---
     // The goal is to bring all chunks from their snapshot batch (batch_number_of_chunk[k])
     // forward to the overall latest batch found in snapshots (max_loaded_batch_overall).
-    size_t collected_tx_count = 0;
-    // TOTAL_SNAPSHOT_SLOTS is now NUM_STATE_CHUNKS
     size_t tx_slot_array_offset = CHECKPOINT_HEADER_SIZE + NUM_STATE_CHUNKS * sizeof(ChunkSlot);
-    //printf("[DEBUG] tx_slot_array_offset=%zu (for single cycle)\n", tx_slot_array_offset);
+    uint32_t chnk_processed_counter = 0;
+    uint32_t collected_tx_count = 0;
+    for (uint32_t currently_processing_chnk = positive_modulo(latest_chunk_idx_overall - 1, NUM_STATE_CHUNKS); 
+         chnk_processed_counter < NUM_STATE_CHUNKS - 1; 
+         currently_processing_chnk = positive_modulo((int32_t)currently_processing_chnk - 1, NUM_STATE_CHUNKS)) {
+        printf("[DEBUG] Processing chunk %u (chnk_processed_counter=%u)\n", currently_processing_chnk, chnk_processed_counter);
+        ++ chnk_processed_counter;
+        // Iterate through the batches that are newer than the batch of the currently processing chunk
+        for (uint32_t curr_batch = batch_number_of_chunk[currently_processing_chnk] + 1; 
+            curr_batch <= batch_number_of_chunk[latest_chunk_idx_overall]; 
+            ++curr_batch) {
 
-    int final_state_batch_num = max_loaded_batch_overall;
-    //printf("Recovery Step 3: Targeting state consistency at batch %d.\n", final_state_batch_num);
-
-    for (uint32_t chunk_to_update = 0; chunk_to_update < NUM_STATE_CHUNKS; ++chunk_to_update) {
-        if (batch_number_of_chunk[chunk_to_update] == -1) {
-            fprintf(stderr, "Recovery WARNING: Skipping transaction replay for chunk %u as its snapshot was invalid.\n", chunk_to_update);
-            continue;
-        }
-        if (batch_number_of_chunk[chunk_to_update] >= final_state_batch_num) {
-            //printf("[DEBUG] Chunk %u (batch %d) is already at or ahead of target batch %d. No replay needed.\n",
-                   //chunk_to_update, batch_number_of_chunk[chunk_to_update], final_state_batch_num);
-            continue;
-        }
-
-        //printf("[DEBUG] Replaying transactions for chunk %u (from batch %d up to %d)\n",
-               //chunk_to_update, batch_number_of_chunk[chunk_to_update] + 1, final_state_batch_num);
-
-        for (int batch_to_replay = batch_number_of_chunk[chunk_to_update] + 1;
-             batch_to_replay <= final_state_batch_num;
-             ++batch_to_replay) {
-
-            // Transaction logs are stored per batch, in a slot corresponding to that batch number modulo NUM_STATE_CHUNKS
-            uint32_t tx_log_slot_idx = (uint32_t)batch_to_replay % NUM_STATE_CHUNKS;
-            // In a single cycle system, tx_log_cycle is always 0.
-
+            printf("[DEBUG] Processing batch %u for chunk %u\n", curr_batch, currently_processing_chnk);
+            uint32_t tx_log_slot_idx = (uint32_t)curr_batch % NUM_STATE_CHUNKS;
+            // load current batch
             off_t tx_offset_in_file = tx_slot_array_offset + (off_t)tx_log_slot_idx * sizeof(BatchSlot);
-
-            //printf("[DEBUG] Processing batch %d for chunk %u: reading TX log from slot %u (offset %ld)\n",
-                   //batch_to_replay, chunk_to_update, tx_log_slot_idx, (long)tx_offset_in_file);
-
+            //printf("[DEBUG] Reading tx batch at offset=%ld\n", (long)tx_offset_in_file);
             memset(temp_tx_slot, 0, sizeof(BatchSlot));
             ssize_t read_bytes = pread(log_fd, temp_tx_slot, sizeof(BatchSlot), tx_offset_in_file);
-
-            if (read_bytes != (ssize_t)sizeof(BatchSlot) || temp_tx_slot->batch_num != (uint32_t)batch_to_replay) {
-                fprintf(stderr, "Recovery WARNING: Failed to read or mismatched batch for tx log slot %u (expected batch %d, got %u). Skipping batch for chunk %u.\n",
-                        tx_log_slot_idx, batch_to_replay, temp_tx_slot->batch_num, chunk_to_update);
-                continue; // Skip this problematic batch for this chunk's replay
+            //printf("[DEBUG] Read %zd bytes for tx batch, batch_num=%u, tx_count=%u\n", read_bytes, temp_tx_slot->batch_num, temp_tx_slot->tx_count);
+            if (read_bytes == (ssize_t)sizeof(BatchSlot)) {
+                if (temp_tx_slot->tx_count > BATCH_SIZE) {
+                    fprintf(stderr, "Recovery WARNING: BatchSlot for chunk %u (batch %u) has tx_count %u > BATCH_SIZE. Clamping.\n",
+                            currently_processing_chnk, temp_tx_slot->batch_num, temp_tx_slot->tx_count);
+                    temp_tx_slot->tx_count = BATCH_SIZE;
+                }
             }
-             if (temp_tx_slot->tx_count > BATCH_SIZE) {
-                fprintf(stderr, "Recovery WARNING: BatchSlot for tx log slot %u (batch %u) has tx_count %u > BATCH_SIZE. Clamping.\n",
-                        tx_log_slot_idx, batch_to_replay, temp_tx_slot->tx_count);
-                temp_tx_slot->tx_count = BATCH_SIZE;
-            }
-
-
+            // Iterate through the transactions in the current batch and filter
             for (uint32_t tx_idx = 0; tx_idx < temp_tx_slot->tx_count; ++tx_idx) {
                 const Transaction *tx = &temp_tx_slot->transactions[tx_idx];
                 uint8_t sfunc = GET_FUNC(tx->sender);
                 uint8_t rfunc = GET_FUNC(tx->receiver);
                 uint64_t sdata = GET_DATA(tx->sender);
-                uint64_t rdata = GET_DATA(tx->receiver); // For range set, this is 'len'
-
-                bool tx_applied_to_this_chunk = false;
-
-                if (sfunc == 0 && rfunc == 0) { // Simple Transfer
-                    if (sdata < PADDED_ACCOUNT_COUNT) {
+                uint64_t rdata = GET_DATA(tx->receiver);
+                
+                //printf("[DEBUG] Processing tx_idx=%u, sfunc=%u, rfunc=%u, sdata=%lu, rdata=%lu\n", tx_idx, sfunc, rfunc, sdata, rdata);
+                // Transfer transaction
+                if (sfunc == 0 && rfunc == 0) {
+                    bool counted = false;
+                    // Check sender account
+                    if (sdata >= 0 && sdata < PADDED_ACCOUNT_COUNT) { // Ensure account index is valid
                         uint32_t s_chunk_affected = sdata / ACCOUNTS_PER_STATE_CHUNK;
-                        if (s_chunk_affected == chunk_to_update) {
-                            // Apply debit if sender is in the current chunk being updated
-                            if (state_array_to_recover[sdata] >= (int64_t)tx->amount) { // Check might be optional for pure replay
+                        if (s_chunk_affected == currently_processing_chnk) {
+                           if( state_array_to_recover[sdata] >= (int64_t)tx->amount ) {
                                 state_array_to_recover[sdata] -= (int64_t)tx->amount;
-                            } 
-                            tx_applied_to_this_chunk = true;
+                                counted = true;
+                                ++collected_tx_count;
+                           }
                         }
                     }
-                    if (rdata < PADDED_ACCOUNT_COUNT) {
+                    if (rdata >= 0 && rdata < PADDED_ACCOUNT_COUNT) { // Ensure account index is valid
                         uint32_t r_chunk_affected = rdata / ACCOUNTS_PER_STATE_CHUNK;
-                        if (r_chunk_affected == chunk_to_update) {
-                            // Apply credit if receiver is in the current chunk being updated
-                            state_array_to_recover[rdata] += (int64_t)tx->amount;
-                            tx_applied_to_this_chunk = true; // Counts if either part affects
-                        }
-                    }
-                } else if (sfunc == 1 && rfunc == 1) { // Range Set
-                    uint64_t start_idx = sdata;
-                    uint64_t len       = rdata; // rdata is len for range set
-
-                    if (start_idx < PADDED_ACCOUNT_COUNT && len > 0) {
-                        for (uint64_t i = 0; i < len; ++i) {
-                            uint64_t current_account_idx = start_idx + i;
-                            if (current_account_idx >= PADDED_ACCOUNT_COUNT) break;
-
-                            uint32_t acc_chunk = current_account_idx / ACCOUNTS_PER_STATE_CHUNK;
-                            if (acc_chunk == chunk_to_update) {
-                                state_array_to_recover[current_account_idx] = (int64_t)tx->amount;
-                                tx_applied_to_this_chunk = true;
+                        if (r_chunk_affected == currently_processing_chnk) {                        
+                            if( state_array_to_recover[sdata] >= (int64_t)tx->amount ) {
+                                if (counted == false) {
+                                    ++collected_tx_count;
+                                    counted = true;
+                                }
+                                state_array_to_recover[rdata] += (int64_t)tx->amount;
                             }
                         }
                     }
                 }
-                if(tx_applied_to_this_chunk) {
-                    collected_tx_count++; // Count if the transaction had an effect on the chunk being processed
+                // Range set transaction
+                if (sfunc == 1 && rfunc == 1) {
+                    ++ collected_tx_count;
+                    uint64_t start_idx = sdata;
+                    uint64_t len = rdata;
+                    if (start_idx >= 0 && start_idx < PADDED_ACCOUNT_COUNT) {
+                        for (uint64_t i = 0; i < len; ++ i) {
+                            uint32_t current_chunk_affected = (start_idx + i) / ACCOUNTS_PER_STATE_CHUNK;
+                            if (current_chunk_affected == currently_processing_chnk) {
+                                state_array_to_recover[start_idx + i] = (int64_t)tx->amount;
+                            }
+                        }
+                    }
                 }
             }
-        }
+        } 
     }
-
-    *last_recovered_batch_num = final_state_batch_num; // State should now reflect this batch
-    printf("Recovery Step 3: Applied approximately %zu transaction operations during replay. State now reflects batch %d.\n", collected_tx_count, *last_recovered_batch_num);
+    printf("Recovery Step 2: Applied %zu transactions. State now reflects batch %d.\n", collected_tx_count, *last_recovered_batch_num);
 
     free(temp_snap_slot);
     free(temp_tx_slot);
     free(batch_number_of_chunk);
 
-    //printf("[DEBUG] Exiting recover_state_from_log. Final state reflects batch number: %d\n", *last_recovered_batch_num);
+    printf("[DEBUG] Exiting recover_state_from_log. Final state reflects batch number: %d\n", *last_recovered_batch_num);
     printf("Recovery finished. Final state reflects batch number: %d\n", *last_recovered_batch_num);
     return 0;
 }
@@ -656,7 +629,7 @@ int main(int argc, char **argv) {
         printf("INFO: ***** DEBUG/RECOVERY RUN *****\n");
     }
 
-    printf("System Config: ACCOUNTS=%lu, ACCOUNT_SIZE=%zu, BATCH_SIZE=%llu\n", // BATCH_SIZE is ULL
+    printf("System Config: ACCOUNTS=%lu, ACCOUNT_SIZE=%zu, BATCH_SIZE=%llu\n",
             SMALL_ACCOUNT_COUNT, ACCOUNT_SIZE, BATCH_SIZE);
     printf("               CHUNKS=%u, ACC_PER_CHUNK=%u, PADDED_ACCOUNTS=%lu\n",
            NUM_STATE_CHUNKS, ACCOUNTS_PER_STATE_CHUNK, PADDED_ACCOUNT_COUNT);
@@ -752,10 +725,6 @@ int main(int argc, char **argv) {
                 if(ref_state) {
                     FILE *f_ref = fopen(REFERENCE_STATE_FILE, "rb");
                     if(f_ref) {
-                        if(fread(ref_state, ACCOUNT_SIZE, PADDED_ACCOUNT_COUNT, f_ref) == PADDED_ACCOUNT_COUNT) {
-                             printf("Dumping diff against reference state file due to hash mismatch post-recovery.\n");
-                            dump_state_diff(ref_state, main_state_array, SMALL_ACCOUNT_COUNT, 100); // Report up to 100 diffs
-                        }
                         fclose(f_ref);
                     } else if (errno != ENOENT) {
                         perror("Error opening reference state file for diff");
@@ -825,18 +794,8 @@ int main(int argc, char **argv) {
     }
 
     uint32_t current_batch_num_in_loop;
-    if (meaningful_state_recovered && recovered_batch >= 0) {
-        current_batch_num_in_loop = (uint32_t)recovered_batch + 1;
-        long offset = (long)current_batch_num_in_loop * BATCH_SIZE * sizeof(Transaction);
-    } else {
-        current_batch_num_in_loop = 0;
-        rewind(fp_tx);
-         printf("MAIN: No meaningful recovery or starting fresh. Processing TX file from batch 0.\n");
-    }
-
 
     uint32_t file_batches_processed_this_run_count = 0;
-    int last_batch_processed_this_run = recovered_batch; // Start with recovered batch
     double proc_start_t_loop = get_time_ms();
 
     // Allocate array to store total times for each batch processed in this run
@@ -849,7 +808,6 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
     size_t batch_time_count = 0;
-
     printf("Starting transaction processing loop from batch %u...\n", current_batch_num_in_loop);
     while(1) {
         size_t num_tx_read = fread(tx_batch_buf, sizeof(Transaction), BATCH_SIZE, fp_tx);
@@ -889,18 +847,17 @@ int main(int argc, char **argv) {
                        current_batch_num_in_loop, NUM_STATE_CHUNKS, log_header_ptr->current_cycle_ptr);
             }
         }
-        if ((current_batch_num_in_loop % 100) == 0 || num_tx_read < BATCH_SIZE) {
+        if ((current_batch_num_in_loop % 10) == 0 || num_tx_read < BATCH_SIZE) {
             if (current_batch_num_in_loop != 2021) {
                 printf("Processed batch %u (%zu tx read) in %.3f ms. Slot in cycle: %u\n",
                        current_batch_num_in_loop, num_tx_read, tx_apply_end_t - tx_apply_start_t, slot_in_cycle);
             }
         }
-        last_batch_processed_this_run = current_batch_num_in_loop;
         file_batches_processed_this_run_count++;
         current_batch_num_in_loop++;
         if (num_tx_read < BATCH_SIZE && feof(fp_tx)) break;
     }
-
+    current_batch_num_in_loop--;
     // Compute median and 99th percentile of batch_total_times
     if (batch_time_count > 0) {
         // Sort the array
@@ -936,10 +893,10 @@ int main(int argc, char **argv) {
 
     printf("--- Finished processing %s (%u batches this run) in %.3f ms ---\n",
            TX_FILE, file_batches_processed_this_run_count, get_time_ms() - proc_start_t_loop);
-    printf("Final state in memory reflects batch: %d\n", last_batch_processed_this_run);
+    printf("Final state in memory reflects batch: %d\n", current_batch_num_in_loop);
     printf("[SUMMARY] Number of batches processed from %s in this run: %u\n", TX_FILE, file_batches_processed_this_run_count);
 
-    int batch_for_final_hash_label = last_batch_processed_this_run;
+    int batch_for_final_hash_label = current_batch_num_in_loop;
     if (batch_for_final_hash_label >= 0) {
         printf("Computing and saving final state hash for batch %d...\n", batch_for_final_hash_label);
         uint64_t final_hash = compute_state_hash(main_state_array, SMALL_ACCOUNT_COUNT);
