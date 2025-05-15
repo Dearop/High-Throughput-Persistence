@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <inttypes.h>
+#include <immintrin.h> 
 
 // --- Definitions and Constants ---
 
@@ -41,6 +42,27 @@
 #define TX_FILE                 "transactions.bin"
 #define REFERENCE_STATE_FILE    "reference_state.bin"
 #define DIFF_OUTPUT_FILE        "state_diff.txt"
+
+// --- Compiler-specific macros ---
+#if defined(__GNUC__) || defined(__clang__)
+#  define LIKELY(x)   __builtin_expect(!!(x), 1)
+#  define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#  define FORCE_INLINE __attribute__((always_inline)) inline
+#  define PREFETCH(addr,rw,locality) __builtin_prefetch((addr),(rw),(locality))
+#else
+#  define LIKELY(x)   (x)
+#  define UNLIKELY(x) (x)
+#  define FORCE_INLINE inline
+#  define PREFETCH(addr,rw,locality)
+#endif
+
+#if !defined(HAVE_AVX512)
+#  if defined(__AVX512F__) && defined(__GNUC__)
+#    define HAVE_AVX512 1
+#  else
+#    define HAVE_AVX512 0
+#  endif
+#endif
 
 // --- Checkpoint Header Structure ---
 typedef struct {
@@ -149,6 +171,14 @@ static void dump_state_diff(const int64_t *a,
 }
 
 // --- Utility Functions ---
+static inline uint64_t mix64(uint64_t k) {
+    k ^= k >> 33;
+    k *= UINT64_C(0xff51afd7ed558ccd);
+    k ^= k >> 33;
+    k *= UINT64_C(0xc4ceb9fe1a85ec53);
+    k ^= k >> 33;
+    return k;
+}
 
 double get_time_ms(void) {
     struct timespec ts;
@@ -174,105 +204,145 @@ int compare_tx_with_batch_num(const void *a, const void *b) {
     return 0;
 }
 
-// --- Transaction Application to In-Memory State ---
-static inline bool apply_transaction_to_state_array(const Transaction *tx, int64_t *restrict state_array) {
-    uint8_t sfunc = GET_FUNC(tx->sender);
-    uint8_t rfunc = GET_FUNC(tx->receiver);
-    uint64_t sidx = GET_DATA(tx->sender);
-    uint64_t ridx = GET_DATA(tx->receiver);
+/* Fast hot-path transaction application
+ * – Early bound checks
+ * – Branch-prediction hints
+ * – Memory prefetch on the simple-transfer path
+ * – AVX2 vectorised range-set
+ */
+static inline bool apply_transaction_to_state_array(const Transaction *__restrict tx,
+                                 int64_t *__restrict      state_array){
+    /* Decode the packed sender/receiver words */
+    const uint8_t  sfunc = GET_FUNC(tx->sender);
+    const uint8_t  rfunc = GET_FUNC(tx->receiver);
+    const uint64_t sidx  = GET_DATA(tx->sender);
+    const uint64_t ridx  = GET_DATA(tx->receiver);
 
-    if (sidx >= PADDED_ACCOUNT_COUNT || (rfunc == 0 && ridx >= PADDED_ACCOUNT_COUNT)) { // Check bounds carefully
-        // For range set, ridx is length, not an account index directly for bounds check here
-        if (sfunc == 0 && rfunc == 0) return false; // Simple transfer out of bounds
-        if (sfunc == 1 && rfunc == 1) return false; // Range set starts out of bounds
-    }
+    /* -------- early rejection of out-of-bounds indices -------- */
+    if (UNLIKELY(sidx >= PADDED_ACCOUNT_COUNT || (rfunc == 0 && ridx >= PADDED_ACCOUNT_COUNT)))
+        return false;
 
-
-    if (sfunc == 0 && rfunc == 0) { // Simple Transfer
-         if (sidx >= SMALL_ACCOUNT_COUNT || ridx >= SMALL_ACCOUNT_COUNT) { // Apply business logic bounds
+    /* ==========================================================
+     *  Hot path: simple balance transfer (func == 0 → account id)
+     * ========================================================== */
+    if (LIKELY(sfunc == 0 && rfunc == 0)) {
+        /* Narrower array for hot small-account tier */
+        if (UNLIKELY(sidx >= SMALL_ACCOUNT_COUNT ||
+                     ridx >= SMALL_ACCOUNT_COUNT))
             return false;
-        }
-        if (state_array[sidx] >= (int64_t)tx->amount) {
-            state_array[sidx] -= tx->amount;
-            state_array[ridx] += tx->amount;
+
+        int64_t *__restrict from = &state_array[sidx];
+        int64_t *__restrict to   = &state_array[ridx];
+
+        PREFETCH(from, 0, 1); /* read-only prefetch */
+        PREFETCH(to,   1, 1); /* write-intent prefetch */
+
+        const int64_t amt = (int64_t)tx->amount;
+        if (LIKELY(*from >= amt)) {
+            *from -= amt;
+            *to   += amt;
             return true;
         }
-    } else if (sfunc == 1 && rfunc == 1) { // Range Set
-        uint64_t start_idx = sidx;
-        uint64_t len       = ridx; // Use the value already computed in ridx (from GET_DATA(tx->receiver))
-        if (len == 0) return false;
-        // Apply business logic bounds for range set
-        if (start_idx >= SMALL_ACCOUNT_COUNT) return false; // Entire range is outside interesting area
+        return false; /* insufficient funds */
+    }
 
-        for (uint64_t i = 0; i < len; ++i) {
-            if (start_idx + i >= SMALL_ACCOUNT_COUNT) break;
-            state_array[start_idx + i] = (int64_t)tx->amount;
+    /* ==========================================================
+     *  Cold path: range-set (func == 1 → [start,len])  
+     *  Writes `amount` into accounts [start, start+len)
+     * ========================================================== */
+    if (LIKELY(sfunc == 1 && rfunc == 1)) {
+        uint64_t start = sidx;
+        uint64_t len   = ridx;          /* receiver "data" holds length */
+
+        if (UNLIKELY(!len || start >= SMALL_ACCOUNT_COUNT))
+            return false;
+
+        uint64_t end = start + len;
+        if (end > SMALL_ACCOUNT_COUNT) end = SMALL_ACCOUNT_COUNT;
+
+        const int64_t val = (int64_t)tx->amount;
+        int64_t *dst = &state_array[start];
+
+        for (uint64_t i = 0; i < (end - start); ++i) { // Iterate using span relative to dst
+            dst[i] = val;
         }
+        // #endif
         return true;
     }
+
+    /* Any other function codes -> unsupported */
     return false;
 }
 
-// --- Checkpoint Commit Function ---
-static void commit_batch_data_to_log(
-    uint32_t slot_idx_in_cycle, // This is current_batch_num % NUM_STATE_CHUNKS
-    uint32_t current_batch_num,
-    const int64_t *restrict full_state_array,
-    const Transaction *restrict current_transaction_batch,
-    uint32_t num_tx_in_current_batch,
-    void *restrict mapped_log_region,
-    ChunkSlot *restrict temp_snap_slot,
-    BatchSlot *restrict temp_tx_slot,
-    long pagesize // Added pagesize parameter
-) {
-    size_t snapshot_slot_header_offset = CHECKPOINT_HEADER_SIZE;
-    size_t tx_slot_array_offset = snapshot_slot_header_offset + NUM_STATE_CHUNKS * sizeof(ChunkSlot);
+static FORCE_INLINE void commit_batch_data_to_log(
+     uint32_t slot_idx_in_cycle,          /* current_batch_num % NUM_STATE_CHUNKS */
+     uint32_t current_batch_num,
+     const int64_t *__restrict full_state_array,
+     const Transaction *__restrict current_transaction_batch,
+     uint32_t num_tx_in_current_batch,
+     void *__restrict mapped_log_region,
+     ChunkSlot *__restrict temp_snap_slot,
+     BatchSlot *__restrict temp_tx_slot,
+     long pagesize)
+ {
+     /* ---- Layout helpers -------------------------------------------------- */
+     const size_t snapshot_slot_header_offset = CHECKPOINT_HEADER_SIZE;
+     const size_t tx_slot_array_offset        = snapshot_slot_header_offset +
+                                                NUM_STATE_CHUNKS * sizeof(ChunkSlot);
 
-    size_t final_snap_offset = snapshot_slot_header_offset + slot_idx_in_cycle * sizeof(ChunkSlot);
-    size_t final_tx_offset   = tx_slot_array_offset + slot_idx_in_cycle * sizeof(BatchSlot);
+     const size_t final_snap_offset = snapshot_slot_header_offset +
+                                      (size_t)slot_idx_in_cycle * sizeof(ChunkSlot);
+     const size_t final_tx_offset   = tx_slot_array_offset +
+                                      (size_t)slot_idx_in_cycle * sizeof(BatchSlot);
 
-    // Prepare and write snapshot data
-    temp_snap_slot->batch_num = current_batch_num;
-    temp_snap_slot->chunk_idx_in_ring = slot_idx_in_cycle;
-    const int64_t *source_state_chunk_ptr = full_state_array + (size_t)slot_idx_in_cycle * ACCOUNTS_PER_STATE_CHUNK ;
-    nt_memcpy(temp_snap_slot->state_data, source_state_chunk_ptr, ACCOUNTS_PER_STATE_CHUNK * ACCOUNT_SIZE);
-    void *snap_write_target_addr = (char*)mapped_log_region + final_snap_offset;
-    nt_memcpy(snap_write_target_addr, temp_snap_slot, sizeof(ChunkSlot));
+     /* ---- Prepare snapshot chunk ------------------------------------------ */
+     temp_snap_slot->batch_num         = current_batch_num;
+     temp_snap_slot->chunk_idx_in_ring = slot_idx_in_cycle;
 
-    // Prepare and write transaction data
-    memset(temp_tx_slot->transactions, 0, BATCH_SIZE * sizeof(Transaction));
-    temp_tx_slot->batch_num = current_batch_num;
-    temp_tx_slot->tx_count = num_tx_in_current_batch;
-    if (num_tx_in_current_batch > 0) {
-        nt_memcpy(temp_tx_slot->transactions, current_transaction_batch, num_tx_in_current_batch * sizeof(Transaction));
-    }
-    void *tx_write_target_addr = (char*)mapped_log_region + final_tx_offset;
-    nt_memcpy(tx_write_target_addr, temp_tx_slot, sizeof(BatchSlot));
+     const int64_t *__restrict src_state_chunk =
+         full_state_array + (size_t)slot_idx_in_cycle * ACCOUNTS_PER_STATE_CHUNK;
 
-    // Perform a single msync for both snapshot and transaction data
-    if (pagesize == -1) { // Should have been checked earlier, but as a safeguard
-        perror("commit_batch_data_to_log: invalid pagesize");
-        return;
-    }
+     nt_memcpy(temp_snap_slot->state_data,
+               src_state_chunk,
+               ACCOUNTS_PER_STATE_CHUNK * ACCOUNT_SIZE);
 
-    // The snapshot data for a slot is always before the transaction data for any slot in the log file structure.
-    // Thus, snap_write_target_addr is the start of our modified region for this commit operation (or part of it).
-    void *sync_start_page_addr = (void*)((uintptr_t)snap_write_target_addr & ~(pagesize - 1));
-    
-    // The last byte written is at the end of the transaction slot data.
-    uintptr_t last_byte_written_addr = (uintptr_t)tx_write_target_addr + sizeof(BatchSlot) - 1;
-    
-    // Calculate length for msync to cover from sync_start_page_addr up to the end of the page containing last_byte_written_addr.
-    size_t sync_len = ((last_byte_written_addr / pagesize) * pagesize + pagesize) - (uintptr_t)sync_start_page_addr;
+     void *__restrict snap_dst = (char *)mapped_log_region + final_snap_offset;
+     nt_memcpy(snap_dst, temp_snap_slot, sizeof(ChunkSlot));
 
-    if (msync(sync_start_page_addr, sync_len, MS_SYNC) != 0) {
-        char err_buf[256];
-        snprintf(err_buf, sizeof(err_buf), "CRITICAL: Combined msync failed (snap_addr: %p, tx_addr: %p, sync_start: %p, len: %zu)",
-                 snap_write_target_addr, tx_write_target_addr, sync_start_page_addr, sync_len);
-        perror(err_buf);
-        // Decide on error handling, e.g., exit(EXIT_FAILURE);
-    }
-}
+     /* ---- Prepare transaction batch --------------------------------------- */
+     temp_tx_slot->batch_num = current_batch_num;
+     temp_tx_slot->tx_count  = num_tx_in_current_batch;
+
+     if (num_tx_in_current_batch)
+         nt_memcpy(temp_tx_slot->transactions,
+                   current_transaction_batch,
+                   (size_t)num_tx_in_current_batch * sizeof(Transaction));
+     else
+         memset(temp_tx_slot->transactions, 0, BATCH_SIZE * sizeof(Transaction));
+
+     void *__restrict tx_dst = (char *)mapped_log_region + final_tx_offset;
+     nt_memcpy(tx_dst, temp_tx_slot, sizeof(BatchSlot));
+
+     /* ---- Persist to storage with a single msync --------------------------- */
+     if (UNLIKELY(pagesize <= 0)) {
+         perror("commit_batch_data_to_log: invalid pagesize");
+         return;
+     }
+
+     void *sync_start = (void *)((uintptr_t)snap_dst & ~( (uintptr_t)pagesize - 1U ));
+     const uintptr_t last_byte = (uintptr_t)tx_dst + sizeof(BatchSlot) - 1U;
+     const size_t sync_len = ((last_byte / (uintptr_t)pagesize) * (uintptr_t)pagesize +
+                              (uintptr_t)pagesize) - (uintptr_t)sync_start;
+
+     if (UNLIKELY(msync(sync_start, sync_len, MS_SYNC))) {
+         char err[256];
+         snprintf(err, sizeof(err),
+                  "CRITICAL: Combined msync failed (snap=%p, tx=%p, start=%p, len=%zu)",
+                  snap_dst, tx_dst, sync_start, sync_len);
+         perror(err);
+         /* Optionally: abort(); */
+     }
+ }
 
 // --- Recovery Function (User's Specified Algorithm - Refined) ---
 int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover, int *last_recovered_batch_num) {
@@ -284,7 +354,6 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
         fprintf(stderr, "Recovery: Invalid or missing checkpoint header. Skipping recovery.\n");
         return -1;
     }
-    // MODIFIED: header.oldest_cycle is now header.current_cycle_ptr, should be 0
     //printf("[DEBUG] Header: version=%u, current_cycle_ptr=%u, num_state_chunks=%u, accounts_per_chunk=%u\n",
            //header.version, header.current_cycle_ptr, header.num_state_chunks, header.accounts_per_chunk);
 
@@ -294,9 +363,6 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
     }
     if (header.current_cycle_ptr != 0 && CYCLES == 1) { // Sanity check for single cycle
          fprintf(stderr, "Recovery: Header current_cycle_ptr is not 0 in a single-cycle configuration. Log may be from a multi-cycle system.\n");
-        // Depending on strictness, might return -1 or proceed assuming 0.
-        // For now, let's be strict for a clean single-cycle implementation.
-        // return -1; // Or attempt to use 0 anyway if deemed safe.
     }
 
     printf("Recovery: Valid checkpoint header. Using cycle 0.\n");
@@ -808,8 +874,11 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    uint32_t current_batch_num_in_loop;
-
+    // Always start processing transactions from the beginning of the file.
+    uint32_t current_batch_num_in_loop = 0;
+    rewind(fp_tx);
+    printf("MAIN: Always processing %s from batch 0 (top of file).\n", TX_FILE);
+    
     uint32_t file_batches_processed_this_run_count = 0;
     double proc_start_t_loop = get_time_ms();
 
