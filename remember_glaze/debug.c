@@ -107,7 +107,7 @@ static void dump_state_diff(const int64_t *a,
     size_t mismatches = 0;
     FILE *diff_fp = fopen(DIFF_OUTPUT_FILE, "w");
     if (!diff_fp) {
-        perror("dump_state_diff: Error opening diff output file");
+        //perror("dump_state_diff: Error opening diff output file");
         diff_fp = stderr; // Fallback to stderr
         fprintf(diff_fp, "--- dump_state_diff outputting to stderr due to file open error ---\n");
     }
@@ -137,10 +137,8 @@ static void dump_state_diff(const int64_t *a,
         if (count > 0) {
             percentage_diff = ((double)mismatches / count) * 100.0;
         }
-        fprintf(diff_fp, // To file
-                "dump_state_diff: %zu account(s) differ (%.2f%%). Reporting capped at %zu.\n", mismatches, percentage_diff, max_report);
-        fprintf(stderr, // To console
-                "dump_state_diff: %zu account(s) differ (%.2f%%). Detailed report in %s\n", mismatches, percentage_diff, (diff_fp == stderr ? "stderr" : DIFF_OUTPUT_FILE));
+        //fprintf(diff_fp, "dump_state_diff: %zu account(s) differ (%.2f%%). Reporting capped at %zu.\n", mismatches, percentage_diff, max_report);
+        //fprintf(stderr, "dump_state_diff: %zu account(s) differ (%.2f%%). Detailed report in %s\n", mismatches, percentage_diff, (diff_fp == stderr ? "stderr" : DIFF_OUTPUT_FILE));
 
     }
     fprintf(diff_fp, "--- dump_state_diff finished ---\n");
@@ -201,13 +199,13 @@ static inline bool apply_transaction_to_state_array(const Transaction *tx, int64
         }
     } else if (sfunc == 1 && rfunc == 1) { // Range Set
         uint64_t start_idx = sidx;
-        uint64_t len       = GET_DATA(tx->receiver); // ridx is len
+        uint64_t len       = ridx; // Use the value already computed in ridx (from GET_DATA(tx->receiver))
         if (len == 0) return false;
         // Apply business logic bounds for range set
         if (start_idx >= SMALL_ACCOUNT_COUNT) return false; // Entire range is outside interesting area
 
         for (uint64_t i = 0; i < len; ++i) {
-            if (start_idx + i >= SMALL_ACCOUNT_COUNT) return true; // Stop if exceeding logical account limit
+            if (start_idx + i >= SMALL_ACCOUNT_COUNT) break;
             state_array[start_idx + i] = (int64_t)tx->amount;
         }
         return true;
@@ -401,14 +399,14 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
     for (uint32_t currently_processing_chnk = positive_modulo(latest_chunk_idx_overall - 1, NUM_STATE_CHUNKS); 
          chnk_processed_counter < NUM_STATE_CHUNKS - 1; 
          currently_processing_chnk = positive_modulo((int32_t)currently_processing_chnk - 1, NUM_STATE_CHUNKS)) {
-        printf("[DEBUG] Processing chunk %u (chnk_processed_counter=%u)\n", currently_processing_chnk, chnk_processed_counter);
+        //printf("[DEBUG] Processing chunk %u (chnk_processed_counter=%u)\n", currently_processing_chnk, chnk_processed_counter);
         ++ chnk_processed_counter;
         // Iterate through the batches that are newer than the batch of the currently processing chunk
         for (uint32_t curr_batch = batch_number_of_chunk[currently_processing_chnk] + 1; 
             curr_batch <= batch_number_of_chunk[latest_chunk_idx_overall]; 
             ++curr_batch) {
 
-            printf("[DEBUG] Processing batch %u for chunk %u\n", curr_batch, currently_processing_chnk);
+            //printf("[DEBUG] Processing batch %u for chunk %u\n", curr_batch, currently_processing_chnk);
             uint32_t tx_log_slot_idx = (uint32_t)curr_batch % NUM_STATE_CHUNKS;
             // load current batch
             off_t tx_offset_in_file = tx_slot_array_offset + (off_t)tx_log_slot_idx * sizeof(BatchSlot);
@@ -490,7 +488,7 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
     free(temp_tx_slot);
     free(batch_number_of_chunk);
 
-    printf("[DEBUG] Exiting recover_state_from_log. Final state reflects batch number: %d\n", *last_recovered_batch_num);
+    //printf("[DEBUG] Exiting recover_state_from_log. Final state reflects batch number: %d\n", *last_recovered_batch_num);
     printf("Recovery finished. Final state reflects batch number: %d\n", *last_recovered_batch_num);
     return 0;
 }
@@ -713,7 +711,7 @@ int main(int argc, char **argv) {
                 recovered_batch = -1;
             }
             double rec_phase_end = get_time_ms();
-            printf("[TIMING] Recovery phase took %.3f ms.\n", rec_phase_end - rec_phase_start);
+            //printf("[TIMING] Recovery phase took %.3f ms.\n", rec_phase_end - rec_phase_start);
             close(log_fd_rec);
         }
     }
@@ -727,7 +725,7 @@ int main(int argc, char **argv) {
     //    printf("Account[%02lu]: %-12ld ", i, main_state_array[i]);
     //    if ((i + 1) % 4 == 0 || i == SMALL_ACCOUNT_COUNT - 1) printf("\n");
     //}
-    printf("--------------------------------------------------------------------\n");
+    printf("---------------------------------------------------------------------------------------------------\n");
 
     if (!meaningful_state_recovered) {
         printf("Initializing main state array with default balances as no prior state was recovered.\n");
@@ -753,20 +751,20 @@ int main(int argc, char **argv) {
         } else {
             printf("Post-recovery state hash verification SUCCEEDED for batch %d.\n", recovered_batch);
         }
-         if (!is_reference_run) {
-             int64_t *reference_state_array_debug = malloc(PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
-             if (reference_state_array_debug) {
-                 FILE *f_ref_debug = fopen(REFERENCE_STATE_FILE, "rb");
-                 if (f_ref_debug) {
-                     if (fread(reference_state_array_debug, ACCOUNT_SIZE, PADDED_ACCOUNT_COUNT, f_ref_debug) == PADDED_ACCOUNT_COUNT) {
-                         printf("DEBUG RUN: Comparing current main_state_array (post-recovery) with loaded reference state...\n");
-                         dump_state_diff(reference_state_array_debug, main_state_array, SMALL_ACCOUNT_COUNT, SMALL_ACCOUNT_COUNT); // Report 100 diffs
-                     }
-                     fclose(f_ref_debug);
-                 } else if (errno != ENOENT) { perror("DEBUG RUN: Error opening reference state file for comparison");}
-                 free(reference_state_array_debug);
-             }
-         }
+        //if (!is_reference_run) {
+        //    int64_t *reference_state_array_debug = malloc(PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
+        //    if (reference_state_array_debug) {
+        //        FILE *f_ref_debug = fopen(REFERENCE_STATE_FILE, "rb");
+        //        if (f_ref_debug) {
+        //            if (fread(reference_state_array_debug, ACCOUNT_SIZE, PADDED_ACCOUNT_COUNT, f_ref_debug) == PADDED_ACCOUNT_COUNT) {
+        //                printf("DEBUG RUN: Comparing current main_state_array (post-recovery) with loaded reference state...\n");
+        //                dump_state_diff(reference_state_array_debug, main_state_array, SMALL_ACCOUNT_COUNT, SMALL_ACCOUNT_COUNT); // Report 100 diffs
+        //            }
+        //            fclose(f_ref_debug);
+        //        } else if (errno != ENOENT) { perror("DEBUG RUN: Error opening reference state file for comparison");}
+        //        free(reference_state_array_debug);
+        //    }
+        //}
     }
 
     int log_fd_mmap = open(LOG_FILE, O_RDWR);
@@ -816,7 +814,7 @@ int main(int argc, char **argv) {
     double proc_start_t_loop = get_time_ms();
 
     // Allocate array to store total times for each batch processed in this run
-    size_t max_batches_this_run = 100000; // Arbitrary large enough value
+    size_t max_batches_this_run = 10000000; // Arbitrary large enough value
     double *batch_total_times = malloc(max_batches_this_run * sizeof(double));
     if (!batch_total_times) {
         perror("Failed to allocate batch_total_times array");
@@ -916,13 +914,6 @@ int main(int argc, char **argv) {
     //printf("Final state in memory reflects batch: %d\n", current_batch_num_in_loop);
     printf("[SUMMARY] Number of batches processed from %s in this run: %u\n", TX_FILE, file_batches_processed_this_run_count);
 
-    // Print state after all transactions for this run are processed
-    //printf("--- State After Processing All Transactions in This Run (Reflects Batch: %d) ---\n", current_batch_num_in_loop);
-    //for (uint64_t i = 0; i < SMALL_ACCOUNT_COUNT; ++i) {
-    //    printf("Account[%02lu]: %-12ld ", i, main_state_array[i]);
-    //    if ((i + 1) % 4 == 0 || i == SMALL_ACCOUNT_COUNT - 1) printf("\n");
-    //}
-    //printf("------------------------------------------------------------------------------------\n");
 
     int batch_for_final_hash_label = current_batch_num_in_loop;
     if (batch_for_final_hash_label >= 0) {
@@ -940,19 +931,28 @@ int main(int argc, char **argv) {
                 int fd_ref = fileno(f_ref_save);
                 if (fd_ref >= 0 && fsync(fd_ref) != 0) { perror("fsync failed for reference state file");}
                 fclose(f_ref_save);
-            } else { perror("REFERENCE RUN: Error opening reference state file for writing"); }
+            } else { 
+                perror("REFERENCE RUN: Error opening reference state file for writing"); 
+            }
         }
     }
 
     printf("Finalizing log data...\n");
-    if (msync(mapped_log_region, TOTAL_LOG_FILE_SIZE, MS_SYNC) != 0) { perror("Final msync of log data failed"); }
+    if (msync(mapped_log_region, TOTAL_LOG_FILE_SIZE, MS_SYNC) != 0) { 
+        perror("Final msync of log data failed"); 
+    }
     // fsync the file descriptor for mmap region for good measure, though MS_SYNC should cover it for file-backed maps.
-    if (fsync(log_fd_mmap) != 0) { perror("Final fsync of log_fd_mmap failed"); }
+    if (fsync(log_fd_mmap) != 0) { 
+        perror("Final fsync of log_fd_mmap failed"); 
+    }
 
     munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE);
     if(fp_tx) fclose(fp_tx);
     if(log_fd_mmap >=0) close(log_fd_mmap);
-    free(tx_batch_buf); free(temp_snap_slot); free(temp_tx_slot); free(main_state_array);
+    free(tx_batch_buf); 
+    free(temp_snap_slot); 
+    free(temp_tx_slot); 
+    free(main_state_array);
     printf("Execution complete.\n");
     return 0;
 }

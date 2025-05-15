@@ -31,7 +31,7 @@ int main(void) {
     srand((unsigned)time(NULL));
     Transaction tx;
 
-    printf("--- Generating Transactions ---\n");
+    //printf("--- Generating Transactions ---\n");
     for (uint64_t i = 0; i < TOTAL_TRANSACTIONS; i++) {
         uint64_t op_type_flag; // 0 for P2P, 1 for Range Set
         uint64_t display_sender, display_receiver_or_count, display_amount;
@@ -79,7 +79,7 @@ int main(void) {
 
         fwrite(&tx, sizeof(Transaction), 1, fp);
     }
-    printf("--- Finished Generating Transactions ---\n");
+    //printf("--- Finished Generating Transactions ---\n");
     
     fclose(fp);
     return 0;
