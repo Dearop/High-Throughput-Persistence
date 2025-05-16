@@ -30,6 +30,8 @@ int main(void) {
 
     srand((unsigned)time(NULL));
     Transaction tx;
+    Transaction tx_buffer[BATCH_SIZE];
+    size_t buffer_count = 0;
 
     //printf("--- Generating Transactions ---\n");
     for (uint64_t i = 0; i < TOTAL_TRANSACTIONS; i++) {
@@ -66,7 +68,12 @@ int main(void) {
         //       tx.sender,
         //       tx.receiver);
 
-        fwrite(&tx, sizeof(Transaction), 1, fp);
+        tx_buffer[buffer_count++] = tx;
+
+        if (buffer_count == BATCH_SIZE) {
+            fwrite(tx_buffer, sizeof(Transaction), BATCH_SIZE, fp);
+            buffer_count = 0;
+        }
     }
     //printf("--- Finished Generating Transactions ---\n");
     
