@@ -118,9 +118,31 @@ typedef struct {
     uint32_t original_batch_num;
 } TransactionWithBatchNum;
 
+// --- Threading Data Structures ---
+typedef struct {
+    uint32_t slot_idx_in_cycle;
+    uint32_t current_batch_num;
+    void *mapped_log_region;
+    long pagesize;
+    uint32_t num_tx_in_batch;
+    int64_t state_chunk_data[ACCOUNTS_PER_STATE_CHUNK]; // Copy of the relevant state chunk
+    Transaction transactions_copy[BATCH_SIZE];           // Copy of the transactions for the batch
+} CommitThreadArgs;
+
+// --- Threading Globals ---
+static pthread_t commit_thread_id;
+static pthread_mutex_t commit_mutex;
+static pthread_cond_t commit_cond_data_ready; // Main -> Worker: new data is ready for commit
+static pthread_cond_t commit_cond_commit_done;  // Worker -> Main: commit operation is finished
+static bool commit_data_is_ready_for_worker = false; // Protected by commit_mutex
+static bool commit_by_worker_is_in_progress = false; // Protected by commit_mutex, true if worker is busy
+static bool worker_thread_should_exit = false;   // Protected by commit_mutex
+
+// Arguments for the commit worker thread, shared between main and worker
+static CommitThreadArgs global_commit_args_for_worker;
 
 // --Debug Functions --
-static void dump_state_diff(const int64_t *a,
+/* static void dump_state_diff(const int64_t *a,
                 const int64_t *b,
                 size_t          count,
                 size_t          max_report)
@@ -154,10 +176,10 @@ static void dump_state_diff(const int64_t *a,
             fprintf(diff_fp, "dump_state_diff: States are **identical** (%zu accounts)\n", count);
         }
     } else {
-        double percentage_diff = 0.0;
-        if (count > 0) {
-            percentage_diff = ((double)mismatches / count) * 100.0;
-        }
+        // double percentage_diff = 0.0; // Removed as unused
+        // if (count > 0) {
+        //     percentage_diff = ((double)mismatches / count) * 100.0;
+        // }
         //fprintf(diff_fp, "dump_state_diff: %zu account(s) differ (%.2f%%). Reporting capped at %zu.\n", mismatches, percentage_diff, max_report);
         //fprintf(stderr, "dump_state_diff: %zu account(s) differ (%.2f%%). Detailed report in %s\n", mismatches, percentage_diff, (diff_fp == stderr ? "stderr" : DIFF_OUTPUT_FILE));
 
@@ -167,9 +189,10 @@ static void dump_state_diff(const int64_t *a,
     if (diff_fp != stderr) {
         fclose(diff_fp);
     }
-}
+} */
 
 // --- Utility Functions ---
+// Hash function for state verification
 static inline uint64_t mix64(uint64_t k) {
     k ^= k >> 33;
     k *= UINT64_C(0xff51afd7ed558ccd);
@@ -185,15 +208,18 @@ double get_time_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+// Placeholder for memcpy
 static inline void nt_memcpy(void *dest, const void *src, size_t n) {
     memcpy(dest, src, n);
 }
 
+// Modulo operation with positive result
 static inline uint32_t positive_modulo(int32_t value, uint32_t modulus) {
     int32_t result = value % (int32_t)modulus;
     return (uint32_t)(result >= 0 ? result : result + modulus);
 }
 
+// Comparison function for sorting transactions by batch number, oldest first
 int compare_tx_with_batch_num(const void *a, const void *b) {
     TransactionWithBatchNum *tx_a = (TransactionWithBatchNum *)a;
     TransactionWithBatchNum *tx_b = (TransactionWithBatchNum *)b;
@@ -342,6 +368,96 @@ static FORCE_INLINE void commit_batch_data_to_log(
          /* Optionally: abort(); */
      }
  }
+
+// --- Commit Worker Thread Function ---
+static void* commit_worker_func(void* arg) {
+    (void)arg; // Argument not used as we use global_commit_args_for_worker
+
+    CommitThreadArgs local_args_for_current_task; // Worker's local copy of args for safety
+    ChunkSlot current_task_snap_slot; // Worker's own temp slot for snapshot
+    BatchSlot current_task_tx_slot;   // Worker's own temp slot for transactions
+
+    while (true) {
+        pthread_mutex_lock(&commit_mutex);
+        while (!commit_data_is_ready_for_worker && !worker_thread_should_exit) {
+            pthread_cond_wait(&commit_cond_data_ready, &commit_mutex);
+        }
+
+        if (worker_thread_should_exit) {
+            pthread_mutex_unlock(&commit_mutex);
+            break;
+        }
+
+        // At this point, commit_data_is_ready_for_worker is true.
+        // Main thread has set commit_by_worker_is_in_progress = true.
+        // Copy the shared global_commit_args_for_worker to a local copy.
+        local_args_for_current_task = global_commit_args_for_worker;
+        commit_data_is_ready_for_worker = false; // Reset for next cycle. Main thread will set it again.
+        // commit_by_worker_is_in_progress remains true until worker is done with this task.
+        pthread_mutex_unlock(&commit_mutex);
+
+        // --- Perform the commit operation using local_args_for_current_task ---
+        const size_t snapshot_slot_header_offset = CHECKPOINT_HEADER_SIZE;
+        const size_t tx_slot_array_offset = snapshot_slot_header_offset + NUM_STATE_CHUNKS * sizeof(ChunkSlot);
+
+        const size_t final_snap_offset = snapshot_slot_header_offset +
+                                         (size_t)local_args_for_current_task.slot_idx_in_cycle * sizeof(ChunkSlot);
+        const size_t final_tx_offset = tx_slot_array_offset +
+                                       (size_t)local_args_for_current_task.slot_idx_in_cycle * sizeof(BatchSlot);
+
+        // Prepare snapshot chunk using current_task_snap_slot
+        current_task_snap_slot.batch_num = local_args_for_current_task.current_batch_num;
+        current_task_snap_slot.chunk_idx_in_ring = local_args_for_current_task.slot_idx_in_cycle;
+        nt_memcpy(current_task_snap_slot.state_data,
+                  local_args_for_current_task.state_chunk_data, // Use the copied state chunk
+                  ACCOUNTS_PER_STATE_CHUNK * ACCOUNT_SIZE);
+
+        void *__restrict snap_dst = (char *)local_args_for_current_task.mapped_log_region + final_snap_offset;
+        nt_memcpy(snap_dst, &current_task_snap_slot, sizeof(ChunkSlot));
+
+        // Prepare transaction batch using current_task_tx_slot
+        current_task_tx_slot.batch_num = local_args_for_current_task.current_batch_num;
+        current_task_tx_slot.tx_count  = local_args_for_current_task.num_tx_in_batch;
+
+        if (local_args_for_current_task.num_tx_in_batch > 0) {
+            nt_memcpy(current_task_tx_slot.transactions,
+                      local_args_for_current_task.transactions_copy, // Use the copied transactions
+                      (size_t)local_args_for_current_task.num_tx_in_batch * sizeof(Transaction));
+        } else {
+            // Ensure the transaction part of the slot is zeroed if no transactions
+            memset(current_task_tx_slot.transactions, 0, BATCH_SIZE * sizeof(Transaction));
+        }
+
+        void *__restrict tx_dst = (char *)local_args_for_current_task.mapped_log_region + final_tx_offset;
+        nt_memcpy(tx_dst, &current_task_tx_slot, sizeof(BatchSlot));
+
+        // Persist
+        if (UNLIKELY(local_args_for_current_task.pagesize <= 0)) {
+            perror("commit_worker_func: invalid pagesize");
+        } else {
+            void *sync_start = (void *)((uintptr_t)snap_dst & ~((uintptr_t)local_args_for_current_task.pagesize - 1U));
+            const uintptr_t last_byte = (uintptr_t)tx_dst + sizeof(BatchSlot) - 1U;
+            const size_t sync_len = ((last_byte / (uintptr_t)local_args_for_current_task.pagesize) * (uintptr_t)local_args_for_current_task.pagesize +
+                                     (uintptr_t)local_args_for_current_task.pagesize) - (uintptr_t)sync_start;
+
+            if (UNLIKELY(msync(sync_start, sync_len, MS_SYNC))) {
+                char err_buf[256];
+                snprintf(err_buf, sizeof(err_buf),
+                         "CRITICAL (WORKER): Combined msync failed (snap=%p, tx=%p, start=%p, len=%zu, batch %u)",
+                         snap_dst, tx_dst, sync_start, sync_len, local_args_for_current_task.current_batch_num);
+                perror(err_buf);
+                // Potentially add more robust error handling / signaling to main thread
+            }
+        }
+        // --- End of commit operation ---
+
+        pthread_mutex_lock(&commit_mutex);
+        commit_by_worker_is_in_progress = false; // Worker is done with this task
+        pthread_cond_signal(&commit_cond_commit_done); // Signal main
+        pthread_mutex_unlock(&commit_mutex);
+    }
+    return NULL;
+}
 
 // --- Recovery Function (User's Specified Algorithm - Refined) ---
 int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover, int *last_recovered_batch_num) {
@@ -547,7 +663,7 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
             }
         } 
     }
-    printf("Recovery Step 2: Applied %zu transactions. State now reflects batch %d.\n", collected_tx_count, *last_recovered_batch_num);
+    printf("Recovery Step 2: Applied %u transactions. State now reflects batch %d.\n", collected_tx_count, *last_recovered_batch_num);
 
     free(temp_snap_slot);
     free(temp_tx_slot);
@@ -701,9 +817,9 @@ int main(int argc, char **argv) {
         printf("INFO: ***** DEBUG/RECOVERY RUN *****\n");
     }
 
-    printf("System Config: ACCOUNTS=%lu, ACCOUNT_SIZE=%zu, BATCH_SIZE=%llu\n",
+    printf("System Config: ACCOUNTS=%lu, ACCOUNT_SIZE=%d, BATCH_SIZE=%llu\n",
             SMALL_ACCOUNT_COUNT, ACCOUNT_SIZE, BATCH_SIZE);
-    printf("               CHUNKS=%u, ACC_PER_CHUNK=%u, PADDED_ACCOUNTS=%lu\n",
+    printf("               CHUNKS=%lu, ACC_PER_CHUNK=%u, PADDED_ACCOUNTS=%lu\n",
            NUM_STATE_CHUNKS, ACCOUNTS_PER_STATE_CHUNK, PADDED_ACCOUNT_COUNT);
     printf("               LOGGING CYCLES: %d\n", CYCLES);
 
@@ -766,7 +882,6 @@ int main(int argc, char **argv) {
             memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
         } else {
             printf("Attempting to recover state from %s\n", LOG_FILE);
-            double rec_phase_start = get_time_ms();
             if (recover_state_from_log(log_fd_rec, main_state_array, &recovered_batch) == 0) {
                 meaningful_state_recovered = true;
                 printf("Recovery successful. Last recovered batch: %d\n", recovered_batch);
@@ -775,8 +890,6 @@ int main(int argc, char **argv) {
                 memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
                 recovered_batch = -1;
             }
-            double rec_phase_end = get_time_ms();
-            //printf("[TIMING] Recovery phase took %.3f ms.\n", rec_phase_end - rec_phase_start);
             close(log_fd_rec);
         }
     }
@@ -856,20 +969,54 @@ int main(int argc, char **argv) {
      // For single cycle, current_cycle_ptr in header should always be 0.
     log_header_ptr->current_cycle_ptr = 0;
 
+    // Initialize pthread mutex and condition variables
+    if (pthread_mutex_init(&commit_mutex, NULL) != 0) {
+        perror("Mutex init failed"); free(main_state_array); munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap); exit(EXIT_FAILURE);
+    }
+    if (pthread_cond_init(&commit_cond_data_ready, NULL) != 0) {
+        perror("Cond var (data_ready) init failed"); pthread_mutex_destroy(&commit_mutex); free(main_state_array); munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap); exit(EXIT_FAILURE);
+    }
+    if (pthread_cond_init(&commit_cond_commit_done, NULL) != 0) {
+        perror("Cond var (commit_done) init failed"); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex); free(main_state_array); munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap); exit(EXIT_FAILURE);
+    }
+
+    // Create the commit worker thread
+    if (pthread_create(&commit_thread_id, NULL, commit_worker_func, NULL) != 0) {
+        perror("Thread creation failed");
+        pthread_cond_destroy(&commit_cond_commit_done); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex);
+        free(main_state_array); munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
+        exit(EXIT_FAILURE);
+    }
 
     Transaction *tx_batch_buf = malloc(BATCH_SIZE * sizeof(Transaction));
     if (!tx_batch_buf) {
         perror("Failed to allocate tx_batch_buf");
+        // Signal worker to exit and join before full cleanup
+        pthread_mutex_lock(&commit_mutex);
+        worker_thread_should_exit = true;
+        commit_data_is_ready_for_worker = true; // Wake up worker if waiting
+        pthread_cond_signal(&commit_cond_data_ready);
+        pthread_mutex_unlock(&commit_mutex);
+        pthread_join(commit_thread_id, NULL);
+        pthread_cond_destroy(&commit_cond_commit_done); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex);
         munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
-        free(main_state_array); free(temp_snap_slot); free(temp_tx_slot);
+        free(main_state_array); // temp_snap_slot and temp_tx_slot already removed
         exit(EXIT_FAILURE);
     }
     FILE *fp_tx = fopen(TX_FILE, "rb");
     if (!fp_tx) {
         perror("Error opening transactions file");
         free(tx_batch_buf);
+        // Signal worker to exit and join before full cleanup
+        pthread_mutex_lock(&commit_mutex);
+        worker_thread_should_exit = true;
+        commit_data_is_ready_for_worker = true; // Wake up worker if waiting
+        pthread_cond_signal(&commit_cond_data_ready);
+        pthread_mutex_unlock(&commit_mutex);
+        pthread_join(commit_thread_id, NULL);
+        pthread_cond_destroy(&commit_cond_commit_done); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex);
         munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
-        free(main_state_array); free(temp_snap_slot); free(temp_tx_slot);
+        free(main_state_array); // temp_snap_slot and temp_tx_slot already removed
         exit(EXIT_FAILURE);
     }
 
@@ -886,8 +1033,16 @@ int main(int argc, char **argv) {
     double *batch_total_times = malloc(max_batches_this_run * sizeof(double));
     if (!batch_total_times) {
         perror("Failed to allocate batch_total_times array");
+        // Signal worker to exit and join before full cleanup
+        pthread_mutex_lock(&commit_mutex);
+        worker_thread_should_exit = true;
+        commit_data_is_ready_for_worker = true; // Wake up worker if waiting
+        pthread_cond_signal(&commit_cond_data_ready);
+        pthread_mutex_unlock(&commit_mutex);
+        pthread_join(commit_thread_id, NULL);
+        pthread_cond_destroy(&commit_cond_commit_done); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex);
         munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
-        free(main_state_array); free(temp_snap_slot); free(temp_tx_slot); free(tx_batch_buf);
+        free(main_state_array); free(tx_batch_buf); // temp_snap_slot and temp_tx_slot already removed
         exit(EXIT_FAILURE);
     }
     size_t batch_time_count = 0;
@@ -911,16 +1066,42 @@ int main(int argc, char **argv) {
 
         uint32_t slot_in_cycle = current_batch_num_in_loop % NUM_STATE_CHUNKS;
 
-        double persist_start_t = get_time_ms();
-        commit_batch_data_to_log(slot_in_cycle, current_batch_num_in_loop,
-                                 main_state_array, tx_batch_buf, num_tx_read,
-                                 mapped_log_region, temp_snap_slot, temp_tx_slot,
-                                 pagesize); // Pass pagesize
-        double persist_end_t = get_time_ms();
+        // Wait for the previous batch's commit to complete (if not the first batch processed in this run)
+        if (file_batches_processed_this_run_count > 0) {
+            pthread_mutex_lock(&commit_mutex);
+            while (commit_by_worker_is_in_progress) {
+                pthread_cond_wait(&commit_cond_commit_done, &commit_mutex);
+            }
+            pthread_mutex_unlock(&commit_mutex);
+        }
 
-        // Collect total time for this batch (application + persistence)
+        // Prepare data and signal worker thread for the current batch
+        pthread_mutex_lock(&commit_mutex);
+        global_commit_args_for_worker.slot_idx_in_cycle = slot_in_cycle;
+        global_commit_args_for_worker.current_batch_num = current_batch_num_in_loop;
+        global_commit_args_for_worker.mapped_log_region = mapped_log_region;
+        global_commit_args_for_worker.pagesize = pagesize;
+        global_commit_args_for_worker.num_tx_in_batch = num_tx_read;
+
+        // Copy the relevant state chunk
+        const int64_t *__restrict src_state_chunk_for_commit =
+            main_state_array + (size_t)slot_in_cycle * ACCOUNTS_PER_STATE_CHUNK;
+        nt_memcpy(global_commit_args_for_worker.state_chunk_data, src_state_chunk_for_commit, ACCOUNTS_PER_STATE_CHUNK * ACCOUNT_SIZE);
+
+        // Copy transactions for the batch
+        if (num_tx_read > 0) {
+            nt_memcpy(global_commit_args_for_worker.transactions_copy, tx_batch_buf, (size_t)num_tx_read * sizeof(Transaction));
+        }
+        // If num_tx_read is 0, worker will handle empty transactions_copy.
+
+        commit_data_is_ready_for_worker = true;
+        commit_by_worker_is_in_progress = true; // Main sets this; worker resets it after completion
+        pthread_cond_signal(&commit_cond_data_ready);
+        pthread_mutex_unlock(&commit_mutex);
+
+        // Collect time for this batch (application time only, persistence is async)
         if (batch_time_count < max_batches_this_run) {
-            batch_total_times[batch_time_count++] = (tx_apply_end_t - tx_apply_start_t) + (persist_end_t - persist_start_t);
+            batch_total_times[batch_time_count++] = (tx_apply_end_t - tx_apply_start_t); // Application time only
         }
 
         if (slot_in_cycle == (NUM_STATE_CHUNKS - 1)) {
@@ -928,13 +1109,13 @@ int main(int argc, char **argv) {
             if (msync((void*)log_header_ptr, CHECKPOINT_HEADER_SIZE, MS_SYNC) != 0) {
                  perror("CRITICAL: Failed to msync header update");
             }
-            if (current_batch_num_in_loop != 2021) {
-                printf("Batch %u: Full pass over %u log slots completed. Header (current_cycle_ptr=%u) synced.\n",
+            if (current_batch_num_in_loop != 2021) { // Intentionally keeping != 2021 for specific logging behavior
+                printf("Batch %u: Full pass over %lu log slots completed. Header (current_cycle_ptr=%u) synced.\n",
                        current_batch_num_in_loop, NUM_STATE_CHUNKS, log_header_ptr->current_cycle_ptr);
             }
         }
         if ((current_batch_num_in_loop % 10) == 0 || num_tx_read < BATCH_SIZE) {
-            if (current_batch_num_in_loop != 2021) {
+            if (current_batch_num_in_loop != 2021) { // Intentionally keeping != 2021 for specific logging behavior
                 printf("Processed batch %u (%zu tx read) in %.3f ms. Slot in cycle: %u\n",
                        current_batch_num_in_loop, num_tx_read, tx_apply_end_t - tx_apply_start_t, slot_in_cycle);
             }
@@ -970,8 +1151,17 @@ int main(int argc, char **argv) {
             size_t idx_99 = (size_t)(0.99 * batch_time_count);
             if (idx_99 >= batch_time_count) idx_99 = batch_time_count - 1;
             double p99 = sorted_times[idx_99];
-            printf("[STATS] Median batch total time (apply+persist): %.3f ms\n", median);
-            printf("[STATS] 99th percentile batch total time (apply+persist): %.3f ms\n", p99);
+
+            // Calculate Average
+            double sum_of_times = 0;
+            for (size_t i = 0; i < batch_time_count; ++i) {
+                sum_of_times += batch_total_times[i]; // Use original times (application times)
+            }
+            double average_time = (batch_time_count > 0) ? (sum_of_times / batch_time_count) : 0.0;
+
+            printf("[STATS] Average batch application time: %.3f ms\n", average_time);
+            printf("[STATS] Median batch application time: %.3f ms\n", median);
+            printf("[STATS] 99th percentile batch application time: %.3f ms\n", p99);
             free(sorted_times);
         }
     }
@@ -1014,12 +1204,29 @@ int main(int argc, char **argv) {
         perror("Final fsync of log_fd_mmap failed"); 
     }
 
+    // Wait for the last dispatched commit to finish, then signal worker to exit and join
+    pthread_mutex_lock(&commit_mutex);
+    while (commit_by_worker_is_in_progress) { // Ensure last commit is done
+        pthread_cond_wait(&commit_cond_commit_done, &commit_mutex);
+    }
+    worker_thread_should_exit = true;
+    commit_data_is_ready_for_worker = true; // Wake up worker if it's waiting on commit_cond_data_ready
+    pthread_cond_signal(&commit_cond_data_ready);
+    pthread_mutex_unlock(&commit_mutex);
+
+    pthread_join(commit_thread_id, NULL);
+
+    // Destroy pthread objects
+    pthread_mutex_destroy(&commit_mutex);
+    pthread_cond_destroy(&commit_cond_data_ready);
+    pthread_cond_destroy(&commit_cond_commit_done);
+
     munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE);
     if(fp_tx) fclose(fp_tx);
     if(log_fd_mmap >=0) close(log_fd_mmap);
     free(tx_batch_buf); 
-    free(temp_snap_slot); 
-    free(temp_tx_slot); 
+    // free(temp_snap_slot); // No longer allocated in main
+    // free(temp_tx_slot); // No longer allocated in main
     free(main_state_array);
     printf("Execution complete.\n");
     return 0;

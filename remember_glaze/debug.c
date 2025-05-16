@@ -14,7 +14,6 @@
 #include <errno.h>
 #include <pthread.h>
 #include <inttypes.h>
-#include <immintrin.h> 
 
 // --- Definitions and Constants ---
 
@@ -23,7 +22,7 @@
 #define ACCOUNT_SIZE            8 // Use sizeof for clarity and portability
 
 // State Chunk configuration
-#define TARGET_CHUNK_DATA_BYTES (512 * 1024)   // Approx 512KB per state chunk
+#define TARGET_CHUNK_DATA_BYTES (512 * 1024)   // Needs tuning => trade-off between transaction processing and state recovery speed
 #define ACCOUNTS_PER_STATE_CHUNK (TARGET_CHUNK_DATA_BYTES / ACCOUNT_SIZE) // Number of accounts in one state chunk
 #if ACCOUNTS_PER_STATE_CHUNK == 0
     #error "ACCOUNTS_PER_STATE_CHUNK is zero, TARGET_CHUNK_DATA_BYTES is too small for even one account."
@@ -121,7 +120,7 @@ typedef struct {
 
 
 // --Debug Functions --
-static void dump_state_diff(const int64_t *a,
+/* static void dump_state_diff(const int64_t *a, // Commenting out the function to remove unused warning
                 const int64_t *b,
                 size_t          count,
                 size_t          max_report)
@@ -155,10 +154,10 @@ static void dump_state_diff(const int64_t *a,
             fprintf(diff_fp, "dump_state_diff: States are **identical** (%zu accounts)\n", count);
         }
     } else {
-        double percentage_diff = 0.0;
-        if (count > 0) {
-            percentage_diff = ((double)mismatches / count) * 100.0;
-        }
+        // double percentage_diff = 0.0; // This variable is set but not used
+        // if (count > 0) {
+        //     percentage_diff = ((double)mismatches / count) * 100.0;
+        // }
         //fprintf(diff_fp, "dump_state_diff: %zu account(s) differ (%.2f%%). Reporting capped at %zu.\n", mismatches, percentage_diff, max_report);
         //fprintf(stderr, "dump_state_diff: %zu account(s) differ (%.2f%%). Detailed report in %s\n", mismatches, percentage_diff, (diff_fp == stderr ? "stderr" : DIFF_OUTPUT_FILE));
 
@@ -168,7 +167,7 @@ static void dump_state_diff(const int64_t *a,
     if (diff_fp != stderr) {
         fclose(diff_fp);
     }
-}
+} */
 
 // --- Utility Functions ---
 static inline uint64_t mix64(uint64_t k) {
@@ -548,7 +547,7 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
             }
         } 
     }
-    printf("Recovery Step 2: Applied %zu transactions. State now reflects batch %d.\n", collected_tx_count, *last_recovered_batch_num);
+    printf("Recovery Step 2: Applied %u transactions. State now reflects batch %d.\n", collected_tx_count, *last_recovered_batch_num);
 
     free(temp_snap_slot);
     free(temp_tx_slot);
@@ -702,9 +701,9 @@ int main(int argc, char **argv) {
         printf("INFO: ***** DEBUG/RECOVERY RUN *****\n");
     }
 
-    printf("System Config: ACCOUNTS=%lu, ACCOUNT_SIZE=%zu, BATCH_SIZE=%llu\n",
+    printf("System Config: ACCOUNTS=%lu, ACCOUNT_SIZE=%d, BATCH_SIZE=%llu\n",
             SMALL_ACCOUNT_COUNT, ACCOUNT_SIZE, BATCH_SIZE);
-    printf("               CHUNKS=%u, ACC_PER_CHUNK=%u, PADDED_ACCOUNTS=%lu\n",
+    printf("               CHUNKS=%lu, ACC_PER_CHUNK=%u, PADDED_ACCOUNTS=%lu\n",
            NUM_STATE_CHUNKS, ACCOUNTS_PER_STATE_CHUNK, PADDED_ACCOUNT_COUNT);
     printf("               LOGGING CYCLES: %d\n", CYCLES);
 
@@ -767,7 +766,6 @@ int main(int argc, char **argv) {
             memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
         } else {
             printf("Attempting to recover state from %s\n", LOG_FILE);
-            double rec_phase_start = get_time_ms();
             if (recover_state_from_log(log_fd_rec, main_state_array, &recovered_batch) == 0) {
                 meaningful_state_recovered = true;
                 printf("Recovery successful. Last recovered batch: %d\n", recovered_batch);
@@ -776,8 +774,6 @@ int main(int argc, char **argv) {
                 memset(main_state_array, 0, PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
                 recovered_batch = -1;
             }
-            double rec_phase_end = get_time_ms();
-            //printf("[TIMING] Recovery phase took %.3f ms.\n", rec_phase_end - rec_phase_start);
             close(log_fd_rec);
         }
     }
@@ -930,7 +926,7 @@ int main(int argc, char **argv) {
                  perror("CRITICAL: Failed to msync header update");
             }
             if (current_batch_num_in_loop != 2021) {
-                printf("Batch %u: Full pass over %u log slots completed. Header (current_cycle_ptr=%u) synced.\n",
+                printf("Batch %u: Full pass over %lu log slots completed. Header (current_cycle_ptr=%u) synced.\n",
                        current_batch_num_in_loop, NUM_STATE_CHUNKS, log_header_ptr->current_cycle_ptr);
             }
         }
