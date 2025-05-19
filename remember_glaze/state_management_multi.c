@@ -17,9 +17,9 @@
 
 // --- Definitions and Constants ---
 
-#define BATCH_SIZE              (1ULL << 16)      // 65,536 transactions per batch
+#define BATCH_SIZE              (1ULL << 16)     // 65,536 transactions per batch
 #define SMALL_ACCOUNT_COUNT     2000000UL       // Target number of accounts
-#define ACCOUNT_SIZE            8 // Use sizeof for clarity and portability
+#define ACCOUNT_SIZE            8              
 
 // State Chunk configuration
 #define TARGET_CHUNK_DATA_BYTES (512 * 1024)   // Needs tuning => trade-off between transaction processing and state recovery speed
@@ -192,7 +192,7 @@ static CommitThreadArgs global_commit_args_for_worker;
 } */
 
 // --- Utility Functions ---
-// Hash function for state verification
+// Hash function for state verification -- tries to express distance between two states
 static inline uint64_t mix64(uint64_t k) {
     k ^= k >> 33;
     k *= UINT64_C(0xff51afd7ed558ccd);
@@ -929,6 +929,7 @@ int main(int argc, char **argv) {
         } else {
             printf("Post-recovery state hash verification SUCCEEDED for batch %d.\n", recovered_batch);
         }
+        // ----- Debugging code -----
         //if (!is_reference_run) {
         //    int64_t *reference_state_array_debug = malloc(PADDED_ACCOUNT_COUNT * ACCOUNT_SIZE);
         //    if (reference_state_array_debug) {
@@ -966,7 +967,6 @@ int main(int argc, char **argv) {
         free(main_state_array); free(temp_snap_slot); free(temp_tx_slot);
         exit(EXIT_FAILURE);
     }
-     // For single cycle, current_cycle_ptr in header should always be 0.
     log_header_ptr->current_cycle_ptr = 0;
 
     // Initialize pthread mutex and condition variables
