@@ -12,7 +12,7 @@
 #define BATCH_SIZE        (1 << 16)  // 2^16 transactions per batch
 #define INITIAL_BALANCE   1000000UL
 #define MAX_ACCOUNTS      2000000UL
-#define TOTAL_BATCHES     50         // Process 50 batches total
+#define TOTAL_BATCHES     125000         // Process 50 batches total
 #define MAX_LOG_BATCHES   5          // Snapshot every 5 batches
 
 // Filenames
