@@ -4,7 +4,7 @@
 #include <time.h>
 
 #define BATCH_SIZE (1 << 16)      // 2^16 transactions per batch
-#define NUMBER_OF_BATCHES 125000      // Total number of batches to generate
+#define NUMBER_OF_BATCHES 125000UL     // Total number of batches to generate
 #define TX_FILE "transactions.bin"
 #define SMALL_ACCOUNT_COUNT 500000000UL   
 
@@ -72,7 +72,7 @@ int main(void) {
     free(batch);
     free(addresses);
     fclose(txFile);
-    printf("Generated %lu transactions (in %d batches) and saved to '%s'.\n",
+    printf("Generated %u transactions (in %d batches) and saved to '%s'.\n",
            NUMBER_OF_BATCHES * BATCH_SIZE, NUMBER_OF_BATCHES, TX_FILE);
     
     return 0;
