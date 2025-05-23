@@ -225,6 +225,52 @@ static void create_snapshot_async(void)
 }
 
 // -----------------------------------------------------------------------------
+// Create a snapshot synchronously (no background thread)
+// -----------------------------------------------------------------------------
+static void create_snapshot_sync(void)
+{
+    // Make a copy of the entire state
+    Account *copy_state = (Account *)malloc(MAX_ACCOUNTS * sizeof(Account));
+    if (!copy_state) {
+        perror("malloc for snapshot copy failed");
+        return;
+    }
+    memcpy(copy_state, g_state, MAX_ACCOUNTS * sizeof(Account));
+
+    // Write the snapshot directly (no thread)
+    FILE *snapshot = fopen(SNAPSHOT_FILE, "wb");
+    if (!snapshot) {
+        perror("Error creating snapshot file");
+        free(copy_state);
+        return;
+    }
+
+    size_t written = fwrite(copy_state, sizeof(Account), MAX_ACCOUNTS, snapshot);
+    fflush(snapshot);
+    if (fsync(fileno(snapshot)) != 0) {
+        perror("fsync failed on snapshot file");
+    }
+    fclose(snapshot);
+    
+    if (written != MAX_ACCOUNTS) {
+        fprintf(stderr, "Error writing snapshot: wrote=%zu, expected=%zu\n",
+                written, MAX_ACCOUNTS);
+    } else {
+        printf("Snapshot created with full state.\n");
+    }
+
+    // Remove/truncate old log
+    if (remove(LOG_FILE) != 0 && errno != ENOENT) {
+        perror("Error removing old log");
+    } else {
+        printf("Log has been reset (old log removed).\n");
+    }
+
+    // Free the copy of the state
+    free(copy_state);
+}
+
+// -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
 int main(void)
@@ -329,27 +375,18 @@ int main(void)
             exit(EXIT_FAILURE);
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double elapsed_ms = timespec_diff_ms(&start, &end);
-        batch_times[iteration] = elapsed_ms;  // store this batch's latency
-        total_elapsed_ms += elapsed_ms;
-
         g_processed_batches++;
-        printf("Batch %llu of %llu processed in %.3f ms\n",
-               (unsigned long long)(iteration + 1),
-               (unsigned long long)TOTAL_BATCHES,
-               elapsed_ms);
 
         // Check if it's time for a snapshot
         if (g_processed_batches % MAX_LOG_BATCHES == 0) {
             // We already fsync'ed above, so the log is safe
-            // Close the current log file so snapshot thread can remove it
+            // Close the current log file so snapshot process can remove it
             fclose(log_fp);
 
-            // Launch the asynchronous snapshot
-            create_snapshot_async();
+            // Create snapshot synchronously - timing will include this
+            create_snapshot_sync();
 
-            // Open a fresh log file so main thread can keep processing
+            // Open a fresh log file so we can keep processing
             log_fp = fopen(LOG_FILE, "ab");
             if (!log_fp) {
                 perror("Error re-opening log file");
@@ -360,6 +397,17 @@ int main(void)
                 exit(EXIT_FAILURE);
             }
         }
+
+        // Take timing measurement after all operations including potential snapshot
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed_ms = timespec_diff_ms(&start, &end);
+        batch_times[iteration] = elapsed_ms;  // store this batch's latency
+        total_elapsed_ms += elapsed_ms;
+
+        printf("Batch %llu of %llu processed in %.3f ms\n",
+               (unsigned long long)(iteration + 1),
+               (unsigned long long)TOTAL_BATCHES,
+               elapsed_ms);
     }
 
     // Done with all batches
