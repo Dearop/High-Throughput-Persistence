@@ -94,10 +94,8 @@ int main(void) {
         remove("transactions.bin"); // Attempt to remove potentially corrupted file
         return EXIT_FAILURE;
     } else {
-        printf("--- Finished Generating Transactions ---
-");
-        printf("Successfully generated %llu transactions (%lu batches) and saved to 'transactions.bin'.
-",
+        printf("--- Finished Generating Transactions ---");
+        printf("Successfully generated %llu transactions (%lu batches) and saved to 'transactions.bin'.",
                (unsigned long long)TOTAL_TRANSACTIONS, NUMBER_OF_BATCHES);
     }
     
