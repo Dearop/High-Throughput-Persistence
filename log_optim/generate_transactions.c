@@ -72,7 +72,7 @@ int main(void) {
     free(batch);
     free(addresses);
     fclose(txFile);
-    printf("Generated %d transactions (in %d batches) and saved to '%s'.\n",
+    printf("Generated %lu transactions (in %d batches) and saved to '%s'.\n",
            NUMBER_OF_BATCHES * BATCH_SIZE, NUMBER_OF_BATCHES, TX_FILE);
     
     return 0;
