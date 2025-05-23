@@ -139,6 +139,9 @@ static uint64_t replay_log(void)
 // -----------------------------------------------------------------------------
 static void *snapshot_worker(void *arg)
 {
+    struct timespec snapshot_start, snapshot_end;
+    clock_gettime(CLOCK_MONOTONIC, &snapshot_start);
+    
     SnapshotTask *task = (SnapshotTask *)arg;
     
     // Write the snapshot
@@ -157,11 +160,14 @@ static void *snapshot_worker(void *arg)
     }
     fclose(snapshot);
     
+    clock_gettime(CLOCK_MONOTONIC, &snapshot_end);
+    double snapshot_elapsed_ms = timespec_diff_ms(&snapshot_start, &snapshot_end);
+    
     if (written != task->account_count) {
         fprintf(stderr, "Error writing snapshot: wrote=%zu, expected=%zu\n",
                 written, task->account_count);
     } else {
-        printf("[Async] Snapshot created with full state.\n");
+        printf("[Async] Snapshot created with full state in %.3f ms.\n", snapshot_elapsed_ms);
     }
 
     // Remove/truncate old log
@@ -392,12 +398,19 @@ int main(void)
 
         // Check if it's time for a snapshot
         if (g_processed_batches % MAX_LOG_BATCHES == 0) {
+            struct timespec snapshot_trigger_start, snapshot_trigger_end;
+            clock_gettime(CLOCK_MONOTONIC, &snapshot_trigger_start);
+            
             // We already fsync'ed above, so the log is safe
             // Close the current log file so snapshot thread can remove it
             fclose(log_fp);
 
             // Launch the asynchronous snapshot
             create_snapshot_async();
+            
+            clock_gettime(CLOCK_MONOTONIC, &snapshot_trigger_end);
+            double snapshot_trigger_ms = timespec_diff_ms(&snapshot_trigger_start, &snapshot_trigger_end);
+            printf("Snapshot triggered in %.3f ms (state copy + thread spawn)\n", snapshot_trigger_ms);
 
             // Open a fresh log file so main thread can keep processing
             log_fp = fopen(LOG_FILE, "ab");
