@@ -66,7 +66,7 @@ int main(void) {
             fclose(txFile);
             exit(EXIT_FAILURE);
         }
-        printf("Batch %zu written.\n", batch_num + 1);
+        //printf("Batch %zu written.\n", batch_num + 1);
     }
     
     free(batch);
