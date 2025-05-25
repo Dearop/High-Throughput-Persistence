@@ -20,12 +20,14 @@
 #define STATE_CHUNK_SIZE  (512 * 1024)           // 512KB state chunk per checkpoint (efficient)
 #define STATE_CHUNK_COUNT (STATE_CHUNK_SIZE / sizeof(int64_t))  // 65,536 accounts per chunk
 
-// Write-set size is the batch of transactions
-#define WRITE_SET_SIZE    (BATCH_SIZE * sizeof(Transaction))
+// Write-set size is variable, but we need to allocate maximum possible space
+// Worst case: each transaction modifies multiple accounts (transfers: 2, memset: range length)
+// Conservative estimate: 10x batch size for large memset operations
+#define MAX_WRITE_SET_SIZE (BATCH_SIZE * 10 * sizeof(WriteSetEntry))
 
-// Checkpoint slot size is now fixed and efficient
+// Checkpoint slot size is now based on maximum possible write-set size
 #define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
-#define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
+#define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + MAX_WRITE_SET_SIZE)
 #define LOG_FILE          "checkpoint_log.dat"
 
 // --- Operation Encoding (from Report_testing) ---
@@ -59,12 +61,18 @@ typedef struct {
     uint64_t amount;    // 64-bit amount
 } Transaction;
 
+// Write-set entry: captures the actual state changes
+typedef struct {
+    uint64_t account_index;  // Which account was modified
+    int64_t new_value;       // The new value after the transaction
+} WriteSetEntry;
+
 // Checkpoint header structure (inspired by glaze)
 typedef struct {
     uint32_t batch_num;         // Batch number of this checkpoint
     uint32_t chunk_offset;      // Starting account index for this chunk
     uint32_t chunk_count;       // Number of accounts in this chunk (usually STATE_CHUNK_COUNT)
-    uint32_t write_set_count;   // Should equal BATCH_SIZE
+    uint32_t write_set_count;   // Number of actual write-set entries (not transactions)
 } CheckpointHeader;
 
 void print_usage(const char *program_name) {
@@ -149,7 +157,7 @@ void preallocate_log_file_posix(const char *filename) {
     close(fd);
 }
 
-// Reconstruction function (enhanced for rotating chunks)
+// Reconstruction function (enhanced for write-sets)
 int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     uint32_t latest_batch = 0;
     int latest_slot = -1;
@@ -161,17 +169,36 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
         ssize_t bytes = pread(fd, &header, sizeof(header), offset);
         if (bytes != sizeof(header))
             continue;
-        if (header.write_set_count == BATCH_SIZE && header.chunk_offset < g_max_accounts) {
-            // Read this chunk's state
+        if (header.chunk_offset < g_max_accounts) {
+            // Read this chunk's state (actual size based on chunk_count)
+            size_t actual_chunk_size = header.chunk_count * sizeof(int64_t);
             int64_t state_chunk[STATE_CHUNK_COUNT];
-            ssize_t read_bytes = pread(fd, state_chunk, STATE_CHUNK_SIZE, offset + sizeof(CheckpointHeader));
-            if (read_bytes == STATE_CHUNK_SIZE) {
+            ssize_t read_bytes = pread(fd, state_chunk, actual_chunk_size, offset + sizeof(CheckpointHeader));
+            if (read_bytes == (ssize_t)actual_chunk_size) {
                 // Copy chunk data to the appropriate position in full state
                 uint64_t copy_count = header.chunk_count;
                 if (header.chunk_offset + copy_count > g_max_accounts) {
                     copy_count = g_max_accounts - header.chunk_offset;
                 }
                 memcpy(state + header.chunk_offset, state_chunk, copy_count * sizeof(int64_t));
+                
+                // Read and apply write-sets sequentially
+                if (header.write_set_count > 0) {
+                    size_t write_set_size = header.write_set_count * sizeof(WriteSetEntry);
+                    WriteSetEntry *write_set = malloc(write_set_size);
+                    if (write_set) {
+                        ssize_t ws_bytes = pread(fd, write_set, write_set_size, offset + sizeof(CheckpointHeader) + actual_chunk_size);
+                        if (ws_bytes == (ssize_t)write_set_size) {
+                            // Apply write-sets sequentially to get final state
+                            for (uint32_t j = 0; j < header.write_set_count; j++) {
+                                if (write_set[j].account_index < g_max_accounts) {
+                                    state[write_set[j].account_index] = write_set[j].new_value;
+                                }
+                            }
+                        }
+                        free(write_set);
+                    }
+                }
                 
                 if (header.batch_num >= latest_batch) {
                     latest_batch = header.batch_num;
@@ -190,8 +217,8 @@ int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     return 0;
 }
 
-// Enhanced transaction application with memset support (unlimited accounts)
-static inline bool apply_transaction_to_state_array(const Transaction *__restrict tx, int64_t *__restrict state)
+// Enhanced transaction application with write-set collection
+static inline bool apply_transaction_to_state_array_with_writeset(const Transaction *__restrict tx, int64_t *__restrict state, WriteSetEntry *__restrict write_set, uint32_t *__restrict write_set_count)
 {
     /* Decode the packed sender/receiver words */
     const uint8_t  sfunc = GET_FUNC(tx->sender);
@@ -221,6 +248,16 @@ static inline bool apply_transaction_to_state_array(const Transaction *__restric
         if (LIKELY(*from >= amt)) {
             *from -= amt;
             *to += amt;
+            
+            // Record write-set entries for both accounts
+            write_set[*write_set_count].account_index = sidx;
+            write_set[*write_set_count].new_value = *from;
+            (*write_set_count)++;
+            
+            write_set[*write_set_count].account_index = ridx;
+            write_set[*write_set_count].new_value = *to;
+            (*write_set_count)++;
+            
             return true;
         }
         return false; /* insufficient funds */
@@ -244,6 +281,11 @@ static inline bool apply_transaction_to_state_array(const Transaction *__restric
         
         for (uint64_t i = start; i < end; ++i) {
             state[i] = val;
+            
+            // Record write-set entry for each modified account
+            write_set[*write_set_count].account_index = i;
+            write_set[*write_set_count].new_value = val;
+            (*write_set_count)++;
         }
         return true;
     }
@@ -252,8 +294,8 @@ static inline bool apply_transaction_to_state_array(const Transaction *__restric
     return false;
 }
 
-void apply(const Transaction *tx, int64_t *state, uint64_t *successful_tx, uint64_t *failed_tx) {
-    if (apply_transaction_to_state_array(tx, state)) {
+void apply_with_writeset(const Transaction *tx, int64_t *state, WriteSetEntry *write_set, uint32_t *write_set_count, uint64_t *successful_tx, uint64_t *failed_tx) {
+    if (apply_transaction_to_state_array_with_writeset(tx, state, write_set, write_set_count)) {
         (*successful_tx)++;
     } else {
         (*failed_tx)++;
@@ -301,7 +343,7 @@ int main(int argc, char **argv) {
     g_total_chunks = (g_max_accounts + STATE_CHUNK_COUNT - 1) / STATE_CHUNK_COUNT;  // Round up
     g_state_size_bytes = g_max_accounts * sizeof(int64_t);
     g_checkpoint_header_size = sizeof(CheckpointHeader);
-    g_checkpoint_slot_size = g_checkpoint_header_size + g_state_size_bytes + WRITE_SET_SIZE;
+    g_checkpoint_slot_size = g_checkpoint_header_size + STATE_CHUNK_SIZE + MAX_WRITE_SET_SIZE;
 
     printf("=== Breaking Glaze with Memset Support (Unlimited Accounts) ===\n");
     printf("Configuration:\n");
@@ -390,6 +432,20 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
+    // Allocate write-set buffer (worst case: each transaction can modify multiple accounts)
+    // For transfers: 2 accounts per transaction, for memset: up to range length
+    // Conservative estimate: 10x batch size to handle large memset operations
+    WriteSetEntry *write_set = malloc(MAX_WRITE_SET_SIZE);
+    if (!write_set) {
+        perror("Error allocating write-set buffer");
+        free(batch_times);
+        free(batch);
+        fclose(tx_file);
+        close(fd_log);
+        free(state);
+        exit(EXIT_FAILURE);
+    }
+
     uint64_t total_successful_tx = 0;
     uint64_t total_failed_tx = 0;
     double total_elapsed_ms = 0.0;
@@ -412,12 +468,13 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Apply transactions
+        // Apply transactions and collect write-sets
         uint64_t batch_successful = 0;
         uint64_t batch_failed = 0;
+        uint32_t write_set_count = 0;  // Reset for each batch
         
         for (size_t i = 0; i < read_count; i++) {
-            apply(&batch[i], state, &batch_successful, &batch_failed);
+            apply_with_writeset(&batch[i], state, write_set, &write_set_count, &batch_successful, &batch_failed);
         }
         
         total_successful_tx += batch_successful;
@@ -435,7 +492,7 @@ int main(int argc, char **argv) {
         header.chunk_offset = chunk_offset;
         header.chunk_count = (chunk_offset + STATE_CHUNK_COUNT <= g_max_accounts) ? 
                             STATE_CHUNK_COUNT : (g_max_accounts - chunk_offset);
-        header.write_set_count = BATCH_SIZE;
+        header.write_set_count = write_set_count;  // Actual number of write-set entries
 
         // Copy the appropriate chunk of state for efficient checkpointing
         int64_t state_chunk[STATE_CHUNK_COUNT];
@@ -451,17 +508,19 @@ int main(int argc, char **argv) {
             break;
         }
 
-        // Write state chunk (fixed 512KB)
-        bytes_written = pwrite(fd_log, state_chunk, STATE_CHUNK_SIZE, offset + sizeof(header));
-        if (bytes_written != STATE_CHUNK_SIZE) {
+        // Write state chunk (actual size based on chunk_count)
+        size_t actual_chunk_size = header.chunk_count * sizeof(int64_t);
+        bytes_written = pwrite(fd_log, state_chunk, actual_chunk_size, offset + sizeof(header));
+        if (bytes_written != (ssize_t)actual_chunk_size) {
             perror("Error writing state chunk");
             break;
         }
 
-        // Write transaction batch
-        bytes_written = pwrite(fd_log, batch, WRITE_SET_SIZE, offset + sizeof(header) + STATE_CHUNK_SIZE);
-        if (bytes_written != WRITE_SET_SIZE) {
-            perror("Error writing transaction batch");
+        // Write write-set entries (actual size based on write_set_count)
+        size_t actual_write_set_size = header.write_set_count * sizeof(WriteSetEntry);
+        bytes_written = pwrite(fd_log, write_set, actual_write_set_size, offset + sizeof(header) + actual_chunk_size);
+        if (bytes_written != (ssize_t)actual_write_set_size) {
+            perror("Error writing write-set");
             break;
         }
 
@@ -477,11 +536,13 @@ int main(int argc, char **argv) {
         total_elapsed_ms += elapsed;
 
         if ((batch_num + 1) % 10 == 0 || batch_num == 0) {
-            printf("Batch %u of %u processed in %.3f ms (success: %llu, failed: %llu, checkpointed chunk %u: accounts %u-%u)\n",
+            size_t total_checkpoint_bytes = sizeof(header) + actual_chunk_size + actual_write_set_size;
+            printf("Batch %u of %u processed in %.3f ms (success: %llu, failed: %llu, checkpointed chunk %u: accounts %u-%u, %u write-sets, %zu bytes)\n",
                    batch_num + 1, TOTAL_BATCHES, elapsed,
                    (unsigned long long)batch_successful,
                    (unsigned long long)batch_failed,
-                   chunk_index, chunk_offset, chunk_offset + header.chunk_count - 1);
+                   chunk_index, chunk_offset, chunk_offset + header.chunk_count - 1,
+                   write_set_count, total_checkpoint_bytes);
         }
     }
 
@@ -537,6 +598,7 @@ int main(int argc, char **argv) {
     fclose(tx_file);
     close(fd_log);
     free(state);
+    free(write_set);
 
     printf("\nExecution complete.\n");
     return 0;
