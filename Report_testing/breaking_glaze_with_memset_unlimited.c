@@ -192,9 +192,11 @@ void write_checkpoint_slot(int fd, int slot, int batch_num, int64_t *state,
         perror("pwrite snapshot failed");
         // Potentially exit or handle error more gracefully
     }
-    bytes_written = pwrite(fd, ws_data, WRITE_SET_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
-    if (bytes_written != WRITE_SET_CHUNK_SIZE) {
-        perror("pwrite ws_data failed");
+    bytes_written = pwrite(fd, ws_data, ws_count * sizeof(WriteSetEntry), offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
+    if (bytes_written != (ssize_t)(ws_count * sizeof(WriteSetEntry))) {
+        char err_msg[100];
+        sprintf(err_msg, "pwrite ws_data failed (expected %ld, got %zd)", (long)(ws_count * sizeof(WriteSetEntry)), bytes_written);
+        perror(err_msg);
         // Potentially exit
     }
     bytes_written = pwrite(fd, &header, CHECKPOINT_HEADER_SIZE, offset);
