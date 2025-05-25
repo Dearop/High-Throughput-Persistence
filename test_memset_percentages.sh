@@ -16,3 +16,9 @@ compile_programs() {
     
     log_message "All programs compiled successfully."
 } 
+
+# **Transaction Generation:**
+# - Batch size: 65,536 transactions
+# - Total batches: 1,250,000
+# - Total transactions: ~82 billion per test
+# - Account range: 0 to $(($ACCOUNT_COUNT - 1)) 

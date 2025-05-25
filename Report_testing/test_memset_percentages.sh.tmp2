@@ -28,19 +28,19 @@ compile_programs() {
     # Force recompilation
         log_message "Compiling transaction generator..."
         gcc -Wall -Wextra -O3 -std=c99 -fopenmp -o generate_transactions generate_transactions.c -lm
-    # End force recompilation
+    fi
     
     # Compile breaking_glaze_with_memset_unlimited
     if [ ! -f "breaking_glaze_with_memset_unlimited" ] || [ "breaking_glaze_with_memset_unlimited.c" -nt "breaking_glaze_with_memset_unlimited" ]; then
         log_message "Compiling breaking_glaze_with_memset_unlimited..."
         gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o breaking_glaze_with_memset_unlimited breaking_glaze_with_memset_unlimited.c -lm
-    # End force recompilation
+    fi
     
     # Compile state_management_parameterized
     if [ ! -f "state_management_parameterized" ] || [ "state_management_parameterized.c" -nt "state_management_parameterized" ]; then
         log_message "Compiling state_management_parameterized..."
         gcc -Wall -Wextra -O3 -std=c99 -fopenmp -D_POSIX_C_SOURCE=200809L -o state_management_parameterized state_management_parameterized.c -lm
-    # End force recompilation
+    fi
     
     log_message "All programs compiled successfully."
 }
@@ -70,7 +70,7 @@ run_test() {
     if [ ! -f "transactions.bin" ]; then
         log_message "ERROR: Transaction generation failed for ${memset_percentage}%"
         return 1
-    # End force recompilation
+    fi
     
     # Run the system
     log_message "Running ${system_name}..."
@@ -86,7 +86,7 @@ run_test() {
     else
         log_message "ERROR: ${system_name} failed for ${memset_percentage}% memset"
         return 1
-    # End force recompilation
+    fi
     
     # Clean up for next test
     cleanup_files
@@ -166,7 +166,7 @@ EOF
             
             echo "| $pct% | $bg_throughput | $param_throughput | $bg_success% | $param_success% |" >> "$summary_file"
         done
-    # End force recompilation
+    fi
     
     cat >> "$summary_file" << EOF
 
@@ -200,7 +200,7 @@ main() {
     if ! command -v bc &> /dev/null; then
         log_message "ERROR: bc calculator not found. Please install bc for timing calculations."
         exit 1
-    # End force recompilation
+    fi
     
     # Compile programs
     compile_programs
@@ -220,12 +220,12 @@ main() {
         # Test breaking_glaze_with_memset_unlimited
         if ! run_test "$memset_pct" "$test_counter" "breaking_glaze_with_memset_unlimited" "./breaking_glaze_with_memset_unlimited ${ACCOUNT_COUNT}"; then
             log_message "WARNING: breaking_glaze_with_memset_unlimited test failed for ${memset_pct}%"
-        # End force recompilation
+        fi
         
         # Test state_management_parameterized
         if ! run_test "$memset_pct" "$test_counter" "state_management_parameterized" "./state_management_parameterized ${ACCOUNT_COUNT}"; then
             log_message "WARNING: state_management_parameterized test failed for ${memset_pct}%"
-        # End force recompilation
+        fi
         
         test_counter=$((test_counter + 1))
         
