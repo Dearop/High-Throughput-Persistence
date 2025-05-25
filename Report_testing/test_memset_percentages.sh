@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Test script for comparing breaking_glaze_with_memset and state_management_parameterized
+# Test script for comparing breaking_glaze_with_memset_unlimited and state_management_parameterized
 # with different memset percentages from 0% to 100%
 
 set -e  # Exit on any error
@@ -30,10 +30,10 @@ compile_programs() {
         gcc -Wall -Wextra -O3 -std=c99 -fopenmp -o generate_transactions generate_transactions.c -lm
     fi
     
-    # Compile breaking_glaze_with_memset
-    if [ ! -f "breaking_glaze_with_memset" ] || [ "breaking_glaze_with_memset.c" -nt "breaking_glaze_with_memset" ]; then
-        log_message "Compiling breaking_glaze_with_memset..."
-        gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o breaking_glaze_with_memset breaking_glaze_with_memset.c -lm
+    # Compile breaking_glaze_with_memset_unlimited
+    if [ ! -f "breaking_glaze_with_memset_unlimited" ] || [ "breaking_glaze_with_memset_unlimited.c" -nt "breaking_glaze_with_memset_unlimited" ]; then
+        log_message "Compiling breaking_glaze_with_memset_unlimited..."
+        gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o breaking_glaze_with_memset_unlimited breaking_glaze_with_memset_unlimited.c -lm
     fi
     
     # Compile state_management_parameterized
@@ -133,7 +133,7 @@ generate_summary() {
 ## Test Configuration
 
 - **Systems Tested:**
-  - breaking_glaze_with_memset (Ring-based recovery, 64K account chunk)
+  - breaking_glaze_with_memset_unlimited (Ring-based recovery, ALL ${ACCOUNT_COUNT} accounts)
   - state_management_parameterized (Full ${ACCOUNT_COUNT} accounts)
 
 - **Transaction Generation:**
@@ -159,9 +159,9 @@ EOF
         
         # Process CSV to create comparison table
         for pct in $(seq 0 5 100); do
-            bg_throughput=$(grep "breaking_glaze_with_memset,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
+            bg_throughput=$(grep "breaking_glaze_with_memset_unlimited,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
             param_throughput=$(grep "state_management_parameterized,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
-            bg_success=$(grep "breaking_glaze_with_memset,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f5 || echo "N/A")
+            bg_success=$(grep "breaking_glaze_with_memset_unlimited,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f5 || echo "N/A")
             param_success=$(grep "state_management_parameterized,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f5 || echo "N/A")
             
             echo "| $pct% | $bg_throughput | $param_throughput | $bg_success% | $param_success% |" >> "$summary_file"
@@ -179,10 +179,11 @@ EOF
 
 ## Notes
 
-- breaking_glaze_with_memset only processes the first 64K accounts due to its chunked architecture
-- state_management_parameterized processes all ${ACCOUNT_COUNT} accounts
-- Transactions affecting accounts beyond the breaking_glaze chunk are marked as failed
+- Both systems now process ALL ${ACCOUNT_COUNT} accounts (no artificial limitations)
+- breaking_glaze_with_memset_unlimited uses ring-based checkpointing with dynamic sizing
+- state_management_parameterized uses append-only logging with asynchronous snapshots
 - All timing measurements include transaction processing, logging, and checkpointing overhead
+- Success rates should be much higher now that account range limitations are removed
 
 EOF
 
@@ -216,9 +217,9 @@ main() {
         log_message "Starting test set ${test_counter}/20 with ${memset_pct}% memset"
         log_message "=========================================="
         
-        # Test breaking_glaze_with_memset
-        if ! run_test "$memset_pct" "$test_counter" "breaking_glaze_with_memset" "./breaking_glaze_with_memset"; then
-            log_message "WARNING: breaking_glaze_with_memset test failed for ${memset_pct}%"
+        # Test breaking_glaze_with_memset_unlimited
+        if ! run_test "$memset_pct" "$test_counter" "breaking_glaze_with_memset_unlimited" "./breaking_glaze_with_memset_unlimited ${ACCOUNT_COUNT}"; then
+            log_message "WARNING: breaking_glaze_with_memset_unlimited test failed for ${memset_pct}%"
         fi
         
         # Test state_management_parameterized
