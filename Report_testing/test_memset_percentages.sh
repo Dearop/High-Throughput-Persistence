@@ -33,13 +33,13 @@ compile_programs() {
     # Compile breaking_glaze_with_memset
     if [ ! -f "breaking_glaze_with_memset" ] || [ "breaking_glaze_with_memset.c" -nt "breaking_glaze_with_memset" ]; then
         log_message "Compiling breaking_glaze_with_memset..."
-        make -f Makefile_breaking_glaze_memset
+        gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o breaking_glaze_with_memset breaking_glaze_with_memset.c -lm
     fi
     
     # Compile state_management_parameterized
     if [ ! -f "state_management_parameterized" ] || [ "state_management_parameterized.c" -nt "state_management_parameterized" ]; then
         log_message "Compiling state_management_parameterized..."
-        make -f Makefile_parameterized
+        gcc -Wall -Wextra -O3 -std=c99 -fopenmp -D_POSIX_C_SOURCE=200809L -o state_management_parameterized state_management_parameterized.c -lm
     fi
     
     log_message "All programs compiled successfully."
