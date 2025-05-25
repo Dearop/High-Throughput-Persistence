@@ -34,7 +34,7 @@
 #define DIFF_OUTPUT_FILE        "state_diff.txt"
 
 // Global variables for parameterized account count
-static uint64_t SMALL_ACCOUNT_COUNT = 500000000UL;  // Default value, will be overridden by parameter
+static uint64_t SMALL_ACCOUNT_COUNT = 50000000UL;  // Default value, will be overridden by parameter
 static uint32_t ACCOUNTS_PER_STATE_CHUNK;
 static uint64_t NUM_STATE_CHUNKS;
 static uint64_t PADDED_ACCOUNT_COUNT;
