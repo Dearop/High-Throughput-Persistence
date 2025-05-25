@@ -11,9 +11,11 @@
 #define NUMBER_OF_BATCHES   5000
 #define SMALL_ACCOUNT_COUNT 5000000UL
 
-#define RING_SIZE 10
-#define STATE_CHUNK_COUNT (SMALL_ACCOUNT_COUNT / RING_SIZE)
-#define STATE_CHUNK_SIZE  (STATE_CHUNK_COUNT * sizeof(int64_t))
+// Adjusted State Chunking and Ring Size
+#define STATE_CHUNK_SIZE  (512 * 1024) // Target state chunk size of 512 KB
+#define STATE_CHUNK_COUNT (STATE_CHUNK_SIZE / sizeof(int64_t))
+#define RING_SIZE ((SMALL_ACCOUNT_COUNT + STATE_CHUNK_COUNT - 1) / STATE_CHUNK_COUNT) // Dynamically calculated RING_SIZE
+#define TOTAL_STATE_COVERAGE_COUNT (RING_SIZE * STATE_CHUNK_COUNT) // Actual elements in state array
 
 #define MAX_WRITE_SET_COUNT (16 * BATCH_SIZE)
 #define WRITE_SET_CHUNK_SIZE (MAX_WRITE_SET_COUNT * sizeof(WriteSetEntry))
@@ -201,7 +203,7 @@ int compare_doubles(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
-    int64_t *state = calloc(SMALL_ACCOUNT_COUNT, sizeof(int64_t));
+    int64_t *state = calloc(TOTAL_STATE_COVERAGE_COUNT, sizeof(int64_t));
     if (!state) 
         exit(EXIT_FAILURE);
     WriteSetEntry *ws_accum[RING_SIZE];
