@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Test script for comparing breaking_glaze_with_memset_unlimited and state_management_parameterized
-# RUN THIS ON AWS UBUNTU SERVER ONLY
+# with different memset percentages from 0% to 100%
 
 set -e  # Exit on any error
 
@@ -20,23 +20,29 @@ log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-# Function to compile programs (force recompilation for Ubuntu)
+# Function to compile programs if needed
 compile_programs() {
-    log_message "Compiling programs for Ubuntu..."
+    log_message "Compiling programs..."
     
-    # Force recompilation of transaction generator
-    log_message "Compiling transaction generator..."
-    gcc -Wall -Wextra -O3 -std=c99 -fopenmp -o generate_transactions generate_transactions.c -lm
+    # Compile transaction generator
     
-    # Force recompilation of breaking_glaze_with_memset_unlimited
-    log_message "Compiling breaking_glaze_with_memset_unlimited..."
-    gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o breaking_glaze_with_memset_unlimited breaking_glaze_with_memset_unlimited.c -lm
+        log_message "Compiling transaction generator..."
+        gcc -Wall -Wextra -O3 -std=c99 -fopenmp -o generate_transactions generate_transactions.c -lm
+
     
-    # Force recompilation of state_management_parameterized
-    log_message "Compiling state_management_parameterized..."
-    gcc -Wall -Wextra -O3 -std=c99 -fopenmp -D_GNU_SOURCE -o state_management_parameterized state_management_parameterized.c -lm
+    # Compile breaking_glaze_with_memset_unlimited
     
-    log_message "All programs compiled successfully for Ubuntu."
+        log_message "Compiling breaking_glaze_with_memset_unlimited..."
+        gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o breaking_glaze_with_memset_unlimited breaking_glaze_with_memset_unlimited.c -lm
+
+    
+    # Compile state_management_parameterized
+    
+        log_message "Compiling state_management_parameterized..."
+        gcc -Wall -Wextra -O3 -std=c99 -fopenmp -D_POSIX_C_SOURCE=200809L -o state_management_parameterized state_management_parameterized.c -lm
+
+    
+    log_message "All programs compiled successfully."
 }
 
 # Function to clean up files
@@ -64,7 +70,7 @@ run_test() {
     if [ ! -f "transactions.bin" ]; then
         log_message "ERROR: Transaction generation failed for ${memset_percentage}%"
         return 1
-    fi
+
     
     # Run the system
     log_message "Running ${system_name}..."
@@ -80,7 +86,7 @@ run_test() {
     else
         log_message "ERROR: ${system_name} failed for ${memset_percentage}% memset"
         return 1
-    fi
+
     
     # Clean up for next test
     cleanup_files
@@ -93,24 +99,21 @@ extract_metrics() {
     local memset_percentage=$3
     local duration=$4
     
-    # Extract throughput and timing information (removed success rate)
+    # Extract throughput, success rate, and timing information
     local throughput=$(grep -o "Throughput: [0-9.]* tx/sec" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+    local success_rate=$(grep -o "Success rate: [0-9.]*%" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
     local total_tx=$(grep -o "Total transactions: [0-9]*" "$log_file" | grep -o "[0-9]*" || echo "N/A")
     local avg_batch_time=$(grep -o "Average batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
     local median_time=$(grep -o "Median batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
     local p99_time=$(grep -o "99th percentile batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local total_time=$(grep -o "Total time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
     
     # Append to CSV results file
-    echo "${system_name},${memset_percentage},${duration},${throughput},${total_tx},${avg_batch_time},${median_time},${p99_time},${total_time}" >> "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv"
-    
-    # Log the extracted metrics
-    log_message "  Metrics: Throughput=${throughput} tx/sec, AvgBatch=${avg_batch_time}ms, Total=${total_time}ms"
+    echo "${system_name},${memset_percentage},${duration},${throughput},${success_rate},${total_tx},${avg_batch_time},${median_time},${p99_time}" >> "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv"
 }
 
 # Function to create CSV header
 create_csv_header() {
-    echo "System,Memset_Percentage,Total_Duration_Sec,Throughput_TxPerSec,Total_Transactions,Avg_Batch_Time_Ms,Median_Batch_Time_Ms,P99_Batch_Time_Ms,Total_Processing_Time_Ms" > "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv"
+    echo "System,Memset_Percentage,Total_Duration_Sec,Throughput_TxPerSec,Success_Rate_Percent,Total_Transactions,Avg_Batch_Time_Ms,Median_Batch_Time_Ms,P99_Batch_Time_Ms" > "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv"
 }
 
 # Function to generate summary report
@@ -135,43 +138,52 @@ generate_summary() {
 
 - **Transaction Generation:**
   - Batch size: 65,536 transactions
-  - Total batches: 50,000
-  - Total transactions: ~3.28 billion per test
+  - Total batches: 125,000
+  - Total transactions: ~8.2 billion per test
   - Account range: 0 to $(($ACCOUNT_COUNT - 1))
 
 ## Results Summary
 
 The detailed results are available in: \`results_summary_${TIMESTAMP}.csv\`
 
-### Performance Comparison
+### Key Findings
 
 EOF
 
-    # Add performance comparison table
+    # Add some basic analysis
     if [ -f "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" ]; then
-        echo "| Memset % | breaking_glaze Throughput | parameterized Throughput | breaking_glaze Avg Batch | parameterized Avg Batch |" >> "$summary_file"
+        echo "### Performance Comparison" >> "$summary_file"
+        echo "" >> "$summary_file"
+        echo "| Memset % | breaking_glaze Throughput | parameterized Throughput | breaking_glaze Success % | parameterized Success % |" >> "$summary_file"
         echo "|----------|---------------------------|--------------------------|--------------------------|-------------------------|" >> "$summary_file"
         
         # Process CSV to create comparison table
         for pct in $(seq 0 5 100); do
             bg_throughput=$(grep "breaking_glaze_with_memset_unlimited,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
             param_throughput=$(grep "state_management_parameterized,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
-            bg_avg_batch=$(grep "breaking_glaze_with_memset_unlimited,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f6 || echo "N/A")
-            param_avg_batch=$(grep "state_management_parameterized,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f6 || echo "N/A")
+            bg_success=$(grep "breaking_glaze_with_memset_unlimited,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f5 || echo "N/A")
+            param_success=$(grep "state_management_parameterized,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f5 || echo "N/A")
             
-            echo "| $pct% | $bg_throughput | $param_throughput | ${bg_avg_batch}ms | ${param_avg_batch}ms |" >> "$summary_file"
+            echo "| $pct% | $bg_throughput | $param_throughput | $bg_success% | $param_success% |" >> "$summary_file"
         done
-    fi
+
     
     cat >> "$summary_file" << EOF
 
+## Files Generated
+
+- \`test_log_${TIMESTAMP}.txt\` - Complete test execution log
+- \`results_summary_${TIMESTAMP}.csv\` - Machine-readable results
+- Individual test logs: \`{system}_{percentage}pct_${TIMESTAMP}.log\`
+- Transaction generation logs: \`generation_{system}_{percentage}pct_${TIMESTAMP}.log\`
+
 ## Notes
 
-- Both systems process ALL ${ACCOUNT_COUNT} accounts
-- breaking_glaze uses ring-based checkpointing with rotating chunks
-- state_management_parameterized uses append-only logging
-- Processing 50,000 batches (3.28 billion transactions) per test
-- Average batch time tracked for performance analysis
+- Both systems now process ALL ${ACCOUNT_COUNT} accounts (no artificial limitations)
+- breaking_glaze_with_memset_unlimited uses ring-based checkpointing with dynamic sizing
+- state_management_parameterized uses append-only logging with asynchronous snapshots
+- All timing measurements include transaction processing, logging, and checkpointing overhead
+- Success rates should be much higher now that account range limitations are removed
 
 EOF
 
@@ -180,16 +192,15 @@ EOF
 
 # Main execution
 main() {
-    log_message "Starting memset percentage comparison test on Ubuntu AWS server"
+    log_message "Starting memset percentage comparison test"
     log_message "Account count: ${ACCOUNT_COUNT}"
     log_message "Output directory: ${OUTPUT_DIR}"
-    log_message "Processing 50,000 batches per test (3.28 billion transactions)"
     
-    # Check if bc is available
+    # Check if bc is available for floating point arithmetic
     if ! command -v bc &> /dev/null; then
-        log_message "ERROR: bc calculator not found. Please install bc."
+        log_message "ERROR: bc calculator not found. Please install bc for timing calculations."
         exit 1
-    fi
+
     
     # Compile programs
     compile_programs
@@ -197,7 +208,7 @@ main() {
     # Create CSV header
     create_csv_header
     
-    # Test percentages from 0% to 100% in 5% increments
+    # Test percentages from 0% to 100% in 5% increments (20 tests total)
     local test_counter=1
     
     for memset_pct in $(seq 0 5 100); do
@@ -235,4 +246,4 @@ main() {
 }
 
 # Run main function
-main "$@"
+main "$@" 
