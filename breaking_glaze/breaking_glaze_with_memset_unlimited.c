@@ -8,7 +8,7 @@
 #include <sys/stat.h>
 
 #define BATCH_SIZE          (1 << 16)
-#define NUMBER_OF_BATCHES   5000
+#define NUMBER_OF_BATCHES   50
 #define SMALL_ACCOUNT_COUNT 5000000UL
 
 #define RING_SIZE 10
