@@ -1,0 +1,21 @@
+CC = gcc
+CFLAGS = -Wall -Wextra -O3 -std=c99 -pthread -D_POSIX_C_SOURCE=200809L
+LDFLAGS = -pthread -lm
+
+TARGET = log_optim_parameterized
+SOURCE = log_optim_parameterized.c
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(LDFLAGS)
+
+clean:
+	rm -f $(TARGET) state_log.bin state_snapshot.bin
+
+# Usage examples:
+# make -f Makefile_log_optim_parameterized
+# ./log_optim_parameterized 5000000    # 5 million accounts
+# ./log_optim_parameterized 1000000    # 1 million accounts 
