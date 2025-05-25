@@ -17,7 +17,7 @@
 #define RING_SIZE ((SMALL_ACCOUNT_COUNT + STATE_CHUNK_COUNT - 1) / STATE_CHUNK_COUNT) // Dynamically calculated RING_SIZE
 #define TOTAL_STATE_COVERAGE_COUNT (RING_SIZE * STATE_CHUNK_COUNT) // Actual elements in state array
 
-#define MAX_WRITE_SET_COUNT (16 * BATCH_SIZE)
+#define MAX_WRITE_SET_COUNT (1000 * BATCH_SIZE)
 #define WRITE_SET_CHUNK_SIZE (MAX_WRITE_SET_COUNT * sizeof(WriteSetEntry))
 
 #define CHECKPOINT_MAGIC 0xC0CAC01A
@@ -186,9 +186,22 @@ void write_checkpoint_slot(int fd, int slot, int batch_num, int64_t *state,
     CheckpointHeader header = { CHECKPOINT_MAGIC, batch_num, slot * STATE_CHUNK_COUNT,
                                   STATE_CHUNK_COUNT, ws_count };
     off_t offset = slot * CHECKPOINT_SLOT_SIZE;
-    pwrite(fd, snapshot, STATE_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE);
-    pwrite(fd, ws_data, WRITE_SET_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
-    pwrite(fd, &header, CHECKPOINT_HEADER_SIZE, offset);
+    ssize_t bytes_written;
+    bytes_written = pwrite(fd, snapshot, STATE_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE);
+    if (bytes_written != STATE_CHUNK_SIZE) {
+        perror("pwrite snapshot failed");
+        // Potentially exit or handle error more gracefully
+    }
+    bytes_written = pwrite(fd, ws_data, WRITE_SET_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
+    if (bytes_written != WRITE_SET_CHUNK_SIZE) {
+        perror("pwrite ws_data failed");
+        // Potentially exit
+    }
+    bytes_written = pwrite(fd, &header, CHECKPOINT_HEADER_SIZE, offset);
+    if (bytes_written != CHECKPOINT_HEADER_SIZE) {
+        perror("pwrite header failed");
+        // Potentially exit
+    }
 }
 
 /* Comparator for qsort */
@@ -223,11 +236,16 @@ int main(int argc, char **argv) {
         FILE *hash_fp = fopen("state_hash.dat", "rb");
         if (hash_fp) {
             uint64_t stored_hash;
-            fread(&stored_hash, sizeof(uint64_t), 1, hash_fp);
+            size_t items_read = fread(&stored_hash, sizeof(uint64_t), 1, hash_fp);
+            if (items_read != 1 && ferror(hash_fp)) {
+                perror("fread from state_hash.dat failed");
+            }
             fclose(hash_fp);
-            if (hash != stored_hash) {
-                printf("Hash mismatch: computed %llu, stored %llu\n", hash, stored_hash);
+            if (hash != stored_hash && items_read == 1) {
+                printf("Hash mismatch: computed %lu, stored %lu\n", (unsigned long)hash, (unsigned long)stored_hash);
                 write_state_to_file("reconstructed_state.txt", state, SMALL_ACCOUNT_COUNT);
+            } else if (items_read != 1 && !feof(hash_fp)) {
+                printf("Warning: Could not read stored hash or file was empty.\n");
             }
         }
         close(log_fd);
@@ -293,9 +311,19 @@ int main(int argc, char **argv) {
             CheckpointHeader header = { CHECKPOINT_MAGIC, NUMBER_OF_BATCHES - 1, slot * STATE_CHUNK_COUNT,
                                           STATE_CHUNK_COUNT, 0 };
             off_t offset = slot * CHECKPOINT_SLOT_SIZE;
-            pwrite(log_fd, state + slot * STATE_CHUNK_COUNT, STATE_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE);
-            pwrite(log_fd, empty_ws, WRITE_SET_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
-            pwrite(log_fd, &header, CHECKPOINT_HEADER_SIZE, offset);
+            ssize_t bytes_written_main;
+            bytes_written_main = pwrite(log_fd, state + slot * STATE_CHUNK_COUNT, STATE_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE);
+            if (bytes_written_main != STATE_CHUNK_SIZE) {
+                perror("pwrite final state chunk failed");
+            }
+            bytes_written_main = pwrite(log_fd, empty_ws, WRITE_SET_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
+            if (bytes_written_main != WRITE_SET_CHUNK_SIZE) {
+                perror("pwrite final empty_ws failed");
+            }
+            bytes_written_main = pwrite(log_fd, &header, CHECKPOINT_HEADER_SIZE, offset);
+            if (bytes_written_main != CHECKPOINT_HEADER_SIZE) {
+                perror("pwrite final header failed");
+            }
         }
         fsync(log_fd);
     }
@@ -315,10 +343,15 @@ int main(int argc, char **argv) {
            total_time, average, median, p90, p99);
 
     uint64_t state_hash = fnv1a_hash(state, SMALL_ACCOUNT_COUNT);
-    printf("Final state hash: %llu\n", state_hash);
+    printf("Final state hash: %lu\n", (unsigned long)state_hash);
     FILE *hash_fp = fopen("state_hash.dat", "wb");
-    if (hash_fp) 
-        fwrite(&state_hash, sizeof(uint64_t), 1, hash_fp); fclose(hash_fp); 
+    if (hash_fp) {
+        size_t written = fwrite(&state_hash, sizeof(uint64_t), 1, hash_fp);
+        if (written != 1) {
+            perror("fwrite to state_hash.dat failed");
+        }
+        fclose(hash_fp);
+    }
 
     free(state);
     for (uint32_t i = 0; i < RING_SIZE; i++) free(ws_accum[i]);
