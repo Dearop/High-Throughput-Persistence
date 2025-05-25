@@ -1,0 +1,21 @@
+CC = gcc
+CFLAGS = -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L
+LDFLAGS = -lm
+
+TARGET = breaking_glaze_with_memset
+SOURCE = breaking_glaze_with_memset.c
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(LDFLAGS)
+
+clean:
+	rm -f $(TARGET) checkpoint_log.dat state_hash.dat reconstructed_state.txt
+
+# Usage examples:
+# make -f Makefile_breaking_glaze_memset
+# ./breaking_glaze_with_memset
+# ./breaking_glaze_with_memset recover  # Recovery mode only 

@@ -1,0 +1,21 @@
+CC = gcc
+CFLAGS = -Wall -Wextra -O3 -std=c99 -pthread -D_POSIX_C_SOURCE=200809L -O3
+LDFLAGS = -pthread -lm
+
+TARGET = state_management_parameterized
+SOURCE = state_management_parameterized.c
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(LDFLAGS)
+
+clean:
+	rm -f $(TARGET)
+
+# Usage examples:
+# make
+# ./state_management_parameterized 1000000        # Run with 1M accounts
+# ./state_management_parameterized 1000000 saveref # Run with 1M accounts in reference mode 
