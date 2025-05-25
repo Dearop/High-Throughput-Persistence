@@ -6,7 +6,7 @@
 
 // --- Definitions ---
 #define BATCH_SIZE          (1ULL << 16)
-#define NUMBER_OF_BATCHES   5000UL
+#define NUMBER_OF_BATCHES   5000
 #define TOTAL_TRANSACTIONS  (BATCH_SIZE * NUMBER_OF_BATCHES)
 #define SMALL_ACCOUNT_COUNT  5000000UL       // Target number of accounts
 
