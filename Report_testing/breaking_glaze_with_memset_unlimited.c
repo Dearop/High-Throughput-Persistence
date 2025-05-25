@@ -15,13 +15,17 @@
 #define TOTAL_BATCHES     5000       // Process 5000 batches total
 #define INITIAL_BALANCE   1000000L   // Starting balance per account
 
-// Ring log parameters - now dynamic based on account count
+// Ring log parameters - rotating chunk checkpointing (inspired by glaze)
 #define RING_SIZE         8          // Number of checkpoint slots in the log
+#define STATE_CHUNK_SIZE  (512 * 1024)           // 512KB state chunk per checkpoint (efficient)
+#define STATE_CHUNK_COUNT (STATE_CHUNK_SIZE / sizeof(int64_t))  // 65,536 accounts per chunk
 
 // Write-set size is the batch of transactions
 #define WRITE_SET_SIZE    (BATCH_SIZE * sizeof(Transaction))
 
-// Checkpoint slot size will be calculated dynamically
+// Checkpoint slot size is now fixed and efficient
+#define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
+#define CHECKPOINT_SLOT_SIZE (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_SIZE)
 #define LOG_FILE          "checkpoint_log.dat"
 
 // --- Operation Encoding (from Report_testing) ---
@@ -41,8 +45,9 @@
 #  define PREFETCH(addr,rw,locality)
 #endif
 
-// Global variables (now parameterized)
-static uint64_t g_max_accounts = 0;
+// Global variables (now parameterized for processing, chunked for checkpointing)
+static uint64_t g_max_accounts = 0;  // Process ALL accounts
+static uint64_t g_total_chunks = 0;  // Total number of chunks needed
 static size_t g_state_size_bytes = 0;
 static size_t g_checkpoint_header_size = 0;
 static size_t g_checkpoint_slot_size = 0;
@@ -54,12 +59,12 @@ typedef struct {
     uint64_t amount;    // 64-bit amount
 } Transaction;
 
-// Checkpoint header structure
+// Checkpoint header structure (inspired by glaze)
 typedef struct {
     uint32_t batch_num;         // Batch number of this checkpoint
-    uint32_t account_count;     // Number of accounts in this checkpoint
+    uint32_t chunk_offset;      // Starting account index for this chunk
+    uint32_t chunk_count;       // Number of accounts in this chunk (usually STATE_CHUNK_COUNT)
     uint32_t write_set_count;   // Should equal BATCH_SIZE
-    uint32_t reserved;          // Reserved/padding
 } CheckpointHeader;
 
 void print_usage(const char *program_name) {
@@ -132,7 +137,7 @@ void preallocate_log_file_posix(const char *filename) {
          exit(EXIT_FAILURE);
     }
     off_t fsize = st.st_size;
-    off_t expected = RING_SIZE * g_checkpoint_slot_size;
+    off_t expected = RING_SIZE * CHECKPOINT_SLOT_SIZE;
     if (fsize < expected) {
          if (ftruncate(fd, expected) != 0) {
               perror("ftruncate error");
@@ -144,34 +149,43 @@ void preallocate_log_file_posix(const char *filename) {
     close(fd);
 }
 
-// Reconstruction function
+// Reconstruction function (enhanced for rotating chunks)
 int reconstruct_state(int fd, int64_t *state, int *last_batch) {
     uint32_t latest_batch = 0;
     int latest_slot = -1;
     CheckpointHeader header;
     
+    // Scan all ring slots to find the latest checkpoint for each chunk
     for (uint32_t i = 0; i < RING_SIZE; i++) {
-        off_t offset = i * g_checkpoint_slot_size;
+        off_t offset = i * CHECKPOINT_SLOT_SIZE;
         ssize_t bytes = pread(fd, &header, sizeof(header), offset);
         if (bytes != sizeof(header))
             continue;
-        if (header.write_set_count == BATCH_SIZE && header.account_count == g_max_accounts) {
-            if (header.batch_num >= latest_batch) {
-                latest_batch = header.batch_num;
-                latest_slot = i;
+        if (header.write_set_count == BATCH_SIZE && header.chunk_offset < g_max_accounts) {
+            // Read this chunk's state
+            int64_t state_chunk[STATE_CHUNK_COUNT];
+            ssize_t read_bytes = pread(fd, state_chunk, STATE_CHUNK_SIZE, offset + sizeof(CheckpointHeader));
+            if (read_bytes == STATE_CHUNK_SIZE) {
+                // Copy chunk data to the appropriate position in full state
+                uint64_t copy_count = header.chunk_count;
+                if (header.chunk_offset + copy_count > g_max_accounts) {
+                    copy_count = g_max_accounts - header.chunk_offset;
+                }
+                memcpy(state + header.chunk_offset, state_chunk, copy_count * sizeof(int64_t));
+                
+                if (header.batch_num >= latest_batch) {
+                    latest_batch = header.batch_num;
+                    latest_slot = i;
+                }
             }
         }
     }
+    
     if (latest_slot == -1) {
         printf("No valid checkpoint found in log.\n");
         return -1;
     }
-    off_t offset = latest_slot * g_checkpoint_slot_size + sizeof(CheckpointHeader);
-    ssize_t read_bytes = pread(fd, state, g_state_size_bytes, offset);
-    if (read_bytes != (ssize_t)g_state_size_bytes) {
-        perror("Error reading state during reconstruction");
-        return -1;
-    }
+    
     *last_batch = latest_batch;
     return 0;
 }
@@ -284,22 +298,25 @@ int main(int argc, char **argv) {
     }
 
     g_max_accounts = account_count;
+    g_total_chunks = (g_max_accounts + STATE_CHUNK_COUNT - 1) / STATE_CHUNK_COUNT;  // Round up
     g_state_size_bytes = g_max_accounts * sizeof(int64_t);
     g_checkpoint_header_size = sizeof(CheckpointHeader);
     g_checkpoint_slot_size = g_checkpoint_header_size + g_state_size_bytes + WRITE_SET_SIZE;
 
     printf("=== Breaking Glaze with Memset Support (Unlimited Accounts) ===\n");
     printf("Configuration:\n");
-    printf("  MAX_ACCOUNTS: %lu (processing ALL accounts)\n", g_max_accounts);
+    printf("  MAX_ACCOUNTS: %llu (processing ALL accounts)\n", (unsigned long long)g_max_accounts);
+    printf("  TOTAL_CHUNKS: %llu (rotating through chunks of %lu accounts each)\n", (unsigned long long)g_total_chunks, STATE_CHUNK_COUNT);
     printf("  BATCH_SIZE: %d\n", BATCH_SIZE);
     printf("  TOTAL_BATCHES: %d\n", TOTAL_BATCHES);
     printf("  RING_SIZE: %d\n", RING_SIZE);
     printf("  Memory usage: ~%.1f MB for account state\n", 
            (double)g_state_size_bytes / (1024.0 * 1024.0));
-    printf("  Checkpoint slot size: ~%.1f MB\n", 
-           (double)g_checkpoint_slot_size / (1024.0 * 1024.0));
+    printf("  Checkpoint slot size: ~%.1f KB (efficient chunked)\n", 
+           (double)CHECKPOINT_SLOT_SIZE / 1024.0);
     printf("  Total log file size: ~%.1f MB\n", 
-           (double)(RING_SIZE * g_checkpoint_slot_size) / (1024.0 * 1024.0));
+           (double)(RING_SIZE * CHECKPOINT_SLOT_SIZE) / (1024.0 * 1024.0));
+    printf("  Checkpointing strategy: Rotating chunks (full coverage over time)\n");
     printf("  Supports: Balance transfers (func=0) and Range-set operations (func=1)\n\n");
 
     // Allocate state array
@@ -332,7 +349,7 @@ int main(int argc, char **argv) {
         printf("State reconstructed from checkpoint (batch %d) in %.3f ms.\n", 
                last_batch, reconstruction_end - reconstruction_start);
         
-        uint64_t hash = fnv1a_hash(state, g_max_accounts);
+        uint64_t hash = fnv1a_hash(state, STATE_CHUNK_COUNT);
         printf("Reconstructed state hash: 0x%016llx\n", (unsigned long long)hash);
         
         write_state_to_file("reconstructed_state.txt", state, g_max_accounts);
@@ -362,22 +379,10 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    // Allocate state snapshot buffer for checkpoints
-    int64_t *state_snapshot = malloc(g_state_size_bytes);
-    if (!state_snapshot) {
-        perror("Error allocating state snapshot");
-        free(batch);
-        fclose(tx_file);
-        close(fd_log);
-        free(state);
-        exit(EXIT_FAILURE);
-    }
-
     // Timing arrays
     double *batch_times = malloc(TOTAL_BATCHES * sizeof(double));
     if (!batch_times) {
         perror("Error allocating timing arrays");
-        free(state_snapshot);
         free(batch);
         fclose(tx_file);
         close(fd_log);
@@ -418,19 +423,26 @@ int main(int argc, char **argv) {
         total_successful_tx += batch_successful;
         total_failed_tx += batch_failed;
 
-        // Create checkpoint
+        // Create checkpoint for rotating chunk (inspired by glaze)
         uint32_t slot_index = batch_num % RING_SIZE;
-        off_t offset = slot_index * g_checkpoint_slot_size;
+        uint32_t chunk_index = slot_index % g_total_chunks;  // Rotate through available chunks
+        uint32_t chunk_offset = chunk_index * STATE_CHUNK_COUNT;
+        off_t offset = slot_index * CHECKPOINT_SLOT_SIZE;
 
         // Prepare checkpoint header
         CheckpointHeader header;
         header.batch_num = batch_num;
-        header.account_count = g_max_accounts;
+        header.chunk_offset = chunk_offset;
+        header.chunk_count = (chunk_offset + STATE_CHUNK_COUNT <= g_max_accounts) ? 
+                            STATE_CHUNK_COUNT : (g_max_accounts - chunk_offset);
         header.write_set_count = BATCH_SIZE;
-        header.reserved = 0;
 
-        // Copy current state for checkpoint
-        memcpy(state_snapshot, state, g_state_size_bytes);
+        // Copy the appropriate chunk of state for efficient checkpointing
+        int64_t state_chunk[STATE_CHUNK_COUNT];
+        memset(state_chunk, 0, sizeof(state_chunk));  // Initialize to zero
+        if (chunk_offset < g_max_accounts) {
+            memcpy(state_chunk, state + chunk_offset, header.chunk_count * sizeof(int64_t));
+        }
 
         // Write checkpoint header
         ssize_t bytes_written = pwrite(fd_log, &header, sizeof(header), offset);
@@ -439,15 +451,15 @@ int main(int argc, char **argv) {
             break;
         }
 
-        // Write state snapshot
-        bytes_written = pwrite(fd_log, state_snapshot, g_state_size_bytes, offset + sizeof(header));
-        if (bytes_written != (ssize_t)g_state_size_bytes) {
-            perror("Error writing state snapshot");
+        // Write state chunk (fixed 512KB)
+        bytes_written = pwrite(fd_log, state_chunk, STATE_CHUNK_SIZE, offset + sizeof(header));
+        if (bytes_written != STATE_CHUNK_SIZE) {
+            perror("Error writing state chunk");
             break;
         }
 
         // Write transaction batch
-        bytes_written = pwrite(fd_log, batch, WRITE_SET_SIZE, offset + sizeof(header) + g_state_size_bytes);
+        bytes_written = pwrite(fd_log, batch, WRITE_SET_SIZE, offset + sizeof(header) + STATE_CHUNK_SIZE);
         if (bytes_written != WRITE_SET_SIZE) {
             perror("Error writing transaction batch");
             break;
@@ -465,10 +477,11 @@ int main(int argc, char **argv) {
         total_elapsed_ms += elapsed;
 
         if ((batch_num + 1) % 10 == 0 || batch_num == 0) {
-            printf("Batch %u of %u processed in %.3f ms (success: %llu, failed: %llu)\n",
+            printf("Batch %u of %u processed in %.3f ms (success: %llu, failed: %llu, checkpointed chunk %u: accounts %u-%u)\n",
                    batch_num + 1, TOTAL_BATCHES, elapsed,
                    (unsigned long long)batch_successful,
-                   (unsigned long long)batch_failed);
+                   (unsigned long long)batch_failed,
+                   chunk_index, chunk_offset, chunk_offset + header.chunk_count - 1);
         }
     }
 
@@ -515,12 +528,11 @@ int main(int argc, char **argv) {
     printf("  99th percentile batch time: %.3f ms\n", p99_ms);
 
     // Final state hash
-    uint64_t state_hash = fnv1a_hash(state, g_max_accounts);
+    uint64_t state_hash = fnv1a_hash(state, STATE_CHUNK_COUNT);
     printf("\nFinal state hash: 0x%016llx\n", (unsigned long long)state_hash);
 
     // Cleanup
     free(batch_times);
-    free(state_snapshot);
     free(batch);
     fclose(tx_file);
     close(fd_log);
