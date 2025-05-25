@@ -1,58 +1,90 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <stdbool.h>
+#include <math.h>
 
-#define BATCH_SIZE          (1 << 16)
-#define NUMBER_OF_BATCHES   5000
-#define SMALL_ACCOUNT_COUNT 5000000UL
+// Configuration parameters
+#define BATCH_SIZE        (1 << 16)  // 65,536 transactions per batch
+#define TOTAL_BATCHES     50000       // Process 5000 batches total
+#define INITIAL_BALANCE   1000000L   // Starting balance per account
 
-// Adjusted State Chunking and Ring Size
-#define STATE_CHUNK_SIZE  (512 * 1024) // Target state chunk size of 512 KB
-#define STATE_CHUNK_COUNT (STATE_CHUNK_SIZE / sizeof(int64_t))
-#define RING_SIZE ((SMALL_ACCOUNT_COUNT + STATE_CHUNK_COUNT - 1) / STATE_CHUNK_COUNT) // Dynamically calculated RING_SIZE
-#define TOTAL_STATE_COVERAGE_COUNT (RING_SIZE * STATE_CHUNK_COUNT) // Actual elements in state array
+// Ring log parameters - now dynamic based on account count
+#define RING_SIZE         8          // Number of checkpoint slots in the log
 
-#define MAX_WRITE_SET_COUNT (1000 * BATCH_SIZE)
-#define WRITE_SET_CHUNK_SIZE (MAX_WRITE_SET_COUNT * sizeof(WriteSetEntry))
+// Write-set size is the batch of transactions
+#define WRITE_SET_SIZE    (BATCH_SIZE * sizeof(Transaction))
 
-#define CHECKPOINT_MAGIC 0xC0CAC01A
+// Checkpoint slot size will be calculated dynamically
+#define LOG_FILE          "checkpoint_log.dat"
 
-// --- Operation Encoding ---
-// Top 4 bits hold the op code, remaining 60 bits hold data.
+// --- Operation Encoding (from Report_testing) ---
 #define FUNC_MASK   0xF000000000000000UL
 #define DATA_MASK   0x0FFFFFFFFFFFFFFFUL
-#define GET_OP(encoded_val) (((uint64_t)(encoded_val) & FUNC_MASK) >> 60)
-#define GET_DATA(encoded_val) ((uint64_t)(encoded_val) & DATA_MASK)
+#define GET_FUNC(x) ((uint8_t)((x) >> 60))
+#define GET_DATA(x) ((x) & DATA_MASK)
 
+// --- Compiler-specific macros ---
+#if defined(__GNUC__) || defined(__clang__)
+#  define LIKELY(x)   __builtin_expect(!!(x), 1)
+#  define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#  define PREFETCH(addr,rw,locality) __builtin_prefetch((addr),(rw),(locality))
+#else
+#  define LIKELY(x)   (x)
+#  define UNLIKELY(x) (x)
+#  define PREFETCH(addr,rw,locality)
+#endif
+
+// Global variables (now parameterized)
+static uint64_t g_max_accounts = 0;
+static size_t g_state_size_bytes = 0;
+static size_t g_checkpoint_header_size = 0;
+static size_t g_checkpoint_slot_size = 0;
+
+// Transaction structure updated for Report_testing format
 typedef struct {
-    uint32_t magic;
-    uint32_t batch_num;
-    uint32_t chunk_offset;
-    uint32_t state_chunk_count;
-    uint32_t write_set_count;
-} CheckpointHeader;
-#define CHECKPOINT_HEADER_SIZE (sizeof(CheckpointHeader))
-#define CHECKPOINT_SLOT_SIZE   (CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE + WRITE_SET_CHUNK_SIZE)
-
-#define TX_FILE "transactions.bin"
-#define LOG_FILE "checkpoint_log.dat"
-
-typedef struct {
-    uint64_t sender;
-    uint64_t receiver;
-    uint32_t amount;
+    uint64_t sender;    // Encoded: top 4 bits = function, bottom 60 bits = data
+    uint64_t receiver;  // Encoded: top 4 bits = function, bottom 60 bits = data
+    uint64_t amount;    // 64-bit amount
 } Transaction;
 
+// Checkpoint header structure
 typedef struct {
-    uint64_t address;
-    int64_t balance;
-} WriteSetEntry;
+    uint32_t batch_num;         // Batch number of this checkpoint
+    uint32_t account_count;     // Number of accounts in this checkpoint
+    uint32_t write_set_count;   // Should equal BATCH_SIZE
+    uint32_t reserved;          // Reserved/padding
+} CheckpointHeader;
 
+void print_usage(const char *program_name) {
+    printf("Usage: %s <number_of_accounts>\n", program_name);
+    printf("\n");
+    printf("Arguments:\n");
+    printf("  number_of_accounts  Number of accounts to manage (must be > 0)\n");
+    printf("                      Example: 5000000 for 5 million accounts\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  %s 5000000     # Manage 5 million accounts\n", program_name);
+    printf("  %s 1000000     # Manage 1 million accounts\n", program_name);
+    printf("  %s 100000000   # Manage 100 million accounts\n", program_name);
+    printf("\n");
+    printf("Configuration:\n");
+    printf("  Batch size: %d transactions\n", BATCH_SIZE);
+    printf("  Total batches: %d\n", TOTAL_BATCHES);
+    printf("  Ring size: %d checkpoint slots\n", RING_SIZE);
+    printf("  Initial balance: %ld per account\n", INITIAL_BALANCE);
+    printf("\n");
+    printf("Input file: transactions.bin (must exist)\n");
+    printf("Output files: %s, reconstructed_state.txt\n", LOG_FILE);
+}
+
+// FNV-1a 64-bit hash function
 uint64_t fnv1a_hash(int64_t *data, size_t len) {
     uint64_t hash = 14695981039346656037UL;
     for (size_t i = 0; i < len; i++) {
@@ -66,301 +98,434 @@ uint64_t fnv1a_hash(int64_t *data, size_t len) {
     return hash;
 }
 
+// Returns current time in milliseconds
 double get_time_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-void preallocate_log_file(const char *filename) {
-    int fd = open(filename, O_RDWR | O_CREAT, 0666);
-    if (fd < 0)    
-        exit(EXIT_FAILURE);
-    struct stat st;
-    if (fstat(fd, &st) != 0) { 
-        close(fd); 
-        exit(EXIT_FAILURE); 
+// Writes the given state to a text file
+void write_state_to_file(const char *filename, int64_t *state, size_t count) {
+    FILE *fp = fopen(filename, "w");
+    if (!fp) {
+        perror("Error opening state text file for writing");
+        return;
     }
-    off_t expected = RING_SIZE * CHECKPOINT_SLOT_SIZE;
-    if (st.st_size < expected) {
-        if (ftruncate(fd, expected) != 0) {
-            close(fd); 
-            exit(EXIT_FAILURE); 
-        }
-        fsync(fd);
+    for (size_t i = 0; i < count; i++) {
+        fprintf(fp, "%zu: %lld\n", i, (long long)state[i]);
+    }
+    fclose(fp);
+}
+
+// Pre-allocate the log file to the expected size
+void preallocate_log_file_posix(const char *filename) {
+    int fd = open(filename, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+         perror("Error opening log file for pre-allocation");
+         exit(EXIT_FAILURE);
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+         perror("fstat error");
+         close(fd);
+         exit(EXIT_FAILURE);
+    }
+    off_t fsize = st.st_size;
+    off_t expected = RING_SIZE * g_checkpoint_slot_size;
+    if (fsize < expected) {
+         if (ftruncate(fd, expected) != 0) {
+              perror("ftruncate error");
+              close(fd);
+              exit(EXIT_FAILURE);
+         }
+         fsync(fd);
     }
     close(fd);
 }
 
-void write_state_to_file(const char *filename, int64_t *state, size_t count) {
-    FILE *fp = fopen(filename, "w");
-    if (!fp) return;
-    for (size_t i = 0; i < count; i++)
-        fprintf(fp, "%zu: %lld\n", i, (long long)state[i]);
-    fclose(fp);
-}
-
+// Reconstruction function
 int reconstruct_state(int fd, int64_t *state, int *last_batch) {
-    for (uint32_t slot = 0; slot < RING_SIZE; slot++) {
-        off_t offset = slot * CHECKPOINT_SLOT_SIZE;
-        CheckpointHeader header;
-        if (pread(fd, &header, sizeof(header), offset) != sizeof(header))
+    uint32_t latest_batch = 0;
+    int latest_slot = -1;
+    CheckpointHeader header;
+    
+    for (uint32_t i = 0; i < RING_SIZE; i++) {
+        off_t offset = i * g_checkpoint_slot_size;
+        ssize_t bytes = pread(fd, &header, sizeof(header), offset);
+        if (bytes != sizeof(header))
             continue;
-        if (header.magic != CHECKPOINT_MAGIC || header.state_chunk_count != STATE_CHUNK_COUNT)
-            continue;
-        int64_t *chunk = malloc(STATE_CHUNK_SIZE);
-        if (!chunk) 
-            exit(EXIT_FAILURE);
-        if (pread(fd, chunk, STATE_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE) != STATE_CHUNK_SIZE) {
-            free(chunk);
-            continue;
-        }
-        memcpy(state + header.chunk_offset, chunk, STATE_CHUNK_SIZE);
-        free(chunk);
-        *last_batch = header.batch_num;
-    }
-    return 0;
-}
-
-void apply(const Transaction *tx, int64_t *state,
-           WriteSetEntry **ws_accum, int *ws_count) {
-    uint64_t op_type = GET_OP(tx->sender); // Op is in sender for P2P, and start_addr for memset
-
-    if (op_type == 0) { // P2P Transfer
-        uint64_t sender_addr = GET_DATA(tx->sender);
-        uint64_t receiver_addr = GET_DATA(tx->receiver);
-        uint32_t amount = tx->amount;
-
-        if (sender_addr < SMALL_ACCOUNT_COUNT) {
-            state[sender_addr] -= amount;
-            uint32_t chunk = sender_addr / STATE_CHUNK_COUNT;
-            // Use full MAX_WRITE_SET_COUNT for the chunk's accumulator capacity
-            if (ws_count[chunk] < MAX_WRITE_SET_COUNT) {
-                ws_accum[chunk][ws_count[chunk]].address = sender_addr;
-                ws_accum[chunk][ws_count[chunk]].balance = state[sender_addr];
-                ws_count[chunk]++;
-            }
-        }
-        if (receiver_addr < SMALL_ACCOUNT_COUNT) {
-            state[receiver_addr] += amount;
-            uint32_t chunk = receiver_addr / STATE_CHUNK_COUNT;
-            // Use full MAX_WRITE_SET_COUNT for the chunk's accumulator capacity
-            if (ws_count[chunk] < MAX_WRITE_SET_COUNT) {
-                ws_accum[chunk][ws_count[chunk]].address = receiver_addr;
-                ws_accum[chunk][ws_count[chunk]].balance = state[receiver_addr];
-                ws_count[chunk]++;
-            }
-        }
-    } else if (op_type == 1) { // Memset Operation
-        uint64_t start_addr = GET_DATA(tx->sender); // start_addr is in sender field
-        uint64_t count = GET_DATA(tx->receiver);    // count is in receiver field
-        int64_t value = (int64_t)tx->amount;        // value to set is in amount field
-
-        for (uint64_t i = 0; i < count; ++i) {
-            uint64_t current_addr = start_addr + i;
-            if (current_addr < SMALL_ACCOUNT_COUNT) {
-                state[current_addr] = value;
-                uint32_t chunk = current_addr / STATE_CHUNK_COUNT;
-                // Use full MAX_WRITE_SET_COUNT for the chunk's accumulator capacity
-                if (ws_count[chunk] < MAX_WRITE_SET_COUNT) {
-                    ws_accum[chunk][ws_count[chunk]].address = current_addr;
-                    ws_accum[chunk][ws_count[chunk]].balance = state[current_addr];
-                    ws_count[chunk]++;
-                }
-                // No 'else' block needed here, as we're not skipping entries if within MAX_WRITE_SET_COUNT
-                // (unless MAX_WRITE_SET_COUNT itself is exhausted for this chunk, which would be a buffer overflow)
+        if (header.write_set_count == BATCH_SIZE && header.account_count == g_max_accounts) {
+            if (header.batch_num >= latest_batch) {
+                latest_batch = header.batch_num;
+                latest_slot = i;
             }
         }
     }
-}
-
-void write_checkpoint_slot(int fd, int slot, int batch_num, int64_t *state,
-                             WriteSetEntry *ws_data, int ws_count) {
-    static char *snapshot = NULL;
-    if (!snapshot) {
-        snapshot = malloc(STATE_CHUNK_SIZE);
-        if (!snapshot) 
-            exit(EXIT_FAILURE);
-    }
-    memcpy(snapshot, state + slot * STATE_CHUNK_COUNT, STATE_CHUNK_SIZE);
-    CheckpointHeader header = { CHECKPOINT_MAGIC, batch_num, slot * STATE_CHUNK_COUNT,
-                                  STATE_CHUNK_COUNT, ws_count };
-    off_t offset = slot * CHECKPOINT_SLOT_SIZE;
-    ssize_t bytes_written;
-    bytes_written = pwrite(fd, snapshot, STATE_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE);
-    if (bytes_written != STATE_CHUNK_SIZE) {
-        perror("pwrite snapshot failed");
-        // Potentially exit or handle error more gracefully
-    }
-    bytes_written = pwrite(fd, ws_data, ws_count * sizeof(WriteSetEntry), offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
-    if (bytes_written != (ssize_t)(ws_count * sizeof(WriteSetEntry))) {
-        char err_msg[100];
-        sprintf(err_msg, "pwrite ws_data failed (expected %ld, got %zd)", (long)(ws_count * sizeof(WriteSetEntry)), bytes_written);
-        perror(err_msg);
-        // Potentially exit
-    }
-    bytes_written = pwrite(fd, &header, CHECKPOINT_HEADER_SIZE, offset);
-    if (bytes_written != CHECKPOINT_HEADER_SIZE) {
-        perror("pwrite header failed");
-        // Potentially exit
-    }
-}
-
-/* Comparator for qsort */
-int compare_doubles(const void *a, const void *b) {
-    double d1 = *(const double *)a;
-    double d2 = *(const double *)b;
-    if (d1 < d2)
+    if (latest_slot == -1) {
+        printf("No valid checkpoint found in log.\n");
         return -1;
-    else if (d1 > d2)
-        return 1;
+    }
+    off_t offset = latest_slot * g_checkpoint_slot_size + sizeof(CheckpointHeader);
+    ssize_t read_bytes = pread(fd, state, g_state_size_bytes, offset);
+    if (read_bytes != (ssize_t)g_state_size_bytes) {
+        perror("Error reading state during reconstruction");
+        return -1;
+    }
+    *last_batch = latest_batch;
     return 0;
+}
+
+// Enhanced transaction application with memset support (unlimited accounts)
+static inline bool apply_transaction_to_state_array(const Transaction *__restrict tx, int64_t *__restrict state)
+{
+    /* Decode the packed sender/receiver words */
+    const uint8_t  sfunc = GET_FUNC(tx->sender);
+    const uint8_t  rfunc = GET_FUNC(tx->receiver);
+    const uint64_t sidx  = GET_DATA(tx->sender);
+    const uint64_t ridx  = GET_DATA(tx->receiver);
+
+    /* -------- early rejection of out-of-bounds indices -------- */
+    if (UNLIKELY(sidx >= g_max_accounts || (rfunc == 0 && ridx >= g_max_accounts)))
+        return false;
+
+    /* ==========================================================
+     *  Hot path: simple balance transfer (func == 0 → account id)
+     * ========================================================== */
+    if (LIKELY(sfunc == 0 && rfunc == 0)) {
+        /* Bounds check for both accounts */
+        if (UNLIKELY(sidx >= g_max_accounts || ridx >= g_max_accounts))
+            return false;
+
+        int64_t *__restrict from = &state[sidx];
+        int64_t *__restrict to   = &state[ridx];
+
+        PREFETCH(from, 0, 1); /* read-only prefetch */
+        PREFETCH(to,   1, 1); /* write-intent prefetch */
+
+        const int64_t amt = (int64_t)tx->amount;
+        if (LIKELY(*from >= amt)) {
+            *from -= amt;
+            *to += amt;
+            return true;
+        }
+        return false; /* insufficient funds */
+    }
+
+    /* ==========================================================
+     *  Cold path: range-set (func == 1 → [start,len])  
+     *  Writes `amount` into accounts [start, start+len)
+     * ========================================================== */
+    if (LIKELY(sfunc == 1 && rfunc == 1)) {
+        uint64_t start = sidx;
+        uint64_t len   = ridx;          /* receiver "data" holds length */
+
+        if (UNLIKELY(!len || start >= g_max_accounts))
+            return false;
+
+        uint64_t end = start + len;
+        if (end > g_max_accounts) end = g_max_accounts;
+
+        const int64_t val = (int64_t)tx->amount;
+        
+        for (uint64_t i = start; i < end; ++i) {
+            state[i] = val;
+        }
+        return true;
+    }
+
+    /* Any other function codes -> unsupported */
+    return false;
+}
+
+void apply(const Transaction *tx, int64_t *state, uint64_t *successful_tx, uint64_t *failed_tx) {
+    if (apply_transaction_to_state_array(tx, state)) {
+        (*successful_tx)++;
+    } else {
+        (*failed_tx)++;
+    }
+}
+
+int compare_doubles(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    return (da > db) - (da < db);
 }
 
 int main(int argc, char **argv) {
-    int64_t *state = calloc(TOTAL_STATE_COVERAGE_COUNT, sizeof(int64_t));
-    if (!state) 
-        exit(EXIT_FAILURE);
-    WriteSetEntry *ws_accum[RING_SIZE];
-    int ws_count[RING_SIZE] = {0};
-    for (uint32_t i = 0; i < RING_SIZE; i++) {
-        ws_accum[i] = malloc(WRITE_SET_CHUNK_SIZE);
-        if (!ws_accum[i])   
-            exit(EXIT_FAILURE);
+    // Parse command-line arguments
+    if (argc != 2) {
+        fprintf(stderr, "Error: Invalid number of arguments.\n\n");
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
     }
 
-    int recovered_batch = -1;
-    int log_fd = open(LOG_FILE, O_RDWR);
-    if (log_fd >= 0) {
-        reconstruct_state(log_fd, state, &recovered_batch);
-        printf("Reconstructed state up to batch %d.\n", recovered_batch);
-        uint64_t hash = fnv1a_hash(state, SMALL_ACCOUNT_COUNT);
-        FILE *hash_fp = fopen("state_hash.dat", "rb");
-        if (hash_fp) {
-            uint64_t stored_hash;
-            size_t items_read = fread(&stored_hash, sizeof(uint64_t), 1, hash_fp);
-            if (items_read != 1 && ferror(hash_fp)) {
-                perror("fread from state_hash.dat failed");
-            }
-            fclose(hash_fp);
-            if (hash != stored_hash && items_read == 1) {
-                printf("Hash mismatch: computed %lu, stored %lu\n", (unsigned long)hash, (unsigned long)stored_hash);
-                write_state_to_file("reconstructed_state.txt", state, SMALL_ACCOUNT_COUNT);
-            } else if (items_read != 1 && !feof(hash_fp)) {
-                printf("Warning: Could not read stored hash or file was empty.\n");
-            }
-        }
-        close(log_fd);
-        if (argc > 1 && strcmp(argv[1], "recover") == 0) {
-            for (uint32_t i = 0; i < RING_SIZE; i++) free(ws_accum[i]);
-            free(state);
-            return 0;
-        }
+    char *endptr;
+    unsigned long long account_count = strtoull(argv[1], &endptr, 10);
+    
+    // Validate the account count
+    if (*endptr != '\0') {
+        fprintf(stderr, "Error: Invalid account count '%s'. Must be a valid number.\n\n", argv[1]);
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    
+    if (account_count == 0) {
+        fprintf(stderr, "Error: Account count must be greater than 0.\n\n");
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
     }
 
-    preallocate_log_file(LOG_FILE);
-    log_fd = open(LOG_FILE, O_RDWR);
-    if (log_fd < 0) 
-        exit(EXIT_FAILURE);
-    Transaction *transaction_batch = malloc(BATCH_SIZE * sizeof(Transaction));
-    if (!transaction_batch) 
-        exit(EXIT_FAILURE);
-    FILE *fp_transactions = fopen(TX_FILE, "rb");
-    if (!fp_transactions) { 
-        free(state);  
-        free(transaction_batch); 
-        close(log_fd); 
-        exit(EXIT_FAILURE); 
+    // Check for reasonable limits (avoid excessive memory usage)
+    if (account_count > 1000000000ULL) {  // 1 billion accounts
+        fprintf(stderr, "Error: Account count %llu is too large (max: 1,000,000,000).\n\n", account_count);
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
     }
-    double *batch_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
-    if (!batch_times) { 
-        free(state); 
-        free(transaction_batch); 
-        fclose(fp_transactions); 
-        close(log_fd); 
-        exit(EXIT_FAILURE); 
-    }
-    
-    double total_time = 0.0;
-    
-    void *empty_ws = calloc(1, WRITE_SET_CHUNK_SIZE);
-    if (!empty_ws) 
+
+    g_max_accounts = account_count;
+    g_state_size_bytes = g_max_accounts * sizeof(int64_t);
+    g_checkpoint_header_size = sizeof(CheckpointHeader);
+    g_checkpoint_slot_size = g_checkpoint_header_size + g_state_size_bytes + WRITE_SET_SIZE;
+
+    printf("=== Breaking Glaze with Memset Support (Unlimited Accounts) ===\n");
+    printf("Configuration:\n");
+    printf("  MAX_ACCOUNTS: %lu (processing ALL accounts)\n", g_max_accounts);
+    printf("  BATCH_SIZE: %d\n", BATCH_SIZE);
+    printf("  TOTAL_BATCHES: %d\n", TOTAL_BATCHES);
+    printf("  RING_SIZE: %d\n", RING_SIZE);
+    printf("  Memory usage: ~%.1f MB for account state\n", 
+           (double)g_state_size_bytes / (1024.0 * 1024.0));
+    printf("  Checkpoint slot size: ~%.1f MB\n", 
+           (double)g_checkpoint_slot_size / (1024.0 * 1024.0));
+    printf("  Total log file size: ~%.1f MB\n", 
+           (double)(RING_SIZE * g_checkpoint_slot_size) / (1024.0 * 1024.0));
+    printf("  Supports: Balance transfers (func=0) and Range-set operations (func=1)\n\n");
+
+    // Allocate state array
+    int64_t *state = calloc(g_max_accounts, sizeof(int64_t));
+    if (!state) {
+        perror("Error allocating state array");
         exit(EXIT_FAILURE);
-    uint64_t start_total = get_time_ms();
-    for (unsigned int batch_num = 0; batch_num < NUMBER_OF_BATCHES; batch_num++) {
-        double start = get_time_ms();
-        size_t items = fread(transaction_batch, sizeof(Transaction), BATCH_SIZE, fp_transactions);
-        if (items != BATCH_SIZE) 
+    }
+
+    // Initialize state with starting balances
+    for (size_t i = 0; i < g_max_accounts; i++) {
+        state[i] = INITIAL_BALANCE;
+    }
+
+    // Pre-allocate log file
+    preallocate_log_file_posix(LOG_FILE);
+
+    // Try to reconstruct state from existing log
+    int fd_log = open(LOG_FILE, O_RDWR);
+    if (fd_log < 0) {
+        perror("Error opening log file");
+        free(state);
+        exit(EXIT_FAILURE);
+    }
+
+    int last_batch = -1;
+    double reconstruction_start = get_time_ms();
+    if (reconstruct_state(fd_log, state, &last_batch) == 0) {
+        double reconstruction_end = get_time_ms();
+        printf("State reconstructed from checkpoint (batch %d) in %.3f ms.\n", 
+               last_batch, reconstruction_end - reconstruction_start);
+        
+        uint64_t hash = fnv1a_hash(state, g_max_accounts);
+        printf("Reconstructed state hash: 0x%016llx\n", (unsigned long long)hash);
+        
+        write_state_to_file("reconstructed_state.txt", state, g_max_accounts);
+        printf("Reconstructed state written to reconstructed_state.txt\n");
+    } else {
+        double reconstruction_end = get_time_ms();
+        printf("No valid checkpoint found. Using fresh state in %.3f ms.\n", 
+               reconstruction_end - reconstruction_start);
+    }
+
+    // Open transaction file
+    FILE *tx_file = fopen("transactions.bin", "rb");
+    if (!tx_file) {
+        perror("Error opening transaction file");
+        close(fd_log);
+        free(state);
+        exit(EXIT_FAILURE);
+    }
+
+    // Allocate transaction batch buffer
+    Transaction *batch = malloc(BATCH_SIZE * sizeof(Transaction));
+    if (!batch) {
+        perror("Error allocating transaction batch");
+        fclose(tx_file);
+        close(fd_log);
+        free(state);
+        exit(EXIT_FAILURE);
+    }
+
+    // Allocate state snapshot buffer for checkpoints
+    int64_t *state_snapshot = malloc(g_state_size_bytes);
+    if (!state_snapshot) {
+        perror("Error allocating state snapshot");
+        free(batch);
+        fclose(tx_file);
+        close(fd_log);
+        free(state);
+        exit(EXIT_FAILURE);
+    }
+
+    // Timing arrays
+    double *batch_times = malloc(TOTAL_BATCHES * sizeof(double));
+    if (!batch_times) {
+        perror("Error allocating timing arrays");
+        free(state_snapshot);
+        free(batch);
+        fclose(tx_file);
+        close(fd_log);
+        free(state);
+        exit(EXIT_FAILURE);
+    }
+
+    uint64_t total_successful_tx = 0;
+    uint64_t total_failed_tx = 0;
+    double total_elapsed_ms = 0.0;
+
+    printf("\nStarting transaction processing...\n");
+
+    // Process batches
+    for (uint32_t batch_num = 0; batch_num < TOTAL_BATCHES; batch_num++) {
+        double batch_start = get_time_ms();
+
+        // Read transaction batch
+        size_t read_count = fread(batch, sizeof(Transaction), BATCH_SIZE, tx_file);
+        if (read_count < BATCH_SIZE) {
+            if (feof(tx_file)) {
+                rewind(tx_file);
+                read_count = fread(batch, sizeof(Transaction), BATCH_SIZE, tx_file);
+            } else {
+                perror("Error reading transaction batch");
+                break;
+            }
+        }
+
+        // Apply transactions
+        uint64_t batch_successful = 0;
+        uint64_t batch_failed = 0;
+        
+        for (size_t i = 0; i < read_count; i++) {
+            apply(&batch[i], state, &batch_successful, &batch_failed);
+        }
+        
+        total_successful_tx += batch_successful;
+        total_failed_tx += batch_failed;
+
+        // Create checkpoint
+        uint32_t slot_index = batch_num % RING_SIZE;
+        off_t offset = slot_index * g_checkpoint_slot_size;
+
+        // Prepare checkpoint header
+        CheckpointHeader header;
+        header.batch_num = batch_num;
+        header.account_count = g_max_accounts;
+        header.write_set_count = BATCH_SIZE;
+        header.reserved = 0;
+
+        // Copy current state for checkpoint
+        memcpy(state_snapshot, state, g_state_size_bytes);
+
+        // Write checkpoint header
+        ssize_t bytes_written = pwrite(fd_log, &header, sizeof(header), offset);
+        if (bytes_written != sizeof(header)) {
+            perror("Error writing checkpoint header");
             break;
-        for (unsigned int i = 0; i < BATCH_SIZE; i++)
-            apply(&transaction_batch[i], state, ws_accum, ws_count);
-        double end = get_time_ms();
-        if ((batch_num + 1) % RING_SIZE == 0) {
-            for (uint32_t slot = 0; slot < RING_SIZE; slot++) {
-                write_checkpoint_slot(log_fd, slot, batch_num, state, ws_accum[slot], ws_count[slot]);
-                ws_count[slot] = 0;
-            }
-            fsync(log_fd);
         }
-        double duration = end - start;
-        batch_times[batch_num] = duration;
-        total_time += duration;
-        printf("Batch %u processed in %.3f ms.\n", batch_num, duration);
+
+        // Write state snapshot
+        bytes_written = pwrite(fd_log, state_snapshot, g_state_size_bytes, offset + sizeof(header));
+        if (bytes_written != (ssize_t)g_state_size_bytes) {
+            perror("Error writing state snapshot");
+            break;
+        }
+
+        // Write transaction batch
+        bytes_written = pwrite(fd_log, batch, WRITE_SET_SIZE, offset + sizeof(header) + g_state_size_bytes);
+        if (bytes_written != WRITE_SET_SIZE) {
+            perror("Error writing transaction batch");
+            break;
+        }
+
+        // Ensure data is written to disk
+        if (fsync(fd_log) != 0) {
+            perror("Error syncing log file");
+            break;
+        }
+
+        double batch_end = get_time_ms();
+        double elapsed = batch_end - batch_start;
+        batch_times[batch_num] = elapsed;
+        total_elapsed_ms += elapsed;
+
+        if ((batch_num + 1) % 10 == 0 || batch_num == 0) {
+            printf("Batch %u of %u processed in %.3f ms (success: %llu, failed: %llu)\n",
+                   batch_num + 1, TOTAL_BATCHES, elapsed,
+                   (unsigned long long)batch_successful,
+                   (unsigned long long)batch_failed);
+        }
     }
 
-    if (NUMBER_OF_BATCHES % RING_SIZE != 0) {
-        for (uint32_t slot = 0; slot < RING_SIZE; slot++) {
-            CheckpointHeader header = { CHECKPOINT_MAGIC, NUMBER_OF_BATCHES - 1, slot * STATE_CHUNK_COUNT,
-                                          STATE_CHUNK_COUNT, 0 };
-            off_t offset = slot * CHECKPOINT_SLOT_SIZE;
-            ssize_t bytes_written_main;
-            bytes_written_main = pwrite(log_fd, state + slot * STATE_CHUNK_COUNT, STATE_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE);
-            if (bytes_written_main != STATE_CHUNK_SIZE) {
-                perror("pwrite final state chunk failed");
-            }
-            bytes_written_main = pwrite(log_fd, empty_ws, WRITE_SET_CHUNK_SIZE, offset + CHECKPOINT_HEADER_SIZE + STATE_CHUNK_SIZE);
-            if (bytes_written_main != WRITE_SET_CHUNK_SIZE) {
-                perror("pwrite final empty_ws failed");
-            }
-            bytes_written_main = pwrite(log_fd, &header, CHECKPOINT_HEADER_SIZE, offset);
-            if (bytes_written_main != CHECKPOINT_HEADER_SIZE) {
-                perror("pwrite final header failed");
-            }
-        }
-        fsync(log_fd);
+    // Calculate statistics
+    double avg_elapsed_ms = total_elapsed_ms / (double)TOTAL_BATCHES;
+    double total_tx = total_successful_tx + total_failed_tx;
+    double success_rate = (total_tx > 0) ? (total_successful_tx * 100.0 / total_tx) : 0.0;
+    
+    printf("\n=== Processing Summary ===\n");
+    printf("Processed %d batches total.\n", TOTAL_BATCHES);
+    printf("Total transactions: %llu (successful: %llu, failed: %llu)\n", 
+           (unsigned long long)total_tx, 
+           (unsigned long long)total_successful_tx, 
+           (unsigned long long)total_failed_tx);
+    printf("Success rate: %.2f%%\n", success_rate);
+    printf("Total time: %.3f ms\n", total_elapsed_ms);
+    printf("Average batch time: %.3f ms\n", avg_elapsed_ms);
+    printf("Throughput: %.0f tx/sec\n", total_tx * 1000.0 / total_elapsed_ms);
+
+    // Calculate percentiles
+    qsort(batch_times, TOTAL_BATCHES, sizeof(double), compare_doubles);
+    
+    double median_ms, p90_ms, p99_ms;
+    if (TOTAL_BATCHES % 2 == 0) {
+        int mid = TOTAL_BATCHES / 2;
+        median_ms = (batch_times[mid - 1] + batch_times[mid]) / 2.0;
+    } else {
+        median_ms = batch_times[TOTAL_BATCHES / 2];
     }
+    
+    int idx_90 = (int)ceil(0.90 * TOTAL_BATCHES) - 1;
+    if (idx_90 < 0) idx_90 = 0;
+    if (idx_90 >= (int)TOTAL_BATCHES) idx_90 = TOTAL_BATCHES - 1;
+    p90_ms = batch_times[idx_90];
+    
+    int idx_99 = (int)ceil(0.99 * TOTAL_BATCHES) - 1;
+    if (idx_99 < 0) idx_99 = 0;
+    if (idx_99 >= (int)TOTAL_BATCHES) idx_99 = TOTAL_BATCHES - 1;
+    p99_ms = batch_times[idx_99];
 
-    uint64_t end_total = get_time_ms();
-    fclose(fp_transactions);
-    close(log_fd);
+    printf("\nLatency statistics:\n");
+    printf("  Median batch time: %.3f ms\n", median_ms);
+    printf("  90th percentile batch time: %.3f ms\n", p90_ms);
+    printf("  99th percentile batch time: %.3f ms\n", p99_ms);
 
-    double average = total_time / NUMBER_OF_BATCHES;
-    double *sorted = malloc(NUMBER_OF_BATCHES * sizeof(double));
-    memcpy(sorted, batch_times, NUMBER_OF_BATCHES * sizeof(double));
-    qsort(sorted, NUMBER_OF_BATCHES, sizeof(double), compare_doubles);
-    double median = sorted[NUMBER_OF_BATCHES / 2];
-    double p90 = sorted[(int)(NUMBER_OF_BATCHES * 0.9) - 1];
-    double p99 = sorted[(int)(NUMBER_OF_BATCHES * 0.99) - 1];
-    printf("\nMetrics (ms): Total %.3f, Avg %.3f, Med %.3f, 90th %.3f, 99th %.3f\n",
-           total_time, average, median, p90, p99);
+    // Final state hash
+    uint64_t state_hash = fnv1a_hash(state, g_max_accounts);
+    printf("\nFinal state hash: 0x%016llx\n", (unsigned long long)state_hash);
 
-    uint64_t state_hash = fnv1a_hash(state, SMALL_ACCOUNT_COUNT);
-    printf("Final state hash: %lu\n", (unsigned long)state_hash);
-    FILE *hash_fp = fopen("state_hash.dat", "wb");
-    if (hash_fp) {
-        size_t written = fwrite(&state_hash, sizeof(uint64_t), 1, hash_fp);
-        if (written != 1) {
-            perror("fwrite to state_hash.dat failed");
-        }
-        fclose(hash_fp);
-    }
-
-    free(state);
-    for (uint32_t i = 0; i < RING_SIZE; i++) free(ws_accum[i]);
+    // Cleanup
     free(batch_times);
-    free(sorted);
-    free(transaction_batch);
-    free(empty_ws);
-    printf("Total time: %.3f ms\n", (double)(end_total - start_total));
+    free(state_snapshot);
+    free(batch);
+    fclose(tx_file);
+    close(fd_log);
+    free(state);
+
+    printf("\nExecution complete.\n");
     return 0;
-}
+} 
