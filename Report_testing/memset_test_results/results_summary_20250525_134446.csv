@@ -1,0 +1,3 @@
+System,Memset_Percentage,Total_Duration_Sec,Throughput_TxPerSec,Success_Rate_Percent,Total_Transactions,Avg_Batch_Time_Ms,Median_Batch_Time_Ms,P99_Batch_Time_Ms
+state_management_parameterized,0,12.395646782,N/A,N/A,N/A,N/A,N/A,N/A
+state_management_parameterized,5,12.176186414,N/A,N/A,N/A,N/A,N/A,N/A
