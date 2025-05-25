@@ -8,7 +8,7 @@
 #define BATCH_SIZE          (1ULL << 16)
 #define NUMBER_OF_BATCHES   50000
 #define TOTAL_TRANSACTIONS  (BATCH_SIZE * NUMBER_OF_BATCHES)
-#define SMALL_ACCOUNT_COUNT  50000000UL       // Target number of accounts
+#define SMALL_ACCOUNT_COUNT  10000000UL       // Target number of accounts
 
 // --- Operation Encoding ---
 // Top 4 bits hold the op code, remaining 60 bits hold data.

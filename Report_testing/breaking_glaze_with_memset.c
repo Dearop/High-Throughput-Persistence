@@ -16,7 +16,7 @@
 #define INITIAL_BALANCE   1000000L   // Starting balance per account
 
 // Ring log parameters - now dynamic based on account count
-#define RING_SIZE         8          // Number of checkpoint slots in the log
+#define RING_SIZE         150          // Number of checkpoint slots in the log
 
 // Write-set size is the batch of transactions
 #define WRITE_SET_SIZE    (BATCH_SIZE * sizeof(Transaction))
