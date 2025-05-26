@@ -506,17 +506,15 @@ int main(void)
         for (size_t i = 0; i < tcnt; i++) avg += times[i];
         avg /= tcnt;
         double total_time_s = (now_ms()-t0)/1e3;
-        double throughput = (batch * (double)BATCH_SIZE) / (total_time_s * 1000.0); // Convert to Ktx/s
-
-        printf("\nPerformance Metrics:\n");
-        printf("Total throughput: %.2f Ktx/s\n", throughput);
+        double throughput = (batch * (double)BATCH_SIZE) / (total_time_s * 1000.0);
+        
+        printf("Throughput: %.2f Ktx/s\n", throughput);
         printf("Average batch time: %.3f ms\n", avg);
         printf("Median batch time: %.3f ms\n", times[tcnt/2]);
-        printf("99th percentile batch time: %.3f ms\n", times[(size_t)(0.99*tcnt)]);
-        printf("Total processing time: %.2f s\n", total_time_s);
+        printf("99th percentile: %.3f ms\n", times[(size_t)(0.99*tcnt)]);
     }
 
-    // Cleanup
+    // Cleanup and save hash
     uint64_t h = fnv1a_hash(state, SMALL_ACCOUNT_COUNT);
     FILE *hf = fopen(STATE_HASH_FILE, "wb");
     if (hf) {
