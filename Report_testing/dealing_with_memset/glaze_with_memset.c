@@ -7,14 +7,19 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <inttypes.h>
 
+#define ACCOUNT_SIZE         8       
 #define BATCH_SIZE          (1 << 16)
-#define NUMBER_OF_BATCHES   5000
-#define SMALL_ACCOUNT_COUNT 20000000UL
-#define RING_SIZE           8
+#define NUMBER_OF_BATCHES   50
+uint64_t SMALL_ACCOUNT_COUNT = 2000000UL; // Made into a variable
 #define STATE_CHUNK_SIZE    (512 * 1024)  // 512KB state chunks
-#define STATE_CHUNK_COUNT   (STATE_CHUNK_SIZE / sizeof(int64_t))
+#define TARGET_CHUNK_DATA_BYTES   (STATE_CHUNK_SIZE / sizeof(int64_t))
+#define ACCOUNTS_PER_STATE_CHUNK (TARGET_CHUNK_DATA_BYTES / ACCOUNT_SIZE)
+#define RING_SIZE           ((SMALL_ACCOUNT_COUNT + ACCOUNTS_PER_STATE_CHUNK - 1) / ACCOUNTS_PER_STATE_CHUNK)
 #define INITIAL_WS_CAPACITY 1024  
+     
+
 
 // Operation encoding macros
 #define FUNC_MASK   0xF000000000000000UL
@@ -72,17 +77,33 @@ int reconstruct_state(int fd, int64_t *state, uint32_t *last_batch) {
 
     while (read_pos < file_size) {
         CheckpointHeader header;
-        if (pread(fd, &header, sizeof(header), read_pos) != sizeof(header)) break;
+        ssize_t bytes_read = pread(fd, &header, sizeof(header), read_pos);
+        if (bytes_read != sizeof(header)) {
+            fprintf(stderr, "Error reading header: %zd/%zu bytes\n", bytes_read, sizeof(header));
+            return -1;
+        }
         read_pos += sizeof(header);
 
         // Read state chunk
         int64_t *state_chunk = malloc(STATE_CHUNK_SIZE);
-        pread(fd, state_chunk, STATE_CHUNK_SIZE, read_pos);
+        bytes_read = pread(fd, state_chunk, STATE_CHUNK_SIZE, read_pos);
+        if (bytes_read != STATE_CHUNK_SIZE) {
+            fprintf(stderr, "Error reading state chunk: %zd/%d bytes\n", 
+                    bytes_read, STATE_CHUNK_SIZE);
+            free(state_chunk);
+            return -1;
+        }
         read_pos += STATE_CHUNK_SIZE;
 
         // Read write set
         WriteSetEntry *ws = malloc(header.write_set_count * sizeof(WriteSetEntry));
-        pread(fd, ws, header.write_set_count * sizeof(WriteSetEntry), read_pos);
+        bytes_read = pread(fd, ws, header.write_set_count * sizeof(WriteSetEntry), read_pos);
+        if (bytes_read != (ssize_t)(header.write_set_count * sizeof(WriteSetEntry))) {
+            fprintf(stderr, "Error reading write set: %zd/%zu bytes\n",
+                    bytes_read, header.write_set_count * sizeof(WriteSetEntry));
+            free(ws);
+            return -1;
+        }
         read_pos += header.write_set_count * sizeof(WriteSetEntry);
 
         // Store record
@@ -101,7 +122,7 @@ int reconstruct_state(int fd, int64_t *state, uint32_t *last_batch) {
     for (size_t i = 1; i < record_count; i++) {
         for (uint32_t j = 0; j < records[i].write_set_count; j++) {
             uint64_t addr = records[i].write_set[j].address;
-            if (addr < STATE_CHUNK_COUNT)
+            if (addr < ACCOUNTS_PER_STATE_CHUNK)
                 state[addr] = records[i].write_set[j].balance;
         }
         *last_batch = records[i].batch_num;
@@ -215,36 +236,61 @@ typedef struct {
     double p99_time;
 } PerformanceStats;
 
+// Add static comparator function
+static int compare_doubles(const void *a, const void *b) {
+    double diff = (*(const double*)a) - (*(const double*)b);
+    return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1) {
+        char *endptr;
+        long long parsed_accounts = strtoll(argv[1], &endptr, 10);
+        if (*endptr != '\0' || argv[1] == endptr || parsed_accounts <= 0) {
+            fprintf(stderr, "Error: Invalid number of accounts '%s'. Must be a positive integer.\n", argv[1]);
+            return EXIT_FAILURE;
+        }
+        SMALL_ACCOUNT_COUNT = (uint64_t)parsed_accounts;
+    }
+
     int64_t *state = calloc(SMALL_ACCOUNT_COUNT, sizeof(int64_t));
+    if (!state) {
+        fprintf(stderr, "Failed to allocate state array\n");
+        exit(EXIT_FAILURE);
+    }
     const char *log_file = "checkpoint_log.dat";
     int fd = open(log_file, O_RDWR | O_CREAT, 0666);
     
     // Recovery logic
-    int recovered_batch = -1;
+    uint32_t recovered_batch = UINT32_MAX;
     int log_fd = open(log_file, O_RDWR);
     if (log_fd >= 0) {
         if (reconstruct_state(log_fd, state, &recovered_batch) == 0) {
-            printf("Recovered state from batch %d\n", recovered_batch);
-            // Optional: Add hash verification like in state_management.c
+            printf("Recovered state from batch %" PRIu32 "\n", recovered_batch);
+            printf("State hash: 0x%016" PRIx64 "\n", fnv1a_hash(state, ACCOUNTS_PER_STATE_CHUNK));
         }
         close(log_fd);
     }
 
     // Performance tracking
     double *batch_times = malloc(NUMBER_OF_BATCHES * sizeof(double));
+    if (!batch_times) {
+        fprintf(stderr, "Failed to allocate batch times array\n");
+        free(state);
+        exit(EXIT_FAILURE);
+    }
     double total_processing_time = 0;
     uint64_t start_total = get_time_ms();
 
     // Enhanced recovery reporting
-    if (recovered_batch != -1) {
+    if (recovered_batch != UINT32_MAX) {
         printf("=== Recovery Details ===\n");
-        printf("Recovered state from batch: %d\n", recovered_batch);
-        printf("State hash: 0x%016llx\n", fnv1a_hash(state, STATE_CHUNK_COUNT));
+        printf("Recovered state from batch: %" PRIu32 "\n", recovered_batch);
+        printf("State hash: 0x%016" PRIx64 "\n", fnv1a_hash(state, ACCOUNTS_PER_STATE_CHUNK));
         printf("========================\n\n");
     }
 
-    for (uint32_t batch = (recovered_batch == -1) ? 0 : recovered_batch+1; 
+    for (uint32_t batch = (recovered_batch == UINT32_MAX) ? 0 : recovered_batch+1; 
          batch < NUMBER_OF_BATCHES; 
          batch++) {
         double batch_start = get_time_ms();
@@ -252,13 +298,26 @@ int main(int argc, char **argv) {
         // Initialize write-set with dynamic capacity
         uint32_t ws_capacity = INITIAL_WS_CAPACITY;
         WriteSetEntry *write_set = malloc(ws_capacity * sizeof(WriteSetEntry));
+        if (!write_set) {
+            fprintf(stderr, "Failed to allocate initial write set\n");
+            exit(EXIT_FAILURE);
+        }
         uint32_t ws_count = 0;
 
         // Read batch
         Transaction tx_batch[BATCH_SIZE];
         FILE *fp = fopen("transactions.bin", "rb");
+        if (!fp) {
+            fprintf(stderr, "Failed to open transactions file\n");
+            exit(EXIT_FAILURE);
+        }
         fseek(fp, batch * BATCH_SIZE * sizeof(Transaction), SEEK_SET);
-        fread(tx_batch, sizeof(Transaction), BATCH_SIZE, fp);
+        size_t read_count = fread(tx_batch, sizeof(Transaction), BATCH_SIZE, fp);
+        if (read_count != BATCH_SIZE) {
+            fprintf(stderr, "Error reading batch %u: expected %d, got %zu\n",
+                    batch, BATCH_SIZE, read_count);
+            exit(EXIT_FAILURE);
+        }
         fclose(fp);
 
         // Process transactions
@@ -269,17 +328,45 @@ int main(int argc, char **argv) {
         // Persist checkpoint
         CheckpointHeader header = {
             .batch_num = batch,
-            .state_chunk_count = STATE_CHUNK_COUNT,
+            .state_chunk_count = ACCOUNTS_PER_STATE_CHUNK,
             .write_set_count = ws_count
         };
         
         // Write to log (sequential append style)
         // 1. Write header
-        write(fd, &header, sizeof(header));
+        ssize_t bytes_written;
+        bytes_written = write(fd, &header, sizeof(header));
+        if (bytes_written != sizeof(header)) {
+            perror("Error writing header");
+            exit(EXIT_FAILURE);
+        }
         // 2. Write state chunk
-        write(fd, state, STATE_CHUNK_SIZE);
+        bytes_written = write(fd, state, STATE_CHUNK_SIZE);
+        if (bytes_written != STATE_CHUNK_SIZE) {
+            perror("Error writing state chunk");
+            exit(EXIT_FAILURE);
+        }
         // 3. Write write-set entries
-        write(fd, write_set, ws_count * sizeof(WriteSetEntry));
+        if (ws_count > 0) {  // Only write if we have entries
+            size_t total_to_write = ws_count * sizeof(WriteSetEntry);
+            ssize_t bytes_written = 0;
+            ssize_t rc;
+            
+            while (bytes_written < total_to_write) {
+                rc = write(fd, (char*)write_set + bytes_written, total_to_write - bytes_written);
+                if (rc < 0) {
+                    perror("Error writing write set");
+                    exit(EXIT_FAILURE);
+                }
+                bytes_written += rc;
+            }
+            
+            if (bytes_written != total_to_write) {
+                fprintf(stderr, "Partial write set write: %zd/%zu bytes\n", 
+                      bytes_written, total_to_write);
+                exit(EXIT_FAILURE);
+            }
+        }
         
         fsync(fd);
         free(write_set);
@@ -295,12 +382,7 @@ int main(int argc, char **argv) {
     }
 
     // Calculate performance statistics
-    qsort(batch_times, NUMBER_OF_BATCHES, sizeof(double), 
-          (int (*)(const void*, const void*))(
-              ^(const void *a, const void *b) {
-                  double diff = (*(double*)a) - (*(double*)b);
-                  return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
-              }));
+    qsort(batch_times, NUMBER_OF_BATCHES, sizeof(double), compare_doubles);
 
     PerformanceStats stats = {
         .total_time = get_time_ms() - start_total,
@@ -320,9 +402,9 @@ int main(int argc, char **argv) {
            (NUMBER_OF_BATCHES * BATCH_SIZE/1000.0) / (stats.total_time/1000.0));
 
     // State verification
-    uint64_t final_hash = fnv1a_hash(state, STATE_CHUNK_COUNT);
+    uint64_t final_hash = fnv1a_hash(state, ACCOUNTS_PER_STATE_CHUNK);
     printf("\n=== Final State Verification ===\n");
-    printf("State hash: 0x%016llx\n", final_hash);
+    printf("State hash: 0x%016" PRIx64 "\n", final_hash);
     printf("Saving hash to state_hash.dat\n");
     
     FILE *hash_file = fopen("state_hash.dat", "wb");

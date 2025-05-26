@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Test script for comparing breaking_glaze_with_memset_unlimited and state_management_parameterized
+# Test script for comparing glaze_with_memset and state_management_multi
 # RUN THIS ON AWS UBUNTU SERVER ONLY
 
 set -e  # Exit on any error
@@ -28,13 +28,13 @@ compile_programs() {
     log_message "Compiling transaction generator..."
     gcc -Wall -Wextra -O3 -std=c99 -fopenmp -o generate_transactions generate_transactions.c -lm
     
-    # Force recompilation of breaking_glaze_with_memset_unlimited
-    log_message "Compiling breaking_glaze_with_memset_unlimited..."
-    gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o breaking_glaze_with_memset_unlimited breaking_glaze_with_memset_unlimited.c -lm
+    # Force recompilation of glaze_with_memset
+    log_message "Compiling glaze_with_memset..."
+    gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o glaze_with_memset glaze_with_memset.c -lm
     
-    # Force recompilation of state_management_parameterized
-    log_message "Compiling state_management_parameterized..."
-    gcc -Wall -Wextra -O3 -std=c99 -fopenmp -D_GNU_SOURCE -o state_management_parameterized state_management_parameterized.c -lm
+    # Force recompilation of state_management_multi
+    log_message "Compiling state_management_multi..."
+    gcc -Wall -Wextra -O3 -std=c99 -fopenmp -D_GNU_SOURCE -pthread -o state_management_multi state_management_multi.c -lm
     
     log_message "All programs compiled successfully for Ubuntu."
 }
@@ -48,23 +48,27 @@ cleanup_files() {
     rm -f *.bin *.dat *.txt 2>/dev/null || true
 }
 
+# Function to generate transactions
+generate_transactions_once() {
+    local memset_percentage=$1
+    local test_num=$2
+    
+    log_message "Generating transactions with ${memset_percentage}% memset operations..."
+    ./generate_transactions "$memset_percentage" "$ACCOUNT_COUNT" > "${OUTPUT_DIR}/generation_${memset_percentage}pct_${TIMESTAMP}.log" 2>&1
+    
+    if [ ! -f "transactions.bin" ]; then
+        log_message "ERROR: Transaction generation failed for ${memset_percentage}%"
+        return 1
+    fi
+    return 0
+}
+
 # Function to run a single test
 run_test() {
     local memset_percentage=$1
     local test_num=$2
     local system_name=$3
     local command=$4
-    
-    log_message "=== Test ${test_num}/20: ${system_name} with ${memset_percentage}% memset ==="
-    
-    # Generate transactions for this percentage
-    log_message "Generating transactions with ${memset_percentage}% memset operations..."
-    ./generate_transactions "$memset_percentage" > "${OUTPUT_DIR}/generation_${system_name}_${memset_percentage}pct_${TIMESTAMP}.log" 2>&1
-    
-    if [ ! -f "transactions.bin" ]; then
-        log_message "ERROR: Transaction generation failed for ${memset_percentage}%"
-        return 1
-    fi
     
     # Run the system
     log_message "Running ${system_name}..."
@@ -81,9 +85,25 @@ run_test() {
         log_message "ERROR: ${system_name} failed for ${memset_percentage}% memset"
         return 1
     fi
+}
+
+# Function to create CSV header
+create_csv_header() {
+    # Create a clean CSV file with headers
+    echo "Memset%,System,TotalTime_s,Throughput_Ktx/s,TotalTx,AvgBatchTime_ms,MedianBatchTime_ms,P99BatchTime_ms,TotalProcessingTime_ms,RecoveryTime_ms" > "${OUTPUT_DIR}/results_${TIMESTAMP}.csv"
     
-    # Clean up for next test
-    cleanup_files
+    # Create a summary CSV for easier plotting
+    echo "Memset%,GlazeWithMemset_Throughput,StateManagementMulti_Throughput,GlazeWithMemset_AvgBatch,StateManagementMulti_AvgBatch" > "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv"
+}
+
+# Function to print section header
+print_section_header() {
+    local title="$1"
+    local width=80
+    local padding=$(( (width - ${#title}) / 2 ))
+    printf "\n%${width}s\n" | tr ' ' '='
+    printf "%${padding}s%s%${padding}s\n" "" "$title" ""
+    printf "%${width}s\n" | tr ' ' '='
 }
 
 # Function to extract metrics from output logs
@@ -93,24 +113,35 @@ extract_metrics() {
     local memset_percentage=$3
     local duration=$4
     
-    # Extract throughput and timing information (removed success rate)
-    local throughput=$(grep -o "Throughput: [0-9.]* tx/sec" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+    # Extract metrics with more robust patterns
+    local throughput=$(grep -o "Throughput: [0-9.]* Ktx/s" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
     local total_tx=$(grep -o "Total transactions: [0-9]*" "$log_file" | grep -o "[0-9]*" || echo "N/A")
-    local avg_batch_time=$(grep -o "Average batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local median_time=$(grep -o "Median batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local p99_time=$(grep -o "99th percentile batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local total_time=$(grep -o "Total time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+    local avg_batch_time=$(grep -o "Average batch.*time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+    local median_time=$(grep -o "Median batch.*time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+    local p99_time=$(grep -o "99th percentile batch.*time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+    local total_time=$(grep -o "Total.*time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+    local recovery_time=$(grep -o "Recovery phase took [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
     
-    # Append to CSV results file
-    echo "${system_name},${memset_percentage},${duration},${throughput},${total_tx},${avg_batch_time},${median_time},${p99_time},${total_time}" >> "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv"
+    # Append to detailed CSV
+    echo "${memset_percentage},${system_name},${duration},${throughput},${total_tx},${avg_batch_time},${median_time},${p99_time},${total_time},${recovery_time}" >> "${OUTPUT_DIR}/results_${TIMESTAMP}.csv"
     
-    # Log the extracted metrics
-    log_message "  Metrics: Throughput=${throughput} tx/sec, AvgBatch=${avg_batch_time}ms, Total=${total_time}ms"
-}
-
-# Function to create CSV header
-create_csv_header() {
-    echo "System,Memset_Percentage,Total_Duration_Sec,Throughput_TxPerSec,Total_Transactions,Avg_Batch_Time_Ms,Median_Batch_Time_Ms,P99_Batch_Time_Ms,Total_Processing_Time_Ms" > "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv"
+    # Store metrics for summary
+    if [ "$system_name" = "glaze_with_memset" ]; then
+        glaze_throughput=$throughput
+        glaze_avg_batch=$avg_batch_time
+    else
+        # If it's state_management_multi, we have both metrics, so write the summary line
+        echo "${memset_percentage},${glaze_throughput},${throughput},${glaze_avg_batch},${avg_batch_time}" >> "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv"
+    fi
+    
+    # Print nice console output
+    printf "\n%-25s Results for %s\n" "🔍" "$system_name"
+    printf "%-25s %'.2f Ktx/s\n" "Throughput:" "$throughput"
+    printf "%-25s %'.2f ms\n" "Avg Batch Time:" "$avg_batch_time"
+    printf "%-25s %'.2f ms\n" "Median Batch Time:" "$median_time"
+    printf "%-25s %'.2f ms\n" "P99 Batch Time:" "$p99_time"
+    printf "%-25s %'.2f ms\n" "Recovery Time:" "$recovery_time"
+    printf "%-25s %'.2f s\n" "Total Run Time:" "$duration"
 }
 
 # Function to generate summary report
@@ -130,8 +161,8 @@ generate_summary() {
 ## Test Configuration
 
 - **Systems Tested:**
-  - breaking_glaze_with_memset_unlimited (Ring-based recovery, ALL ${ACCOUNT_COUNT} accounts)
-  - state_management_parameterized (Full ${ACCOUNT_COUNT} accounts)
+  - glaze_with_memset (Optimized for memset operations)
+  - state_management_multi (Multi-threaded state management)
 
 - **Transaction Generation:**
   - Batch size: 65,536 transactions
@@ -141,25 +172,25 @@ generate_summary() {
 
 ## Results Summary
 
-The detailed results are available in: \`results_summary_${TIMESTAMP}.csv\`
+The detailed results are available in: \`results_${TIMESTAMP}.csv\`
 
 ### Performance Comparison
 
 EOF
 
     # Add performance comparison table
-    if [ -f "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" ]; then
-        echo "| Memset % | breaking_glaze Throughput | parameterized Throughput | breaking_glaze Avg Batch | parameterized Avg Batch |" >> "$summary_file"
+    if [ -f "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" ]; then
+        echo "| Memset % | glaze_with_memset Throughput | state_management_multi Throughput | glaze_with_memset Avg Batch | state_management_multi Avg Batch |" >> "$summary_file"
         echo "|----------|---------------------------|--------------------------|--------------------------|-------------------------|" >> "$summary_file"
         
         # Process CSV to create comparison table
         for pct in $(seq 0 5 100); do
-            bg_throughput=$(grep "breaking_glaze_with_memset_unlimited,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
-            param_throughput=$(grep "state_management_parameterized,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
-            bg_avg_batch=$(grep "breaking_glaze_with_memset_unlimited,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f6 || echo "N/A")
-            param_avg_batch=$(grep "state_management_parameterized,$pct," "${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv" | cut -d',' -f6 || echo "N/A")
+            glaze_throughput=$(grep "glaze_with_memset,$pct," "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" | cut -d',' -f2 || echo "N/A")
+            multi_throughput=$(grep "state_management_multi,$pct," "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" | cut -d',' -f2 || echo "N/A")
+            glaze_avg_batch=$(grep "glaze_with_memset,$pct," "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
+            multi_avg_batch=$(grep "state_management_multi,$pct," "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
             
-            echo "| $pct% | $bg_throughput | $param_throughput | ${bg_avg_batch}ms | ${param_avg_batch}ms |" >> "$summary_file"
+            echo "| $pct% | $glaze_throughput | $multi_throughput | ${glaze_avg_batch}ms | ${multi_avg_batch}ms |" >> "$summary_file"
         done
     fi
     
@@ -168,8 +199,8 @@ EOF
 ## Notes
 
 - Both systems process ALL ${ACCOUNT_COUNT} accounts
-- breaking_glaze uses ring-based checkpointing with rotating chunks
-- state_management_parameterized uses append-only logging
+- glaze_with_memset uses optimized memset operations
+- state_management_multi uses multi-threaded processing
 - Processing 50,000 batches (3.28 billion transactions) per test
 - Average batch time tracked for performance analysis
 
@@ -180,10 +211,12 @@ EOF
 
 # Main execution
 main() {
-    log_message "Starting memset percentage comparison test on Ubuntu AWS server"
-    log_message "Account count: ${ACCOUNT_COUNT}"
-    log_message "Output directory: ${OUTPUT_DIR}"
-    log_message "Processing 50,000 batches per test (3.28 billion transactions)"
+    print_section_header "Performance Test Configuration"
+    printf "Account Count: %'d\n" "$ACCOUNT_COUNT"
+    printf "Output Directory: %s\n" "$OUTPUT_DIR"
+    printf "Batch Size: %'d transactions\n" "65536"
+    printf "Total Batches: %'d\n" "50"
+    printf "Test Range: 0%% to 100%% memset operations (5%% increments)\n"
     
     # Check if bc is available
     if ! command -v bc &> /dev/null; then
@@ -192,46 +225,54 @@ main() {
     fi
     
     # Compile programs
+    print_section_header "Compiling Programs"
     compile_programs
     
-    # Create CSV header
+    # Create CSV headers
     create_csv_header
     
     # Test percentages from 0% to 100% in 5% increments
     local test_counter=1
+    local total_tests=$((100/5 + 1))
     
     for memset_pct in $(seq 0 5 100); do
-        log_message ""
-        log_message "=========================================="
-        log_message "Starting test set ${test_counter}/20 with ${memset_pct}% memset"
-        log_message "=========================================="
+        print_section_header "Test Set ${test_counter}/${total_tests} (${memset_pct}% memset)"
         
-        # Test breaking_glaze_with_memset_unlimited
-        if ! run_test "$memset_pct" "$test_counter" "breaking_glaze_with_memset_unlimited" "./breaking_glaze_with_memset_unlimited ${ACCOUNT_COUNT}"; then
-            log_message "WARNING: breaking_glaze_with_memset_unlimited test failed for ${memset_pct}%"
+        # Generate transactions once for this percentage
+        if ! generate_transactions_once "$memset_pct" "$test_counter"; then
+            log_message "❌ Failed to generate transactions. Skipping this percentage."
+            continue
         fi
+        printf "✅ Generated transactions with %d%% memset operations\n" "$memset_pct"
         
-        # Test state_management_parameterized
-        if ! run_test "$memset_pct" "$test_counter" "state_management_parameterized" "./state_management_parameterized ${ACCOUNT_COUNT}"; then
-            log_message "WARNING: state_management_parameterized test failed for ${memset_pct}%"
-        fi
+        # Test both systems
+        for system in "glaze_with_memset" "state_management_multi"; do
+            local cmd="./glaze_with_memset ${ACCOUNT_COUNT}"
+            [ "$system" = "state_management_multi" ] && cmd="./state_management_multi"
+            
+            printf "\n🔄 Testing %s...\n" "$system"
+            if ! run_test "$memset_pct" "$test_counter" "$system" "$cmd"; then
+                printf "❌ %s test failed\n" "$system"
+            fi
+        done
         
         test_counter=$((test_counter + 1))
+        
+        # Clean up only after both systems have been tested
+        cleanup_files
         
         # Brief pause between test sets
         sleep 2
     done
     
+    print_section_header "Test Summary"
+    printf "✅ All tests completed successfully!\n"
+    printf "📊 Detailed results: %s/results_%s.csv\n" "$OUTPUT_DIR" "$TIMESTAMP"
+    printf "📈 Summary data: %s/summary_%s.csv\n" "$OUTPUT_DIR" "$TIMESTAMP"
+    printf "\nUse the summary CSV file for easy plotting of throughput comparisons.\n"
+    
     # Generate summary
     generate_summary
-    
-    log_message ""
-    log_message "=========================================="
-    log_message "All tests completed!"
-    log_message "Results saved in: ${OUTPUT_DIR}/"
-    log_message "Summary: ${OUTPUT_DIR}/test_summary_${TIMESTAMP}.md"
-    log_message "CSV data: ${OUTPUT_DIR}/results_summary_${TIMESTAMP}.csv"
-    log_message "=========================================="
 }
 
 # Run main function
