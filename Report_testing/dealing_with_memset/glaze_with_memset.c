@@ -23,6 +23,7 @@
 #define STATE_CHUNK_BYTES     (512 * 1024)        /* 512 KiB                          */
 #define ACC_PER_CHUNK         (STATE_CHUNK_BYTES / sizeof(int64_t))
 #define NUM_CHUNKS            ((SMALL_ACCOUNT_COUNT + ACC_PER_CHUNK - 1) / ACC_PER_CHUNK)
+#define PADDED_STATE_SIZE     (NUM_CHUNKS * ACC_PER_CHUNK)
 #define LAST_CHUNK_SIZE       (SMALL_ACCOUNT_COUNT - ((NUM_CHUNKS - 1) * ACC_PER_CHUNK))
 
 // Reduce maximum write-set size to be more conservative
@@ -221,12 +222,10 @@ static void *commit_thread(void *arg)
             continue;
         }
         
-        // Calculate and validate state source bounds
-        const int64_t *state_end = t.state_src + ACC_PER_CHUNK;
-        if (state_end > (int64_t*)t.map + SMALL_ACCOUNT_COUNT) {
-            fprintf(stderr, "State source would exceed bounds\n");
-            continue;
-        }
+        // Calculate chunk size for this slot
+        size_t chunk_offset = t.slot * ACC_PER_CHUNK;
+        size_t remaining = SMALL_ACCOUNT_COUNT - chunk_offset;
+        size_t chunk_size = (remaining < ACC_PER_CHUNK) ? remaining : ACC_PER_CHUNK;
         
         // Calculate offsets and verify bounds
         size_t slot_offset = sizeof(LogHeader) + (t.slot * SLOT_BYTES);
@@ -252,8 +251,8 @@ static void *commit_thread(void *arg)
         cs->batch = t.batch;
         cs->ws_count = t.ws_cnt;
         
-        // Copy state data with explicit size check
-        size_t state_copy_size = STATE_ARRAY_SIZE;
+        // Copy state data with size appropriate for the chunk
+        size_t state_copy_size = chunk_size * sizeof(int64_t);
         if (state_copy_size > sizeof(cs->state)) {
             fprintf(stderr, "State size too large: %zu > %zu\n", 
                     state_copy_size, sizeof(cs->state));
@@ -291,7 +290,8 @@ static void *commit_thread(void *arg)
         }
         msync(cs, sync_size, MS_ASYNC);
         
-        fprintf(stderr, "Commit complete for batch %u\n", t.batch);
+        fprintf(stderr, "Commit complete for batch %u (chunk_size=%zu)\n", 
+                t.batch, chunk_size);
         
         pthread_mutex_lock(&mt); 
         pthread_cond_signal(&cv_done); 
@@ -344,6 +344,11 @@ static inline size_t get_chunk_size(uint32_t slot) {
     return (slot == NUM_CHUNKS - 1) ? LAST_CHUNK_SIZE : ACC_PER_CHUNK;
 }
 
+// Add state array size calculation
+static inline size_t get_padded_state_size(void) {
+    return NUM_CHUNKS * ACC_PER_CHUNK * sizeof(int64_t);
+}
+
 int main(void)
 {
     /* geometry */
@@ -380,18 +385,19 @@ int main(void)
     // Advise the kernel about our access pattern
     madvise(map, sizeof(LogHeader) + LOG_BYTES, MADV_SEQUENTIAL);
 
-    // Initialize state with aligned allocation and padding for last chunk
+    // Initialize state with aligned allocation
     int64_t *state;
-    size_t padded_size = NUM_CHUNKS * ACC_PER_CHUNK;  // Ensure we have full chunks
-    if (posix_memalign((void**)&state, 64, padded_size * sizeof(int64_t)) != 0) {
+    size_t state_size = PADDED_STATE_SIZE;
+    fprintf(stderr, "Allocating state array: accounts=%lu padded_size=%zu\n",
+            SMALL_ACCOUNT_COUNT, state_size);
+            
+    if (posix_memalign((void**)&state, 64, state_size * sizeof(int64_t)) != 0) {
         perror("state alloc"); munmap(map, sizeof(LogHeader) + LOG_BYTES); close(fd); return 1;
     }
-    memset(state, 0, padded_size * sizeof(int64_t));
-
-    // Print debug info about padding
-    fprintf(stderr, "State array: total_size=%zu padded_size=%zu last_chunk_accounts=%zu\n",
-            SMALL_ACCOUNT_COUNT, padded_size,
-            padded_size - ((NUM_CHUNKS - 1) * ACC_PER_CHUNK));
+    memset(state, 0, state_size * sizeof(int64_t));
+    
+    fprintf(stderr, "State array: allocated=%zu padded=%zu last_chunk=%zu\n",
+            SMALL_ACCOUNT_COUNT * sizeof(int64_t), state_size, LAST_CHUNK_SIZE);
 
     // Allocate write-set buffer with debug output
     size_t ws_alloc_size = MAX_WRITE_SET_SIZE * sizeof(WriteSetEntry);
@@ -499,8 +505,15 @@ int main(void)
         double avg = 0;
         for (size_t i = 0; i < tcnt; i++) avg += times[i];
         avg /= tcnt;
-        printf("avg %.3f ms  med %.3f  p99 %.3f (app only)\n",
-               avg, times[tcnt/2], times[(size_t)(0.99*tcnt)]);
+        double total_time_s = (now_ms()-t0)/1e3;
+        double throughput = (batch * (double)BATCH_SIZE) / (total_time_s * 1000.0); // Convert to Ktx/s
+
+        printf("\nPerformance Metrics:\n");
+        printf("Total throughput: %.2f Ktx/s\n", throughput);
+        printf("Average batch time: %.3f ms\n", avg);
+        printf("Median batch time: %.3f ms\n", times[tcnt/2]);
+        printf("99th percentile batch time: %.3f ms\n", times[(size_t)(0.99*tcnt)]);
+        printf("Total processing time: %.2f s\n", total_time_s);
     }
 
     // Cleanup
@@ -511,7 +524,7 @@ int main(void)
         fwrite(&h, sizeof(h), 1, hf);
         fclose(hf);
     }
-    printf("saved hash 0x%016"PRIx64" for batch %u\n", h, batch-1);
+    printf("Saved state hash: 0x%016"PRIx64" for batch %u\n", h, batch-1);
 
     free(times);
     free(tx_buf);
@@ -521,6 +534,6 @@ int main(void)
     close(fd);
     fclose(fp);
 
-    printf("processed %u batches in %.1f s\n", batch, (now_ms()-t0)/1e3);
+    printf("Total batches processed: %u in %.1f s\n", batch, (now_ms()-t0)/1e3);
     return 0;
 }
