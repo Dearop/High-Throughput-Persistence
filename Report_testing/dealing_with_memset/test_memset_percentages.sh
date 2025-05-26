@@ -7,10 +7,12 @@ set -e  # Exit on any error
 
 # Configuration
 ACCOUNT_COUNT=5000000
-TOTAL_TESTS=20
 OUTPUT_DIR="memset_test_results"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${OUTPUT_DIR}/test_log_${TIMESTAMP}.txt"
+
+# Define the exponential memset percentages
+MEMSET_PERCENTAGES=(0 1 2 4 8 16 32 64 100)
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -30,7 +32,7 @@ compile_programs() {
     
     # Force recompilation of glaze_with_memset
     log_message "Compiling glaze_with_memset..."
-    gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o glaze_with_memset glaze_with_memset.c -lm
+    gcc -Wall -Wextra -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -o glaze_with_memset glaze_with_memset.c -lm -pthread
     
     # Force recompilation of state_management_multi
     log_message "Compiling state_management_multi..."
@@ -113,32 +115,37 @@ extract_metrics() {
     local memset_percentage=$3
     local duration=$4
     
-    # Extract metrics with more robust patterns and handle both output formats
     local throughput=0
     local avg_batch_time=0
     local median_time=0
     local p99_time=0
     local recovery_time=0
     
-    # Try different throughput formats
-    if grep -q "Total throughput:" "$log_file"; then
-        throughput=$(grep -o "Total throughput:.*Ktx/s" "$log_file" | grep -o "[0-9.]*" || echo "0")
-    else
-        throughput=$(grep -o "Throughput:.*Ktx/s" "$log_file" | grep -o "[0-9.]*" || echo "0")
-    fi
+    # Extract throughput
+    # glaze_with_memset: "Total throughput:       X Ktx/s"
+    # state_management_multi: potentially "Throughput: X Ktx/s" (fallback)
+    throughput=$(grep "Total throughput:" "$log_file" | grep -o '[0-9.]\\+' || \
+                 grep "Throughput:" "$log_file" | grep -o '[0-9.]\\+' || echo "0")
     
-    # Try different time formats
-    if grep -q "Average batch time:" "$log_file"; then
-        avg_batch_time=$(grep -o "Average batch time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
-        median_time=$(grep -o "Median batch time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
-        p99_time=$(grep -o "99th percentile batch time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
-    else
-        avg_batch_time=$(grep -o "Average batch.*time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
-        median_time=$(grep -o "Median batch.*time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
-        p99_time=$(grep -o "99th percentile:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
-    fi
+    # Extract batch times
+    # glaze_with_memset:
+    # "Average batch time:     X ms"
+    # "Median batch time:      X ms"
+    # "99th percentile:        X ms"
+    # General patterns for fallback if needed for state_management_multi
+    avg_batch_time=$(grep "Average batch time:" "$log_file" | grep -o '[0-9.]\\+' || \
+                     grep "Average batch.*time:" "$log_file" | grep -o '[0-9.]\\+' || echo "0")
     
-    # Try different recovery time formats
+    median_time=$(grep "Median batch time:" "$log_file" | grep -o '[0-9.]\\+' || \
+                  grep "Median batch.*time:" "$log_file" | grep -o '[0-9.]\\+' || echo "0")
+
+    p99_time=$(grep "99th percentile:" "$log_file" | grep -o '[0-9.]\\+' || echo "0")
+    # If "99th percentile:" is not found (value is 0), try specific "99th percentile batch time:" for compatibility
+    if [ "$(echo "$p99_time == 0" | bc -l)" -eq 1 ] && grep -q "99th percentile batch time:" "$log_file"; then
+        p99_time=$(grep "99th percentile batch time:" "$log_file" | grep -o '[0-9.]\\+' || echo "0")
+    fi
+        
+    # Try different recovery time formats (remains as is, glaze_with_memset does not print this explicitly)
     recovery_time=$(grep -o "Recovery phase took [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || \
                    grep -o "Recovery time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
     
@@ -146,6 +153,7 @@ extract_metrics() {
     echo "${memset_percentage},${system_name},${duration},${throughput},${avg_batch_time},${median_time},${p99_time},${recovery_time}" >> "${OUTPUT_DIR}/results_${TIMESTAMP}.csv"
     
     # Store metrics for summary
+    # This logic assumes glaze_with_memset runs first for a given percentage, then state_management_multi
     if [ "$system_name" = "glaze_with_memset" ]; then
         glaze_throughput=$throughput
         glaze_avg_batch=$avg_batch_time
@@ -154,7 +162,7 @@ extract_metrics() {
     fi
     
     # Print nice console output
-    printf "\n%-25s Results for %s\n" "🔍" "$system_name"
+    printf "\n%-25s Results for %s (%s%% memset)\n" "🔍" "$system_name" "$memset_percentage"
     printf "%-25s %.2f Ktx/s\n" "Throughput:" "$throughput"
     printf "%-25s %.2f ms\n" "Avg Batch Time:" "$avg_batch_time"
     printf "%-25s %.2f ms\n" "Median Batch Time:" "$median_time"
@@ -168,60 +176,70 @@ generate_summary() {
     log_message "Generating summary report..."
     
     local summary_file="${OUTPUT_DIR}/test_summary_${TIMESTAMP}.md"
+    local num_percentages=${#MEMSET_PERCENTAGES[@]}
+    local percentage_list_string=$(IFS=, ; echo "${MEMSET_PERCENTAGES[*]}") # Comma-separated list
     
     cat > "$summary_file" << EOF
 # Memset Percentage Test Results
 
 **Test Date:** $(date)
-**Account Count:** ${ACCOUNT_COUNT:?}
-**Total Tests:** ${TOTAL_TESTS}
-**Memset Percentages:** 0% to 100% (in 5% increments)
+**Account Count:** ${ACCOUNT_COUNT}
+**Total Test Sets (Percentages):** ${num_percentages}
+**Memset Percentages Tested:** ${percentage_list_string}%
 
 ## Test Configuration
 
 - **Systems Tested:**
-  - glaze_with_memset (Optimized for memset operations)
+  - glaze_with_memset (Optimized for memset operations, asynchronous checkpointing)
   - state_management_multi (Multi-threaded state management)
 
-- **Transaction Generation:**
-  - Batch size: 65,536 transactions
-  - Total batches: 50,000
-  - Total transactions: ~3.28 billion per test
-  - Account range: 0 to $(($ACCOUNT_COUNT - 1))
+- **Transaction Generation Details (per test set):**
+  - Target Account Count: ${ACCOUNT_COUNT}
+  - Memset operations varied: ${percentage_list_string}%
+
+- **glaze_with_memset Processing Details (per run):**
+  - Batch size: 65,536 transactions (1 << 16)
+  - Total batches processed: 5,000 
+  - Total transactions processed: ~328 million (5000 * 65536)
 
 ## Results Summary
 
 The detailed results are available in: \`results_${TIMESTAMP}.csv\`
+The summary data for plotting is in: \`summary_${TIMESTAMP}.csv\`
 
-### Performance Comparison
+### Performance Comparison (Throughput Ktx/s and Average Batch Time ms)
 
 EOF
 
     # Add performance comparison table
     if [ -f "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" ]; then
-        echo "| Memset % | glaze_with_memset Throughput | state_management_multi Throughput | glaze_with_memset Avg Batch | state_management_multi Avg Batch |" >> "$summary_file"
-        echo "|----------|---------------------------|--------------------------|--------------------------|-------------------------|" >> "$summary_file"
+        echo "| Memset % | glaze_with_memset Throughput (Ktx/s) | state_management_multi Throughput (Ktx/s) | glaze_with_memset Avg Batch (ms) | state_management_multi Avg Batch (ms) |" >> "$summary_file"
+        echo "|----------|---------------------------------------|------------------------------------------|-----------------------------------|--------------------------------------|" >> "$summary_file"
         
         # Process CSV to create comparison table
-        for pct in $(seq 0 5 100); do
-            glaze_throughput=$(grep "glaze_with_memset,$pct," "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" | cut -d',' -f2 || echo "N/A")
-            multi_throughput=$(grep "state_management_multi,$pct," "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" | cut -d',' -f2 || echo "N/A")
-            glaze_avg_batch=$(grep "glaze_with_memset,$pct," "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
-            multi_avg_batch=$(grep "state_management_multi,$pct," "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" | cut -d',' -f4 || echo "N/A")
+        for pct in "${MEMSET_PERCENTAGES[@]}"; do
+            # Read the line corresponding to the percentage from summary.csv
+            local data_line=$(grep "^${pct}," "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv" || echo "$pct,N/A,N/A,N/A,N/A")
             
-            echo "| $pct% | $glaze_throughput | $multi_throughput | ${glaze_avg_batch}ms | ${multi_avg_batch}ms |" >> "$summary_file"
+            local glaze_thr=$(echo "$data_line" | cut -d',' -f2)
+            local multi_thr=$(echo "$data_line" | cut -d',' -f3)
+            local glaze_avg_b=$(echo "$data_line" | cut -d',' -f4)
+            local multi_avg_b=$(echo "$data_line" | cut -d',' -f5)
+            
+            echo "| $pct% | $glaze_thr | $multi_thr | $glaze_avg_b | $multi_avg_b |" >> "$summary_file"
         done
+    else
+        echo "Summary CSV file not found. Table could not be generated." >> "$summary_file"
     fi
     
     cat >> "$summary_file" << EOF
 
 ## Notes
 
-- Both systems process ALL ${ACCOUNT_COUNT} accounts
-- glaze_with_memset uses optimized memset operations
-- state_management_multi uses multi-threaded processing
-- Processing 50,000 batches (3.28 billion transactions) per test
-- Average batch time tracked for performance analysis
+- Throughput is measured in Kilo-transactions per second (Ktx/s).
+- Average Batch Time is measured in milliseconds (ms).
+- glaze_with_memset processes 5,000 batches as per its internal configuration.
+- Ensure \`generate_transactions\` creates sufficient data for all tests.
 
 EOF
 
@@ -233,9 +251,10 @@ main() {
     print_section_header "Performance Test Configuration"
     printf "Account Count: %'d\n" "$ACCOUNT_COUNT"
     printf "Output Directory: %s\n" "$OUTPUT_DIR"
-    printf "Batch Size: %'d transactions\n" "65536"
-    printf "Total Batches: %'d\n" "50000"
-    printf "Test Range: 0%% to 100%% memset operations (5%% increments)\n"
+    printf "Batch Size (as per glaze_with_memset): %'d transactions\n" "65536"
+    printf "Total Batches Processed by glaze_with_memset: %'d\n" "5000"
+    local percentage_list_string=$(IFS=, ; echo "${MEMSET_PERCENTAGES[*]}")
+    printf "Test Memset Percentages: %s%%\n" "$percentage_list_string"
     
     # Check if bc is available
     if ! command -v bc &> /dev/null; then
@@ -250,16 +269,15 @@ main() {
     # Create CSV headers
     create_csv_header
     
-    # Test percentages from 0% to 100% in 5% increments
     local test_counter=1
-    local total_tests=$((100/5 + 1))
+    local total_tests_to_run=${#MEMSET_PERCENTAGES[@]}
     
-    for memset_pct in $(seq 0 5 100); do
-        print_section_header "Test Set ${test_counter}/${total_tests} (${memset_pct}% memset)"
+    for memset_pct in "${MEMSET_PERCENTAGES[@]}"; do
+        print_section_header "Test Set ${test_counter}/${total_tests_to_run} (${memset_pct}% memset)"
         
         # Generate transactions once for this percentage
         if ! generate_transactions_once "$memset_pct" "$test_counter"; then
-            log_message "❌ Failed to generate transactions. Skipping this percentage."
+            log_message "❌ Failed to generate transactions for ${memset_pct}%. Skipping this percentage."
             continue
         fi
         printf "✅ Generated transactions with %d%% memset operations\n" "$memset_pct"
@@ -267,31 +285,35 @@ main() {
         # Test both systems
         for system in "glaze_with_memset" "state_management_multi"; do
             local cmd="./glaze_with_memset ${ACCOUNT_COUNT}"
-            [ "$system" = "state_management_multi" ] && cmd="./state_management_multi"
+            # state_management_multi command does not take ACCOUNT_COUNT as argument in this script.
+            # Assuming it uses an internal or different configuration method for account count.
+            [ "$system" = "state_management_multi" ] && cmd="./state_management_multi" 
             
-            printf "\n🔄 Testing %s...\n" "$system"
+            printf "\n🔄 Testing %s with %s%% memset...\n" "$system" "$memset_pct"
             if ! run_test "$memset_pct" "$test_counter" "$system" "$cmd"; then
-                printf "❌ %s test failed\n" "$system"
+                printf "❌ %s test failed for %s%% memset\n" "$system" "$memset_pct"
             fi
         done
         
         test_counter=$((test_counter + 1))
         
-        # Clean up only after both systems have been tested
+        # Clean up only after both systems have been tested for a given percentage
         cleanup_files
         
         # Brief pause between test sets
+        log_message "Pausing for 2 seconds before next test set..."
         sleep 2
     done
     
     print_section_header "Test Summary"
-    printf "✅ All tests completed successfully!\n"
-    printf "📊 Detailed results: %s/results_%s.csv\n" "$OUTPUT_DIR" "$TIMESTAMP"
-    printf "📈 Summary data: %s/summary_%s.csv\n" "$OUTPUT_DIR" "$TIMESTAMP"
-    printf "\nUse the summary CSV file for easy plotting of throughput comparisons.\n"
-    
-    # Generate summary
+    # Generate summary report at the end of all tests
     generate_summary
+
+    printf "✅ All test sets completed.\n"
+    printf "📊 Detailed results: %s/results_%s.csv\n" "$OUTPUT_DIR" "$TIMESTAMP"
+    printf "📈 Summary data for plotting: %s/summary_%s.csv\n" "$OUTPUT_DIR" "$TIMESTAMP"
+    printf "📄 Markdown summary report: %s/test_summary_%s.md\n" "$OUTPUT_DIR" "$TIMESTAMP"
+    printf "\nUse the summary CSV file for easy plotting of throughput comparisons.\n"
 }
 
 # Run main function
