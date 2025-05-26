@@ -219,20 +219,16 @@ static inline bool apply_transaction_to_state_array(const Transaction *__restric
      *  Writes `amount` into accounts [start, start+len)
      * ========================================================== */
     if (LIKELY(sfunc == 1 && rfunc == 1)) {
-        uint64_t start = sidx;
-        uint64_t len   = ridx;          /* receiver "data" holds length */
+        uint64_t start_idx = GET_DATA(tx->sender);
+        uint64_t count = GET_DATA(tx->receiver);
+        int64_t value_to_set = (int64_t)tx->amount;
 
-        if (UNLIKELY(!len || start >= SMALL_ACCOUNT_COUNT))
-            return false;
-
-        uint64_t end = start + len;
-        if (end > SMALL_ACCOUNT_COUNT) end = SMALL_ACCOUNT_COUNT;
-
-        const int64_t val = (int64_t)tx->amount;
-        int64_t *dst = &state_array[start];
-
-        for (uint64_t i = 0; i < (end - start); ++i) { // Iterate using span relative to dst
-            dst[i] = val;
+        for (uint64_t i = 0; i < count; ++i) {
+            uint64_t current_addr = start_idx + i;
+            if (current_addr < PADDED_ACCOUNT_COUNT) {
+                state_array[current_addr] = value_to_set;
+                uint32_t chunk_idx = current_addr / ACCOUNTS_PER_STATE_CHUNK;
+            }
         }
         return true;
     }
@@ -572,15 +568,15 @@ int recover_state_from_log(int log_fd, int64_t *restrict state_array_to_recover,
                 // Range set transaction
                 if (sfunc == 1 && rfunc == 1) {
                     ++ collected_tx_count;
-                    uint64_t start_idx = sdata;
-                    uint64_t len = rdata;
-                    if (start_idx >= 0 && start_idx < PADDED_ACCOUNT_COUNT) {
-                        for (uint64_t i = 0; i < len; ++ i) {
-                            uint32_t current_chunk_affected = (start_idx + i) / ACCOUNTS_PER_STATE_CHUNK;
-                            if (start_idx + i >= SMALL_ACCOUNT_COUNT) break;
-                            if (current_chunk_affected == currently_processing_chnk) {
-                                state_array_to_recover[start_idx + i] = (int64_t)tx->amount;
-                            }
+                    uint64_t start_idx = GET_DATA(tx->sender);
+                    uint64_t count = GET_DATA(tx->receiver);
+                    int64_t value_to_set = (int64_t)tx->amount;
+
+                    for (uint64_t i = 0; i < count; ++i) {
+                        uint64_t current_addr = start_idx + i;
+                        if (current_addr < PADDED_ACCOUNT_COUNT) {
+                            state_array_to_recover[current_addr] = value_to_set;
+                            uint32_t chunk_idx = current_addr / ACCOUNTS_PER_STATE_CHUNK;
                         }
                     }
                 }

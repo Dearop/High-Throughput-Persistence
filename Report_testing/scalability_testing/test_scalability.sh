@@ -7,7 +7,7 @@
 set -e  # Exit on any error
 
 # Configuration
-MEMSET_PERCENTAGE=50  # Fixed at 50% for scalability testing
+MEMSET_PERCENTAGE=5  # Fixed at 5% for scalability testing
 OUTPUT_DIR="scalability_test_results"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${OUTPUT_DIR}/scalability_test_log_${TIMESTAMP}.txt"
@@ -29,12 +29,14 @@ log_message() {
 
 # Function to format bytes to human readable
 format_bytes() {
-    local bytes=$1
-    if [ "$bytes" -gt 1073741824 ]; then # Use "$bytes" for string comparison with -gt in arithmetic context
+    local bytes=${1:-0} # Default to 0 if not provided or empty
+    if ! [[ "$bytes" =~ ^[0-9]+([.][0-9]+)?$ ]]; then bytes=0; fi # Ensure it's a number
+
+    if (( $(echo "$bytes > 1073741824" | bc -l) )); then 
         echo "$(echo "scale=2; $bytes / 1073741824" | bc)GB"
-    elif [ "$bytes" -gt 1048576 ]; then
+    elif (( $(echo "$bytes > 1048576" | bc -l) )); then
         echo "$(echo "scale=2; $bytes / 1048576" | bc)MB"
-    elif [ "$bytes" -gt 1024 ]; then
+    elif (( $(echo "$bytes > 1024" | bc -l) )); then
         echo "$(echo "scale=2; $bytes / 1024" | bc)KB"
     else
         echo "${bytes}B"
@@ -75,19 +77,20 @@ cleanup_files() {
     rm -f "${BASE_DIR}/transactions.bin"
     rm -f "${BASE_DIR}/checkpoint_log.dat" "${BASE_DIR}/state_hash.dat" "${BASE_DIR}/reconstructed_state.txt"
     rm -f "${BASE_DIR}/state_management_output.txt"
-    # Be cautious with broad rm commands, ensure they target the correct directory if needed
-    # rm -f ${BASE_DIR}/*.bin ${BASE_DIR}/*.dat ${BASE_DIR}/*.txt 2>/dev/null || true
 }
 
 # Function to check available disk space
 check_disk_space() {
-    local required_gb=$1
+    local required_gb=${1:-0}
+    if ! [[ "$required_gb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then required_gb=0; fi
+
     local available_kb=$(df "${BASE_DIR}" | tail -1 | awk '{print $4}')
+    if ! [[ "$available_kb" =~ ^[0-9]+$ ]]; then available_kb=0; fi
     local available_gb=$(echo "scale=2; $available_kb / 1024 / 1024" | bc)
     
     log_message "Available disk space in ${BASE_DIR}: ${available_gb}GB, Required: ${required_gb}GB"
     
-    if (( $(echo "${available_gb} < ${required_gb}" | bc -l) )); then
+    if [ "$(echo "${available_gb} < ${required_gb}" | bc -l)" -eq 1 ]; then
         log_message "WARNING: Insufficient disk space. Available: ${available_gb}GB, Required: ${required_gb}GB"
         return 1
     fi
@@ -96,22 +99,16 @@ check_disk_space() {
 
 # Function to estimate memory and disk requirements
 estimate_requirements() {
-    local account_count=$1
+    local account_count=${1:-0}
+    if ! [[ "$account_count" =~ ^[0-9]+$ ]]; then account_count=0; fi
     
-    # State size: account_count * 8 bytes (int64_t)
-    local state_size_bytes=$(echo "${account_count} * 8" | bc)
+    local state_size_bytes=$(echo "($account_count * 8) + 0" | bc) # Ensure numeric
     
-    # Transaction file size: Based on TOTAL_TRANSACTIONS * sizeof(Transaction) which is 24 bytes
-    # TOTAL_TRANSACTIONS is (1<<16) * 50000 = 3,276,800,000
-    # Size = 3,276,800,000 * 24 bytes = 78,643,200,000 bytes = ~73.24 GB
-    # This seems independent of account_count in the current generate_transactions.c
     local tx_file_gb=73.24 
     
-    # Log files can be large, estimate 2x transaction file size + state size
-    # This estimation is very rough.
-    local log_disk_estimate_gb=$(echo "scale=2; $tx_file_gb * 2" | bc)
-    local state_disk_gb=$(echo "scale=2; $state_size_bytes / 1073741824" | bc)
-    local total_disk_gb=$(echo "scale=2; $tx_file_gb + $log_disk_estimate_gb + $state_disk_gb" | bc)
+    local log_disk_estimate_gb=$(echo "scale=2; ($tx_file_gb * 2) + 0" | bc)
+    local state_disk_gb=$(echo "scale=2; $state_size_bytes / 1073741824 + 0" | bc)
+    local total_disk_gb=$(echo "scale=2; $tx_file_gb + $log_disk_estimate_gb + $state_disk_gb + 0" | bc)
     
     log_message "Estimated requirements for $account_count accounts:"
     log_message "  State size: $(format_bytes $state_size_bytes)"
@@ -126,28 +123,22 @@ run_scalability_test() {
     local account_count=$1
     local account_label=$2
     local system_name=$3
-    local command_template=$4 # Command template, e.g., "./program_name ACCOUNTS_ARG"
+    local command_template=$4
 
-    # Replace placeholder in command with actual account count
     local command=${command_template//ACCOUNTS_ARG/$account_count}
     
     log_message "=== Testing ${system_name} with ${account_count} accounts (${account_label}) ==="
     
-    # Estimate and check requirements
     local required_disk=$(estimate_requirements $account_count)
     if ! check_disk_space "$required_disk"; then
         log_message "Skipping ${system_name} test for ${account_count} accounts due to insufficient disk space"
-        return 1 # Indicate failure/skip
+        return 1 
     fi
     
-    # Generate transactions for this account count
     log_message "Generating transactions for ${account_count} accounts with ${MEMSET_PERCENTAGE}% memset..."
     log_message "Executing: ${BASE_DIR}/generate_transactions \"$MEMSET_PERCENTAGE\" \"$account_count\""
     local gen_start=$(date +%s.%N)
     
-    # All paths should be relative to BASE_DIR or absolute
-    # Output of generate_transactions is transactions.bin in the CWD of generate_transactions
-    # which is BASE_DIR because we execute it as ${BASE_DIR}/generate_transactions
     if ! "${BASE_DIR}/generate_transactions" "$MEMSET_PERCENTAGE" "$account_count" > "${BASE_DIR}/${OUTPUT_DIR}/generation_${system_name}_${account_label}_${TIMESTAMP}.log" 2>&1; then
         log_message "ERROR: Transaction generation failed for ${account_count} accounts. Check ${BASE_DIR}/${OUTPUT_DIR}/generation_${system_name}_${account_label}_${TIMESTAMP}.log"
         return 1
@@ -164,28 +155,22 @@ run_scalability_test() {
     local tx_file_size=$(stat -c%s "${BASE_DIR}/transactions.bin" 2>/dev/null || stat -f%z "${BASE_DIR}/transactions.bin" 2>/dev/null || echo "0")
     log_message "Transaction file generated in ${gen_duration}s, size: $(format_bytes $tx_file_size)"
     
-    # Run the system
     log_message "Running ${system_name} with ${account_count} accounts... Command: $command"
     local start_time=$(date +%s.%N)
     
-    # Execute the command, ensuring it runs in BASE_DIR context if necessary, or uses absolute paths for its files.
-    # The provided command for state_management_parameterized and log_optim_parameterized needs to handle its own paths.
-    # We assume they create output files like checkpoint_log.dat in their CWD (which is BASE_DIR).
     if eval "${command}" > "${BASE_DIR}/${OUTPUT_DIR}/${system_name}_${account_label}_${TIMESTAMP}.log" 2>&1; then
         local end_time=$(date +%s.%N)
         local duration=$(echo "$end_time - $start_time" | bc -l)
         log_message "${system_name} completed successfully in ${duration} seconds"
         
-        # Extract key metrics from the output
         extract_scalability_metrics "${BASE_DIR}/${OUTPUT_DIR}/${system_name}_${account_label}_${TIMESTAMP}.log" "$system_name" "$account_count" "$account_label" "$duration" "$gen_duration" "$tx_file_size"
     else
         log_message "ERROR: ${system_name} failed for ${account_count} accounts. Check ${BASE_DIR}/${OUTPUT_DIR}/${system_name}_${account_label}_${TIMESTAMP}.log"
         return 1
     fi
     
-    # Clean up for next test
     cleanup_files
-    return 0 # Indicate success
+    return 0 
 }
 
 # Function to extract metrics from output logs
@@ -198,11 +183,9 @@ extract_scalability_metrics() {
     local gen_duration=$6
     local tx_file_size=$7
     
-    # Extract throughput and timing information
-    # Add defensive checks for grep results
     local throughput=$(grep -o "Throughput: [0-9.]* tx/sec" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    if [[ "$throughput" == "N/A" ]]; then throughput=$(grep -i "transactions/sec:" "$log_file" | awk '{print $NF}' || echo "N/A"); fi # For log_optim
-    if [[ "$throughput" == "N/A" ]]; then throughput=$(grep -i "Overall throughput:" "$log_file" | awk '{print $3}' || echo "N/A"); fi # For state_management_parameterized new format
+    if [[ "$throughput" == "N/A" ]]; then throughput=$(grep -i "transactions/sec:" "$log_file" | awk '{print $NF}' || echo "N/A"); fi 
+    if [[ "$throughput" == "N/A" ]]; then throughput=$(grep -i "Overall throughput:" "$log_file" | awk '{print $3}' || echo "N/A"); fi
 
     local total_tx=$(grep -o "Total transactions: [0-9]*" "$log_file" | grep -o "[0-9]*" || echo "N/A")
     local avg_batch_time=$(grep -o "Average batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
@@ -211,13 +194,10 @@ extract_scalability_metrics() {
     local total_processing_time_ms=$(grep -o "Total time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
     if [[ "$total_processing_time_ms" == "N/A" ]]; then total_processing_time_ms=$(grep -i "Total processing time:" "$log_file" | awk '{print $4}' || echo "N/A"); fi
     
-    # Calculate memory usage (state size)
-    local state_size_mb=$(echo "scale=2; $account_count * 8 / 1048576" | bc)
+    local state_size_mb=$(echo "scale=2; ($account_count * 8 / 1048576) + 0" | bc)
     
-    # Append to CSV results file
     echo "${system_name},${account_count},${account_label},${duration},${gen_duration},${throughput},${total_tx},${avg_batch_time},${median_time},${p99_time},${total_processing_time_ms},${state_size_mb},${tx_file_size}" >> "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv"
     
-    # Log the extracted metrics
     log_message "  Metrics: Throughput=${throughput} tx/sec, AvgBatch=${avg_batch_time}ms, StateSize=${state_size_mb}MB, TotalProcessingTime=${total_processing_time_ms}ms"
 }
 
@@ -265,12 +245,10 @@ The detailed results are available in: \`${OUTPUT_DIR}/scalability_results_${TIM
 
 EOF
 
-    # Add performance comparison table
     if [ -f "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" ]; then
         echo "| Accounts | log_optim Throughput (tx/s) | state_mgmt Throughput (tx/s) | log_optim Avg Batch (ms) | state_mgmt Avg Batch (ms) | State Size (MB) |" >> "$summary_file"
         echo "|----------|-----------------------------|------------------------------|--------------------------|---------------------------|-----------------|" >> "$summary_file"
         
-        # Process CSV to create comparison table
         for i in "${!ACCOUNT_COUNTS[@]}"; do
             local count=${ACCOUNT_COUNTS[$i]}
             local label=${ACCOUNT_LABELS[$i]}
@@ -279,7 +257,7 @@ EOF
             local state_throughput=$(awk -F, -v ac="$count" '$1 == "state_management_parameterized" && $2 == ac {print $6}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
             local log_avg_batch=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac {print $8}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
             local state_avg_batch=$(awk -F, -v ac="$count" '$1 == "state_management_parameterized" && $2 == ac {print $8}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
-            local state_size=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac {print $12}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A") # State size should be same for both for a given account count
+            local state_size=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac {print $12}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A") 
             
             echo "| $label | $log_throughput | $state_throughput | ${log_avg_batch} | ${state_avg_batch} | ${state_size} |" >> "$summary_file"
         done
@@ -301,32 +279,22 @@ log_message "Starting scalability test suite."
 log_message "Output directory: ${OUTPUT_DIR}"
 log_message "Log file: ${LOG_FILE}"
 
-cd "${BASE_DIR}" # Ensure we are in the script's directory
+cd "${BASE_DIR}" 
 
 compile_programs
 create_csv_header
 
-# Main test loop
 for i in "${!ACCOUNT_COUNTS[@]}"; do
     current_account_count=${ACCOUNT_COUNTS[$i]}
     current_account_label=${ACCOUNT_LABELS[$i]}
 
     log_message "--- Iteration for ${current_account_label} (${current_account_count} accounts) ---"
     
-    # Test log_optim_parameterized
-    # It takes NUM_ACCOUNTS, BATCH_SIZE, NUM_BATCHES, CHUNK_SIZE_KB, RING_SLOTS, EXPENSIVE_OP_RATIO
-    # For scalability, let's keep BATCH_SIZE, NUM_BATCHES fixed. CHUNK_SIZE_KB can be 512.
-    # RING_SLOTS can be dynamic or fixed e.g. 8 or more. Let's use 8.
-    # EXPENSIVE_OP_RATIO = 0 for these tests. We are testing with memset_percentage from generate_transactions.
     cmd_log_optim="./log_optim_parameterized ${current_account_count} $((1<<16)) 50000 512 8 0"
     if ! run_scalability_test "$current_account_count" "$current_account_label" "log_optim_parameterized" "$cmd_log_optim"; then
         log_message "Test run failed for log_optim_parameterized with ${current_account_label}. See logs."
     fi
 
-    # Test state_management_parameterized
-    # It takes SMALL_ACCOUNT_COUNT, NUM_BATCHES, BATCH_SIZE, CHUNK_SIZE_PARAM_KB, RING_SIZE_PARAM, MAX_WRITE_SET_COUNT_MULTIPLIER
-    # Let's use similar fixed params where applicable.
-    # MAX_WRITE_SET_COUNT_MULTIPLIER could be e.g. 16
     cmd_state_mgmt="./state_management_parameterized ${current_account_count} 50000 $((1<<16)) 512 8 16"
     if ! run_scalability_test "$current_account_count" "$current_account_label" "state_management_parameterized" "$cmd_state_mgmt"; then
         log_message "Test run failed for state_management_parameterized with ${current_account_label}. See logs."
