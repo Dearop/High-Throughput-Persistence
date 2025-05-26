@@ -1,0 +1,9 @@
+System,Account_Count,Account_Label,Run_Label,Total_Test_Duration_Sec,Generation_Duration_Sec,Recovery_Time_Ms,Throughput_TxPerSec,Total_Transactions,Avg_Batch_Time_Ms,Median_Batch_Time_Ms,P99_Batch_Time_Ms,Total_Processing_Time_Ms,State_Size_MB,Transaction_File_Size_Bytes
+log_optim_parameterized,2000000,2M,initial,223.101182227,56.846276767,0,,3276800000,N/A,N/A,N/A,,15.25,78643200000
+log_optim_parameterized,2000000,2M,recovery,216.503186233,56.846276767,11.915,,3276800000,N/A,N/A,N/A,,15.25,78643200000
+state_management_parameterized,2000000,2M,initial,121.192082566,56.846276767,0,,,N/A,N/A,N/A,,15.25,78643200000
+state_management_parameterized,2000000,2M,recovery,124.837518613,56.846276767,264.926,,,N/A,N/A,N/A,,15.25,78643200000
+state_management_parameterized,5000000,5M,initial,143.648764108,57.277883379,0,,,N/A,N/A,N/A,,38.14,78643200000
+state_management_parameterized,5000000,5M,recovery,137.437137129,57.277883379,1563.694,,,N/A,N/A,N/A,,38.14,78643200000
+state_management_parameterized,10000000,10M,initial,161.320845037,57.196951112,0,,,N/A,N/A,N/A,,76.29,78643200000
+state_management_parameterized,10000000,10M,recovery,157.847100447,57.196951112,6409.427,,,N/A,N/A,N/A,,76.29,78643200000

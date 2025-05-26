@@ -1,0 +1,17 @@
+System,Account_Count,Account_Label,Run_Label,Total_Test_Duration_Sec,Generation_Duration_Sec,Recovery_Time_Ms,Throughput_TxPerSec,Total_Transactions,Avg_Batch_Time_Ms,Median_Batch_Time_Ms,P99_Batch_Time_Ms,Total_Processing_Time_Ms,State_Size_MB,Transaction_File_Size_Bytes
+log_optim_parameterized,2000000,2M,initial,218.628406795,57.338810342,0,,3276800000,N/A,N/A,N/A,,15.25,78643200000
+log_optim_parameterized,2000000,2M,recovery,215.758938157,57.338810342,12.518,,3276800000,N/A,N/A,N/A,,15.25,78643200000
+state_management_parameterized,2000000,2M,initial,123.095114017,57.338810342,0,,,N/A,N/A,N/A,,15.25,78643200000
+state_management_parameterized,2000000,2M,recovery,126.035243968,57.338810342,274.224,,,N/A,N/A,N/A,,15.25,78643200000
+log_optim_parameterized,5000000,5M,initial,250.974368912,57.311479681,0,,3276800000,N/A,N/A,N/A,,38.14,78643200000
+log_optim_parameterized,5000000,5M,recovery,243.803223198,57.311479681,28.116,,3276800000,N/A,N/A,N/A,,38.14,78643200000
+state_management_parameterized,5000000,5M,initial,142.868752177,57.311479681,0,,,N/A,N/A,N/A,,38.14,78643200000
+state_management_parameterized,5000000,5M,recovery,143.535028271,57.311479681,1633.504,,,N/A,N/A,N/A,,38.14,78643200000
+log_optim_parameterized,10000000,10M,initial,282.519550139,57.157613609,0,,3276800000,N/A,N/A,N/A,,76.29,78643200000
+log_optim_parameterized,10000000,10M,recovery,287.407600155,57.157613609,50.878,,3276800000,N/A,N/A,N/A,,76.29,78643200000
+state_management_parameterized,10000000,10M,initial,162.049691284,57.157613609,0,,,N/A,N/A,N/A,,76.29,78643200000
+state_management_parameterized,10000000,10M,recovery,167.352116960,57.157613609,6657.644,,,N/A,N/A,N/A,,76.29,78643200000
+log_optim_parameterized,20000000,20M,initial,363.388015153,57.244299804,0,,3276800000,N/A,N/A,N/A,,152.58,78643200000
+log_optim_parameterized,20000000,20M,recovery,358.321964275,57.244299804,98.823,,3276800000,N/A,N/A,N/A,,152.58,78643200000
+state_management_parameterized,20000000,20M,initial,169.080759661,57.244299804,0,,,N/A,N/A,N/A,,152.58,78643200000
+state_management_parameterized,20000000,20M,recovery,193.349330983,57.244299804,27227.789,,,N/A,N/A,N/A,,152.58,78643200000
