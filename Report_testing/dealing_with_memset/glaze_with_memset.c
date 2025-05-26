@@ -73,6 +73,12 @@ typedef struct {
 #define LOG_MAGIC   0xC0CAC01B
 #define LOG_VERSION 1
 
+typedef struct {
+    WriteSetEntry *entries;
+    uint32_t capacity;
+    uint32_t count;
+} DynamicWriteSet;
+
 /* timing util (coarse = ~1 µs vs 30 ns for MONOTONIC) ------------------ */
 static inline double now_ms(void)
 { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1e3 + ts.tv_nsec/1e6; }
@@ -221,6 +227,18 @@ static int compare_doubles(const void *a, const void *b) {
     return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
 }
 
+static inline int resize_write_set(DynamicWriteSet *ws, uint32_t new_capacity) {
+    WriteSetEntry *new_entries = aligned_alloc(64, new_capacity * sizeof(WriteSetEntry));
+    if (!new_entries) return 0;
+    if (ws->entries) {
+        memcpy(new_entries, ws->entries, ws->count * sizeof(WriteSetEntry));
+        free(ws->entries);
+    }
+    ws->entries = new_entries;
+    ws->capacity = new_capacity;
+    return 1;
+}
+
 int main(void)
 {
     /* geometry */
@@ -264,8 +282,10 @@ int main(void)
     }
     memset(state, 0, SMALL_ACCOUNT_COUNT * sizeof(int64_t));
 
-    // Allocate write-set buffer
-    WriteSetEntry *ws = aligned_alloc(64, MAX_WRITE_SET_SIZE * sizeof(WriteSetEntry));
+    // Initialize write-set with initial capacity
+    uint32_t ws_capacity = BATCH_SIZE * 2;  // Start with space for 2 entries per tx
+    uint32_t ws_count = 0;
+    WriteSetEntry *ws = aligned_alloc(64, ws_capacity * sizeof(WriteSetEntry));
     if (!ws) {
         perror("ws alloc"); free(state); munmap(map, sizeof(LogHeader) + LOG_BYTES); close(fd); return 1;
     }
@@ -306,7 +326,7 @@ int main(void)
         
         // Process entire batch at once
         for (size_t i = 0; i < n; i++) {
-            apply_tx(&tx_buf[i], state, ws, &ws_cnt, MAX_WRITE_SET_SIZE);
+            apply_tx(&tx_buf[i], state, ws, &ws_cnt, ws_capacity);
         }
         
         double t2 = now_ms();
