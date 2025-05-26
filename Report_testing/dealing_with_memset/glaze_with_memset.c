@@ -25,7 +25,8 @@
 #define NUM_CHUNKS            ((SMALL_ACCOUNT_COUNT + ACC_PER_CHUNK - 1) / ACC_PER_CHUNK)
 
 // Maximum write-set size with safety margin (4x batch size to handle worst case)
-#define MAX_WRITE_SET_SIZE    (BATCH_SIZE * 4)
+#define MAX_WRITE_SET_SIZE    (BATCH_SIZE * 2)    // Maximum 2 entries per transaction
+#define MAX_WS_BYTES         (MAX_WRITE_SET_SIZE * sizeof(WriteSetEntry))
 
 /* ----------------------------- file paths ----------------------------- */
 #define LOG_FILE              "checkpoint_log.dat"
@@ -35,7 +36,33 @@
 // Pre-calculate sizes to ensure proper alignment
 #define HEADER_SIZE           (sizeof(uint32_t) * 2)
 #define STATE_ARRAY_SIZE      (ACC_PER_CHUNK * sizeof(int64_t))
-#define MAX_WS_BYTES         (MAX_WRITE_SET_SIZE * sizeof(WriteSetEntry))
+
+// Add debug macros
+#define DEBUG_PRINT(...) fprintf(stderr, __VA_ARGS__)
+
+// Add memory allocation wrapper
+static inline void* safe_aligned_alloc(size_t alignment, size_t size, const char* purpose) {
+    void* ptr = aligned_alloc(alignment, size);
+    if (!ptr) {
+        DEBUG_PRINT("Failed to allocate %zu bytes aligned to %zu for %s: %s\n", 
+                   size, alignment, purpose, strerror(errno));
+        return NULL;
+    }
+    DEBUG_PRINT("Successfully allocated %zu bytes aligned to %zu for %s at %p\n",
+                size, alignment, purpose, ptr);
+    return ptr;
+}
+
+// Add mmap wrapper
+static inline void* safe_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset, const char* purpose) {
+    void* ptr = mmap(addr, length, prot, flags, fd, offset);
+    if (ptr == MAP_FAILED) {
+        DEBUG_PRINT("mmap failed for %s (%zu bytes): %s\n", purpose, length, strerror(errno));
+        return NULL;
+    }
+    DEBUG_PRINT("mmap succeeded for %s (%zu bytes) at %p\n", purpose, length, ptr);
+    return ptr;
+}
 
 static size_t SLOT_BYTES;  // Will be initialized in main()
 static size_t LOG_BYTES;   // Will be initialized in main()
@@ -218,6 +245,8 @@ static void *commit_thread(void *arg)
         pthread_mutex_lock(&mt); 
         pthread_cond_signal(&cv_done); 
         pthread_mutex_unlock(&mt);
+
+        fprintf(stderr, "Commit thread: slot=%u batch=%u ws_cnt=%u\n", t.slot, t.batch, t.ws_cnt);
     } 
     return NULL; 
 }
@@ -268,8 +297,8 @@ int main(void)
         perror("ftruncate"); close(fd); return 1;
     }
 
-    void *map = mmap(NULL, sizeof(LogHeader) + LOG_BYTES, 
-                    PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    void *map = safe_mmap(NULL, sizeof(LogHeader) + LOG_BYTES, 
+                    PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0, "log map");
     if (map == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
 
     // Advise the kernel about our access pattern
@@ -282,13 +311,18 @@ int main(void)
     }
     memset(state, 0, SMALL_ACCOUNT_COUNT * sizeof(int64_t));
 
-    // Initialize write-set with initial capacity
-    uint32_t ws_capacity = BATCH_SIZE * 2;  // Start with space for 2 entries per tx
-    uint32_t ws_count = 0;
-    WriteSetEntry *ws = aligned_alloc(64, ws_capacity * sizeof(WriteSetEntry));
+    // Allocate write-set buffer with debug output
+    size_t ws_alloc_size = MAX_WRITE_SET_SIZE * sizeof(WriteSetEntry);
+    fprintf(stderr, "Attempting to allocate write-set buffer: %zu bytes (%u entries)\n", 
+            ws_alloc_size, MAX_WRITE_SET_SIZE);
+    
+    WriteSetEntry *ws = aligned_alloc(64, ws_alloc_size);
     if (!ws) {
-        perror("ws alloc"); free(state); munmap(map, sizeof(LogHeader) + LOG_BYTES); close(fd); return 1;
+        fprintf(stderr, "Write-set allocation failed: %s (size=%zu, alignment=64)\n", 
+                strerror(errno), ws_alloc_size);
+        free(state); munmap(map, sizeof(LogHeader) + LOG_BYTES); close(fd); return 1;
     }
+    fprintf(stderr, "Write-set allocation succeeded at %p\n", (void*)ws);
 
     // Start commit thread
     pthread_t th;
@@ -305,7 +339,7 @@ int main(void)
     }
 
     // Allocate transaction buffer
-    Transaction *tx_buf = aligned_alloc(64, BATCH_SIZE * sizeof(Transaction));
+    Transaction *tx_buf = safe_aligned_alloc(64, BATCH_SIZE * sizeof(Transaction), "tx buf alloc");
     if (!tx_buf) {
         perror("tx buf alloc"); fclose(fp); free(ws); free(state);
         munmap(map, sizeof(LogHeader) + LOG_BYTES); close(fd); return 1;
@@ -326,7 +360,7 @@ int main(void)
         
         // Process entire batch at once
         for (size_t i = 0; i < n; i++) {
-            apply_tx(&tx_buf[i], state, ws, &ws_cnt, ws_capacity);
+            apply_tx(&tx_buf[i], state, ws, &ws_cnt, MAX_WRITE_SET_SIZE);
         }
         
         double t2 = now_ms();
