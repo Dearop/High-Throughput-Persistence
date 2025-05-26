@@ -90,7 +90,7 @@ run_test() {
 # Function to create CSV header
 create_csv_header() {
     # Create a clean CSV file with headers
-    echo "Memset%,System,TotalTime_s,Throughput_Ktx/s,TotalTx,AvgBatchTime_ms,MedianBatchTime_ms,P99BatchTime_ms,TotalProcessingTime_ms,RecoveryTime_ms" > "${OUTPUT_DIR}/results_${TIMESTAMP}.csv"
+    echo "Memset%,System,TotalTime_s,Throughput_Ktx/s,AvgBatchTime_ms,MedianBatchTime_ms,P99BatchTime_ms,RecoveryTime_ms" > "${OUTPUT_DIR}/results_${TIMESTAMP}.csv"
     
     # Create a summary CSV for easier plotting
     echo "Memset%,GlazeWithMemset_Throughput,StateManagementMulti_Throughput,GlazeWithMemset_AvgBatch,StateManagementMulti_AvgBatch" > "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv"
@@ -113,35 +113,54 @@ extract_metrics() {
     local memset_percentage=$3
     local duration=$4
     
-    # Extract metrics with more robust patterns
-    local throughput=$(grep -o "Throughput: [0-9.]* Ktx/s" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local total_tx=$(grep -o "Total transactions: [0-9]*" "$log_file" | grep -o "[0-9]*" || echo "N/A")
-    local avg_batch_time=$(grep -o "Average batch.*time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local median_time=$(grep -o "Median batch.*time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local p99_time=$(grep -o "99th percentile batch.*time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local total_time=$(grep -o "Total.*time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local recovery_time=$(grep -o "Recovery phase took [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+    # Extract metrics with more robust patterns and handle both output formats
+    local throughput=0
+    local avg_batch_time=0
+    local median_time=0
+    local p99_time=0
+    local recovery_time=0
+    
+    # Try different throughput formats
+    if grep -q "Total throughput:" "$log_file"; then
+        throughput=$(grep -o "Total throughput:.*Ktx/s" "$log_file" | grep -o "[0-9.]*" || echo "0")
+    else
+        throughput=$(grep -o "Throughput:.*Ktx/s" "$log_file" | grep -o "[0-9.]*" || echo "0")
+    fi
+    
+    # Try different time formats
+    if grep -q "Average batch time:" "$log_file"; then
+        avg_batch_time=$(grep -o "Average batch time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
+        median_time=$(grep -o "Median batch time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
+        p99_time=$(grep -o "99th percentile batch time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
+    else
+        avg_batch_time=$(grep -o "Average batch.*time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
+        median_time=$(grep -o "Median batch.*time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
+        p99_time=$(grep -o "99th percentile:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
+    fi
+    
+    # Try different recovery time formats
+    recovery_time=$(grep -o "Recovery phase took [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || \
+                   grep -o "Recovery time:.*ms" "$log_file" | grep -o "[0-9.]*" || echo "0")
     
     # Append to detailed CSV
-    echo "${memset_percentage},${system_name},${duration},${throughput},${total_tx},${avg_batch_time},${median_time},${p99_time},${total_time},${recovery_time}" >> "${OUTPUT_DIR}/results_${TIMESTAMP}.csv"
+    echo "${memset_percentage},${system_name},${duration},${throughput},${avg_batch_time},${median_time},${p99_time},${recovery_time}" >> "${OUTPUT_DIR}/results_${TIMESTAMP}.csv"
     
     # Store metrics for summary
     if [ "$system_name" = "glaze_with_memset" ]; then
         glaze_throughput=$throughput
         glaze_avg_batch=$avg_batch_time
     else
-        # If it's state_management_multi, we have both metrics, so write the summary line
         echo "${memset_percentage},${glaze_throughput},${throughput},${glaze_avg_batch},${avg_batch_time}" >> "${OUTPUT_DIR}/summary_${TIMESTAMP}.csv"
     fi
     
     # Print nice console output
     printf "\n%-25s Results for %s\n" "🔍" "$system_name"
-    printf "%-25s %'.2f Ktx/s\n" "Throughput:" "$throughput"
-    printf "%-25s %'.2f ms\n" "Avg Batch Time:" "$avg_batch_time"
-    printf "%-25s %'.2f ms\n" "Median Batch Time:" "$median_time"
-    printf "%-25s %'.2f ms\n" "P99 Batch Time:" "$p99_time"
-    printf "%-25s %'.2f ms\n" "Recovery Time:" "$recovery_time"
-    printf "%-25s %'.2f s\n" "Total Run Time:" "$duration"
+    printf "%-25s %.2f Ktx/s\n" "Throughput:" "$throughput"
+    printf "%-25s %.2f ms\n" "Avg Batch Time:" "$avg_batch_time"
+    printf "%-25s %.2f ms\n" "Median Batch Time:" "$median_time"
+    printf "%-25s %.2f ms\n" "P99 Batch Time:" "$p99_time"
+    printf "%-25s %.2f ms\n" "Recovery Time:" "$recovery_time"
+    printf "%-25s %.2f s\n" "Total Run Time:" "$duration"
 }
 
 # Function to generate summary report
