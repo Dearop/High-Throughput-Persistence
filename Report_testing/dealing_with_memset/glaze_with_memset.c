@@ -380,12 +380,18 @@ int main(void)
     // Advise the kernel about our access pattern
     madvise(map, sizeof(LogHeader) + LOG_BYTES, MADV_SEQUENTIAL);
 
-    // Initialize state with aligned allocation
+    // Initialize state with aligned allocation and padding for last chunk
     int64_t *state;
-    if (posix_memalign((void**)&state, 64, SMALL_ACCOUNT_COUNT * sizeof(int64_t)) != 0) {
+    size_t padded_size = NUM_CHUNKS * ACC_PER_CHUNK;  // Ensure we have full chunks
+    if (posix_memalign((void**)&state, 64, padded_size * sizeof(int64_t)) != 0) {
         perror("state alloc"); munmap(map, sizeof(LogHeader) + LOG_BYTES); close(fd); return 1;
     }
-    memset(state, 0, SMALL_ACCOUNT_COUNT * sizeof(int64_t));
+    memset(state, 0, padded_size * sizeof(int64_t));
+
+    // Print debug info about padding
+    fprintf(stderr, "State array: total_size=%zu padded_size=%zu last_chunk_accounts=%zu\n",
+            SMALL_ACCOUNT_COUNT, padded_size,
+            padded_size - ((NUM_CHUNKS - 1) * ACC_PER_CHUNK));
 
     // Allocate write-set buffer with debug output
     size_t ws_alloc_size = MAX_WRITE_SET_SIZE * sizeof(WriteSetEntry);
@@ -445,23 +451,20 @@ int main(void)
         pthread_mutex_lock(&mt);
         while (ready) pthread_cond_wait(&cv_done, &mt);
         
-        // Calculate slot with explicit wrap-around
+        // Calculate slot with safety checks
         uint32_t slot = batch % NUM_CHUNKS;
-        
-        // Debug output for slot calculation
-        fprintf(stderr, "Batch %u using slot %u (NUM_CHUNKS=%lu)\n", 
-                batch, slot, (unsigned long)NUM_CHUNKS);
-        
-        // Calculate chunk size and validate bounds
-        size_t chunk_size = get_chunk_size(slot);
         size_t chunk_offset = slot * ACC_PER_CHUNK;
         
-        if (chunk_offset >= SMALL_ACCOUNT_COUNT || 
-            chunk_offset + chunk_size > SMALL_ACCOUNT_COUNT) {
-            fprintf(stderr, "Error: Invalid chunk access: offset=%zu size=%zu total=%lu\n",
-                    chunk_offset, chunk_size, SMALL_ACCOUNT_COUNT);
+        // Ensure we don't exceed total account bounds
+        if (chunk_offset >= SMALL_ACCOUNT_COUNT) {
+            fprintf(stderr, "Error: Chunk offset %zu exceeds account count %lu\n",
+                    chunk_offset, SMALL_ACCOUNT_COUNT);
             break;
         }
+        
+        // Calculate how many accounts we can safely access
+        size_t remaining = SMALL_ACCOUNT_COUNT - chunk_offset;
+        size_t safe_chunk_size = (remaining < ACC_PER_CHUNK) ? remaining : ACC_PER_CHUNK;
         
         task = (struct task_data){
             .slot = slot,
