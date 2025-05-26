@@ -115,7 +115,7 @@ int main(int argc, char *argv[]) {
                 double r_val = (double)rand_r(&thread_seed) / RAND_MAX;
 
                 if (r_val < memset_probability) { // Range Set (memset operation)
-                    const uint64_t memset_size_accounts = 65536; // 512KB (512*1024/8)
+                    const uint64_t memset_size_accounts = 8192; // 64KB (65536/8 bytes per account)
                     uint64_t max_start = (small_account_count_param > memset_size_accounts) ? 
                         (small_account_count_param - memset_size_accounts) : 0;
                     
