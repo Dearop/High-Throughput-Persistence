@@ -23,9 +23,10 @@
 #define STATE_CHUNK_BYTES     (512 * 1024)        /* 512 KiB                          */
 #define ACC_PER_CHUNK         (STATE_CHUNK_BYTES / sizeof(int64_t))
 #define NUM_CHUNKS            ((SMALL_ACCOUNT_COUNT + ACC_PER_CHUNK - 1) / ACC_PER_CHUNK)
+#define LAST_CHUNK_SIZE       (SMALL_ACCOUNT_COUNT - ((NUM_CHUNKS - 1) * ACC_PER_CHUNK))
 
 // Reduce maximum write-set size to be more conservative
-#define MAX_WRITE_SET_SIZE    (BATCH_SIZE * 2)    // Maximum 2 entries per transaction
+#define MAX_WRITE_SET_SIZE    (BATCH_SIZE)    // Maximum 1 entry per transaction
 #define MAX_WS_BYTES         (MAX_WRITE_SET_SIZE * sizeof(WriteSetEntry))
 
 /* ----------------------------- file paths ----------------------------- */
@@ -201,50 +202,100 @@ static void *commit_thread(void *arg)
         ready = 0; 
         pthread_mutex_unlock(&mt);
         
+        // Debug output for task data
+        fprintf(stderr, "Commit thread received task:\n");
+        fprintf(stderr, "  slot=%u batch=%u ws_cnt=%u\n", t.slot, t.batch, t.ws_cnt);
+        fprintf(stderr, "  state_src=%p ws=%p map=%p\n", 
+                (void*)t.state_src, (void*)t.ws, t.map);
+        
+        // Validate task data
         if (!t.map || !t.state_src || !t.ws || t.ws_cnt > MAX_WRITE_SET_SIZE) {
             fprintf(stderr, "Invalid task data or write-set too large (%u)\n", t.ws_cnt);
             continue;
         }
         
-        // Calculate offsets and verify bounds
-        size_t slot_offset = sizeof(LogHeader) + (t.slot * SLOT_BYTES);
-        if (slot_offset + SLOT_BYTES > sizeof(LogHeader) + LOG_BYTES) {
-            fprintf(stderr, "Slot offset out of bounds: %zu > %zu\n", 
-                    slot_offset + SLOT_BYTES, sizeof(LogHeader) + LOG_BYTES);
+        // Validate slot index
+        if (t.slot >= NUM_CHUNKS) {
+            fprintf(stderr, "Invalid slot index %u (NUM_CHUNKS=%lu)\n", 
+                    t.slot, (unsigned long)NUM_CHUNKS);
             continue;
         }
         
+        // Calculate and validate state source bounds
+        const int64_t *state_end = t.state_src + ACC_PER_CHUNK;
+        if (state_end > (int64_t*)t.map + SMALL_ACCOUNT_COUNT) {
+            fprintf(stderr, "State source would exceed bounds\n");
+            continue;
+        }
+        
+        // Calculate offsets and verify bounds
+        size_t slot_offset = sizeof(LogHeader) + (t.slot * SLOT_BYTES);
+        size_t max_offset = sizeof(LogHeader) + LOG_BYTES;
+        if (slot_offset >= max_offset) {
+            fprintf(stderr, "Slot offset out of bounds: %zu >= %zu\n", 
+                    slot_offset, max_offset);
+            continue;
+        }
+        
+        size_t end_offset = slot_offset + SLOT_BYTES;
+        if (end_offset > max_offset) {
+            fprintf(stderr, "Slot end would exceed log bounds: %zu > %zu\n", 
+                    end_offset, max_offset);
+            continue;
+        }
+        
+        // Get chunk slot pointer and validate
         ChunkSlot *cs = (ChunkSlot*)((char*)t.map + slot_offset);
+        fprintf(stderr, "  ChunkSlot at offset %zu (%p)\n", slot_offset, (void*)cs);
         
         // Set header fields
         cs->batch = t.batch;
         cs->ws_count = t.ws_cnt;
         
-        // Copy state data with explicit size
-        memcpy(cs->state, t.state_src, STATE_ARRAY_SIZE);
+        // Copy state data with explicit size check
+        size_t state_copy_size = STATE_ARRAY_SIZE;
+        if (state_copy_size > sizeof(cs->state)) {
+            fprintf(stderr, "State size too large: %zu > %zu\n", 
+                    state_copy_size, sizeof(cs->state));
+            continue;
+        }
+        memcpy(cs->state, t.state_src, state_copy_size);
         
-        // Calculate write-set destination with proper alignment
+        // Calculate write-set destination with alignment
         WriteSetEntry *ws_dest = (WriteSetEntry*)((char*)cs + sizeof(ChunkSlot));
         size_t ws_bytes = t.ws_cnt * sizeof(WriteSetEntry);
         
-        // Verify write-set bounds
+        // Validate write-set size
         if (ws_bytes > MAX_WS_BYTES) {
-            fprintf(stderr, "Write-set too large: %zu > %zu bytes\n", ws_bytes, MAX_WS_BYTES);
+            fprintf(stderr, "Write-set too large: %zu > %zu bytes\n", 
+                    ws_bytes, MAX_WS_BYTES);
+            continue;
+        }
+        
+        // Ensure write-set won't exceed slot bounds
+        size_t ws_end_offset = (char*)ws_dest + ws_bytes - (char*)t.map;
+        if (ws_end_offset > max_offset) {
+            fprintf(stderr, "Write-set would exceed log bounds: %zu > %zu\n", 
+                    ws_end_offset, max_offset);
             continue;
         }
         
         // Copy write-set
         memcpy(ws_dest, t.ws, ws_bytes);
         
-        // Sync the used portion
+        // Sync the modified data
         size_t sync_size = sizeof(ChunkSlot) + ws_bytes;
+        if (sync_size > SLOT_BYTES) {
+            fprintf(stderr, "Sync size too large: %zu > %zu\n", sync_size, SLOT_BYTES);
+            continue;
+        }
         msync(cs, sync_size, MS_ASYNC);
+        
+        fprintf(stderr, "Commit complete for batch %u\n", t.batch);
         
         pthread_mutex_lock(&mt); 
         pthread_cond_signal(&cv_done); 
         pthread_mutex_unlock(&mt);
-
-        fprintf(stderr, "Commit thread: slot=%u batch=%u ws_cnt=%u\n", t.slot, t.batch, t.ws_cnt);
     } 
     return NULL; 
 }
@@ -273,6 +324,25 @@ static inline int resize_write_set(DynamicWriteSet *ws, uint32_t new_capacity) {
                 (cnt), (needed), (cap)); \
         return; \
     }
+
+// Add safety checks
+#define SLOT_OFFSET(slot) (sizeof(LogHeader) + ((slot) * SLOT_BYTES))
+#define MAX_LOG_OFFSET (sizeof(LogHeader) + LOG_BYTES)
+#define VALIDATE_SLOT(slot) ((slot) < NUM_CHUNKS && SLOT_OFFSET(slot) + SLOT_BYTES <= MAX_LOG_OFFSET)
+
+// Add write-set validation
+static inline int validate_write_set(uint32_t ws_cnt, const WriteSetEntry *ws) {
+    if (!ws || ws_cnt > MAX_WRITE_SET_SIZE) {
+        fprintf(stderr, "Invalid write-set: cnt=%u max=%u\n", ws_cnt, MAX_WRITE_SET_SIZE);
+        return 0;
+    }
+    return 1;
+}
+
+// Add state access helper
+static inline size_t get_chunk_size(uint32_t slot) {
+    return (slot == NUM_CHUNKS - 1) ? LAST_CHUNK_SIZE : ACC_PER_CHUNK;
+}
 
 int main(void)
 {
@@ -382,17 +452,14 @@ int main(void)
         fprintf(stderr, "Batch %u using slot %u (NUM_CHUNKS=%lu)\n", 
                 batch, slot, (unsigned long)NUM_CHUNKS);
         
-        // Ensure we don't exceed chunk bounds
-        if (slot >= NUM_CHUNKS) {
-            fprintf(stderr, "Error: Slot index %u exceeds NUM_CHUNKS %lu\n", 
-                    slot, (unsigned long)NUM_CHUNKS);
-            break;
-        }
+        // Calculate chunk size and validate bounds
+        size_t chunk_size = get_chunk_size(slot);
+        size_t chunk_offset = slot * ACC_PER_CHUNK;
         
-        // Calculate state source pointer with bounds check
-        const int64_t *state_src = state + slot * ACC_PER_CHUNK;
-        if (state_src + ACC_PER_CHUNK > state + SMALL_ACCOUNT_COUNT) {
-            fprintf(stderr, "Error: State source would exceed bounds\n");
+        if (chunk_offset >= SMALL_ACCOUNT_COUNT || 
+            chunk_offset + chunk_size > SMALL_ACCOUNT_COUNT) {
+            fprintf(stderr, "Error: Invalid chunk access: offset=%zu size=%zu total=%lu\n",
+                    chunk_offset, chunk_size, SMALL_ACCOUNT_COUNT);
             break;
         }
         
@@ -400,11 +467,10 @@ int main(void)
             .slot = slot,
             .batch = batch,
             .ws_cnt = ws_cnt,
-            .state_src = state_src,
+            .state_src = state + chunk_offset,
             .ws = ws,
             .map = map
         };
-        
         ready = 1;
         pthread_cond_signal(&cv_new);
         pthread_mutex_unlock(&mt);
