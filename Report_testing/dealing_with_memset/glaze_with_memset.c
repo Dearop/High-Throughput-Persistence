@@ -15,7 +15,7 @@
 
 /* ----------------------------- parameters ----------------------------- */
 #define BATCH_SIZE            (1 << 16)           /* 65 536 tx per batch             */
-#define SMALL_ACCOUNT_COUNT   2000000UL           /* logical accounts               */
+#define SMALL_ACCOUNT_COUNT   5000000UL           /* logical accounts               */
 #define ACCOUNT_SIZE_BYTES    8
 #define PREFETCH_DISTANCE     8                   /* Prefetch 8 transactions ahead   */
 #define WRITE_BUFFER_SIZE     (1 << 20)          /* 1MB write buffer               */
