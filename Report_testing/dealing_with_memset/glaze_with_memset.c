@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
 
 #define ACCOUNT_SIZE         8       
 #define BATCH_SIZE          (1 << 16)
@@ -44,6 +45,25 @@ typedef struct {
     uint32_t write_set_count;
     uint32_t reserved;
 } CheckpointHeader;
+
+// Struct for checkpoint data to be passed to the worker thread
+typedef struct {
+    CheckpointHeader header;
+    int64_t* state_snapshot; // A copy of the relevant state part
+    WriteSetEntry* write_set_snapshot; // A copy of the write set
+    uint32_t write_set_count_snapshot;
+} AsyncCheckpointData;
+
+// Global variables for asynchronous checkpointing
+pthread_t checkpoint_thread_id;
+pthread_mutex_t g_checkpoint_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t g_cond_slot_empty = PTHREAD_COND_INITIALIZER;  // Main waits on this if slot is full
+pthread_cond_t g_cond_slot_full = PTHREAD_COND_INITIALIZER;   // Worker waits on this if slot is empty
+AsyncCheckpointData g_checkpoint_slot; // The single shared slot
+int g_slot_is_full = 0; // 0 = empty, 1 = full
+int g_terminate_checkpoint_thread = 0;
+int g_log_fd; // Global log file descriptor, to be used by worker thread
+int g_async_error_occurred = 0; // Flag for async errors
 
 // Add recovery functions from state_management.c
 void write_state_to_file(const char *filename, int64_t *state, size_t count) {
@@ -242,6 +262,94 @@ static int compare_doubles(const void *a, const void *b) {
     return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
 }
 
+// Checkpoint worker thread function
+void* checkpoint_thread_function(void* arg) {
+    (void)arg; // Unused
+
+    while (1) {
+        AsyncCheckpointData local_copy_data; 
+        int io_error = 0;
+
+        pthread_mutex_lock(&g_checkpoint_mutex);
+        while (!g_slot_is_full && !g_terminate_checkpoint_thread) {
+            pthread_cond_wait(&g_cond_slot_full, &g_checkpoint_mutex);
+        }
+
+        if (g_terminate_checkpoint_thread && !g_slot_is_full) {
+            pthread_mutex_unlock(&g_checkpoint_mutex);
+            break; // Terminate
+        }
+
+        // Copy data from global slot to local_copy_data
+        local_copy_data = g_checkpoint_slot; 
+
+        g_slot_is_full = 0; // Mark slot as empty
+        pthread_cond_signal(&g_cond_slot_empty); // Signal main thread that slot is empty
+        pthread_mutex_unlock(&g_checkpoint_mutex);
+
+        // --- Perform I/O (outside mutex) ---
+        ssize_t bytes_written;
+        
+        // 1. Write header
+        bytes_written = write(g_log_fd, &local_copy_data.header, sizeof(local_copy_data.header));
+        if (bytes_written != sizeof(local_copy_data.header)) {
+            perror("Async: Error writing header");
+            io_error = 1;
+        }
+
+        // 2. Write state chunk
+        if (!io_error) {
+            bytes_written = write(g_log_fd, local_copy_data.state_snapshot, STATE_CHUNK_SIZE);
+            if (bytes_written != STATE_CHUNK_SIZE) {
+                perror("Async: Error writing state chunk");
+                io_error = 1;
+            }
+        }
+        if(local_copy_data.state_snapshot) free(local_copy_data.state_snapshot);
+
+        // 3. Write write-set entries
+        if (!io_error && local_copy_data.write_set_count_snapshot > 0) {
+            size_t total_to_write = local_copy_data.write_set_count_snapshot * sizeof(WriteSetEntry);
+            ssize_t written_this_call = 0;
+            ssize_t rc;
+            char* write_set_ptr = (char*)local_copy_data.write_set_snapshot;
+            
+            while (written_this_call < total_to_write) {
+                rc = write(g_log_fd, write_set_ptr + written_this_call, total_to_write - written_this_call);
+                if (rc < 0) {
+                    perror("Async: Error writing write set entry");
+                    io_error = 1;
+                    break; 
+                }
+                written_this_call += rc;
+            }
+            if (!io_error && written_this_call != total_to_write) {
+                 fprintf(stderr, "Async: Partial write set write: %zd/%zu bytes\n", 
+                      written_this_call, total_to_write);
+                 io_error = 1;
+            }
+        }
+        if(local_copy_data.write_set_snapshot) free(local_copy_data.write_set_snapshot);
+        
+        if (!io_error) {
+            if (fsync(g_log_fd) != 0) {
+                perror("Async: Error fsyncing");
+                io_error = 1;
+            }
+        }
+        
+        if (io_error) {
+            fprintf(stderr, "Async checkpoint thread encountered an I/O error.\n");
+            pthread_mutex_lock(&g_checkpoint_mutex);
+            g_async_error_occurred = 1;
+            pthread_mutex_unlock(&g_checkpoint_mutex);
+            // Thread will continue to check termination condition
+        }
+        // --- End I/O ---
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) {
         char *endptr;
@@ -282,12 +390,24 @@ int main(int argc, char **argv) {
     double total_processing_time = 0;
     uint64_t start_total = get_time_ms();
 
+    // Assign fd to global log_fd for the worker thread
+    g_log_fd = fd;
+
+    // Create and start the checkpoint worker thread
+    if (pthread_create(&checkpoint_thread_id, NULL, checkpoint_thread_function, NULL) != 0) {
+        perror("Failed to create checkpoint thread");
+        close(fd);
+        free(state);
+        free(batch_times);
+        exit(EXIT_FAILURE);
+    }
+
     // Open transactions.bin once before the loop
     FILE *tx_fp = fopen("transactions.bin", "rb");
     if (!tx_fp) {
         fprintf(stderr, "Failed to open transactions file\n");
         free(state);
-        if (batch_times) free(batch_times); // Ensure batch_times is freed if allocated
+        if (batch_times) free(batch_times);
         exit(EXIT_FAILURE);
     }
 
@@ -317,7 +437,7 @@ int main(int argc, char **argv) {
         Transaction tx_batch[BATCH_SIZE];
         if (fseek(tx_fp, batch * BATCH_SIZE * sizeof(Transaction), SEEK_SET) != 0) {
             fprintf(stderr, "Error seeking in transactions file for batch %u\n", batch);
-            fclose(tx_fp); // Close the file before exiting
+            fclose(tx_fp);
             free(state);
             free(batch_times);
             exit(EXIT_FAILURE);
@@ -326,7 +446,7 @@ int main(int argc, char **argv) {
         if (read_count != BATCH_SIZE) {
             fprintf(stderr, "Error reading batch %u: expected %d, got %zu\n",
                     batch, BATCH_SIZE, read_count);
-            fclose(tx_fp); // Close the main file pointer
+            fclose(tx_fp);
             free(state);
             free(batch_times);
             exit(EXIT_FAILURE);
@@ -337,50 +457,73 @@ int main(int argc, char **argv) {
             apply_transaction(&tx_batch[i], state, &write_set, &ws_count, &ws_capacity);
         }
 
-        // Persist checkpoint
+        // Persist checkpoint (asynchronously)
         CheckpointHeader header = {
             .batch_num = batch,
             .state_chunk_count = ACCOUNTS_PER_STATE_CHUNK,
             .write_set_count = ws_count
         };
         
-        // Write to log (sequential append style)
-        // 1. Write header
-        ssize_t bytes_written;
-        bytes_written = write(fd, &header, sizeof(header));
-        if (bytes_written != sizeof(header)) {
-            perror("Error writing header");
+        // Prepare data for the asynchronous checkpoint thread
+        AsyncCheckpointData data_for_slot;
+        data_for_slot.header = header; // struct copy
+        data_for_slot.write_set_count_snapshot = ws_count;
+
+        data_for_slot.state_snapshot = malloc(STATE_CHUNK_SIZE);
+        if (!data_for_slot.state_snapshot) {
+            perror("Failed to malloc state_snapshot for async checkpoint");
+            pthread_mutex_lock(&g_checkpoint_mutex);
+            g_terminate_checkpoint_thread = 1;
+            pthread_cond_signal(&g_cond_slot_full);
+            pthread_mutex_unlock(&g_checkpoint_mutex);
+            pthread_join(checkpoint_thread_id, NULL);
+            close(fd); fclose(tx_fp); free(state); free(batch_times); free(write_set);
             exit(EXIT_FAILURE);
         }
-        // 2. Write state chunk
-        bytes_written = write(fd, state, STATE_CHUNK_SIZE);
-        if (bytes_written != STATE_CHUNK_SIZE) {
-            perror("Error writing state chunk");
-            exit(EXIT_FAILURE);
-        }
-        // 3. Write write-set entries
-        if (ws_count > 0) {  // Only write if we have entries
-            size_t total_to_write = ws_count * sizeof(WriteSetEntry);
-            ssize_t bytes_written = 0;
-            ssize_t rc;
-            
-            while (bytes_written < total_to_write) {
-                rc = write(fd, (char*)write_set + bytes_written, total_to_write - bytes_written);
-                if (rc < 0) {
-                    perror("Error writing write set");
-                    exit(EXIT_FAILURE);
-                }
-                bytes_written += rc;
-            }
-            
-            if (bytes_written != total_to_write) {
-                fprintf(stderr, "Partial write set write: %zd/%zu bytes\n", 
-                      bytes_written, total_to_write);
+        memcpy(data_for_slot.state_snapshot, state, STATE_CHUNK_SIZE);
+
+        if (ws_count > 0) {
+            data_for_slot.write_set_snapshot = malloc(ws_count * sizeof(WriteSetEntry));
+            if (!data_for_slot.write_set_snapshot) {
+                perror("Failed to malloc write_set_snapshot for async checkpoint");
+                free(data_for_slot.state_snapshot);
+                pthread_mutex_lock(&g_checkpoint_mutex);
+                g_terminate_checkpoint_thread = 1;
+                pthread_cond_signal(&g_cond_slot_full);
+                pthread_mutex_unlock(&g_checkpoint_mutex);
+                pthread_join(checkpoint_thread_id, NULL);
+                close(fd); fclose(tx_fp); free(state); free(batch_times); free(write_set);
                 exit(EXIT_FAILURE);
             }
+            memcpy(data_for_slot.write_set_snapshot, write_set, ws_count * sizeof(WriteSetEntry));
+        } else {
+            data_for_slot.write_set_snapshot = NULL;
+        }
+
+        pthread_mutex_lock(&g_checkpoint_mutex);
+        while (g_slot_is_full && !g_terminate_checkpoint_thread) {
+            if (g_async_error_occurred) break;
+            pthread_cond_wait(&g_cond_slot_empty, &g_checkpoint_mutex);
         }
         
-        fsync(fd);
+        if (g_async_error_occurred) {
+            pthread_mutex_unlock(&g_checkpoint_mutex);
+            fprintf(stderr, "Main thread: Detected async error. Aborting batch processing.\n");
+            free(data_for_slot.state_snapshot);
+            if(data_for_slot.write_set_snapshot) free(data_for_slot.write_set_snapshot);
+            break; 
+        }
+
+        if (!g_terminate_checkpoint_thread) {
+            g_checkpoint_slot = data_for_slot;
+            g_slot_is_full = 1;
+            pthread_cond_signal(&g_cond_slot_full);
+        } else {
+            free(data_for_slot.state_snapshot);
+            if(data_for_slot.write_set_snapshot) free(data_for_slot.write_set_snapshot);
+        }
+        pthread_mutex_unlock(&g_checkpoint_mutex);
+        
         free(write_set);
         
         double batch_end = get_time_ms();
@@ -391,6 +534,27 @@ int main(int argc, char **argv) {
         printf("[Batch %04u] Processed in %6.2f ms | Write ops: %-6u | Throughput: %6.2f Ktx/s\n",
                batch, duration, ws_count,
                (BATCH_SIZE/1000.0) / (duration/1000.0));
+    }
+
+    // Wait for the last checkpoint to be processed and terminate worker thread
+    pthread_mutex_lock(&g_checkpoint_mutex);
+    while (g_slot_is_full && !g_async_error_occurred) {
+        pthread_cond_wait(&g_cond_slot_empty, &g_checkpoint_mutex);
+    }
+    g_terminate_checkpoint_thread = 1;
+    pthread_cond_signal(&g_cond_slot_full);
+    pthread_cond_signal(&g_cond_slot_empty);
+    pthread_mutex_unlock(&g_checkpoint_mutex);
+
+    pthread_join(checkpoint_thread_id, NULL);
+
+    if (g_async_error_occurred) {
+        fprintf(stderr, "Main thread: Asynchronous checkpointing failed. Check logs.\n");
+        close(fd); 
+        if (tx_fp) fclose(tx_fp);
+        free(state);
+        free(batch_times);
+        exit(EXIT_FAILURE);
     }
 
     // Calculate performance statistics
@@ -426,7 +590,7 @@ int main(int argc, char **argv) {
     }
 
     close(fd);
-    fclose(tx_fp); // Close transactions.bin file
+    if (tx_fp) fclose(tx_fp);
     free(state);
     free(batch_times);
     return 0;
