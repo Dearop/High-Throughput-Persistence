@@ -128,18 +128,20 @@ static inline void apply_tx(const Transaction *__restrict tx,
             len = SMALL_ACCOUNT_COUNT - start;
         }
         
-        // Check if we have enough space in write-set
-        if (*ws_cnt + len > ws_cap) {
+        // For memset, we only need one write-set entry with a special encoding
+        if (*ws_cnt + 1 > ws_cap) {
             return;
         }
         
-        // Apply memset with bounds checking
+        // Apply memset
         for (uint64_t i = 0; i < len; ++i) {
-            if (*ws_cnt >= ws_cap) break;
             state[start + i] = (int64_t)tx->amount;
-            ws[*ws_cnt] = (WriteSetEntry){start + i, state[start + i]};
-            (*ws_cnt)++;
         }
+        
+        // Store the memset operation as a single write-set entry with special encoding
+        // Use the top 4 bits to indicate memset (1), and the remaining 60 bits for start address
+        ws[*ws_cnt] = (WriteSetEntry){(1ULL << 60) | start, (int64_t)tx->amount};
+        (*ws_cnt)++;
     }
 }
 
@@ -212,6 +214,11 @@ static void *commit_thread(void *arg)
         pthread_mutex_unlock(&mt);
     } 
     return NULL; 
+}
+
+static int compare_doubles(const void *a, const void *b) {
+    double diff = *(const double*)a - *(const double*)b;
+    return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
 }
 
 int main(void)
@@ -330,7 +337,7 @@ int main(void)
 
     // Performance summary
     if (tcnt) {
-        qsort(times, tcnt, sizeof(double), (__compar_fn_t)((int(*)(const void*,const void*))memcmp));
+        qsort(times, tcnt, sizeof(double), compare_doubles);
         double avg = 0;
         for (size_t i = 0; i < tcnt; i++) avg += times[i];
         avg /= tcnt;
