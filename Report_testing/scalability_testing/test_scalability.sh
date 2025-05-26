@@ -371,12 +371,12 @@ for i in "${!ACCOUNT_COUNTS[@]}"; do
 
     log_message "--- Iteration for ${current_account_label} (${current_account_count} accounts) ---"
     
-    cmd_log_optim="./log_optim_parameterized ACCOUNTS_ARG $((1<<16)) 50000 512 8 0" # ACCOUNTS_ARG is placeholder
+    cmd_log_optim="./log_optim_parameterized ACCOUNTS_ARG" # Only expects account count
     if ! run_test_pair "$current_account_count" "$current_account_label" "log_optim_parameterized" "$cmd_log_optim"; then
         log_message "Test pair failed for log_optim_parameterized with ${current_account_label}. See logs."
     fi
 
-    cmd_state_mgmt="./state_management_parameterized ACCOUNTS_ARG 50000 $((1<<16)) 512 8 16" # ACCOUNTS_ARG is placeholder
+    cmd_state_mgmt="./state_management_parameterized ACCOUNTS_ARG" # Only expects account count (no saveref)
     if ! run_test_pair "$current_account_count" "$current_account_label" "state_management_parameterized" "$cmd_state_mgmt"; then
         log_message "Test pair failed for state_management_parameterized with ${current_account_label}. See logs."
     fi
