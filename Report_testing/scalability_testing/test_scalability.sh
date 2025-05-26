@@ -348,22 +348,22 @@ for i in "${!ACCOUNT_COUNTS[@]}"; do
     cleanup_files
     
     # Generate transactions once for this account count
-    local required_disk=$(estimate_requirements $current_account_count)
+    required_disk=$(estimate_requirements $current_account_count)
     if ! check_disk_space "$required_disk"; then
         log_message "Skipping all tests for ${current_account_count} accounts due to insufficient disk space."
         continue
     fi
 
     log_message "Generating transactions for ${current_account_count} accounts with ${MEMSET_PERCENTAGE}% memset..."
-    local gen_log_file="${OUTPUT_DIR}/generation_${current_account_label}_${TIMESTAMP}.log"
-    local gen_start=$(date +%s.%N)
+    gen_log_file="${OUTPUT_DIR}/generation_${current_account_label}_${TIMESTAMP}.log"
+    gen_start=$(date +%s.%N)
     if ! "${BASE_DIR}/generate_transactions" "$MEMSET_PERCENTAGE" "$current_account_count" > "$gen_log_file" 2>&1; then
         log_message "ERROR: Transaction generation failed for ${current_account_count} accounts. Check $gen_log_file"
         continue
     fi
-    local gen_end=$(date +%s.%N)
-    local gen_duration=$(echo "$gen_end - $gen_start" | bc -l)
-    local tx_file_size=$(stat -c%s "${BASE_DIR}/transactions.bin" 2>/dev/null || stat -f%z "${BASE_DIR}/transactions.bin" 2>/dev/null || echo "0")
+    gen_end=$(date +%s.%N)
+    gen_duration=$(echo "$gen_end - $gen_start" | bc -l)
+    tx_file_size=$(stat -c%s "${BASE_DIR}/transactions.bin" 2>/dev/null || stat -f%z "${BASE_DIR}/transactions.bin" 2>/dev/null || echo "0")
     log_message "Transaction file generated: ${gen_duration}s, size: $(format_bytes $tx_file_size)"
     
     # Now run both programs using the same transaction file
