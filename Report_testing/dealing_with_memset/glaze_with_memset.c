@@ -12,7 +12,7 @@
 #define ACCOUNT_SIZE         8       
 #define BATCH_SIZE          (1 << 16)
 #define NUMBER_OF_BATCHES   5000
-uint64_t SMALL_ACCOUNT_COUNT = 2000000UL; // Made into a variable
+uint64_t SMALL_ACCOUNT_COUNT = 5000000UL; // Made into a variable
 #define STATE_CHUNK_SIZE    (512 * 1024)  // 512KB state chunks
 #define TARGET_CHUNK_DATA_BYTES   (STATE_CHUNK_SIZE / sizeof(int64_t))
 #define ACCOUNTS_PER_STATE_CHUNK (TARGET_CHUNK_DATA_BYTES / ACCOUNT_SIZE)
@@ -282,6 +282,15 @@ int main(int argc, char **argv) {
     double total_processing_time = 0;
     uint64_t start_total = get_time_ms();
 
+    // Open transactions.bin once before the loop
+    FILE *tx_fp = fopen("transactions.bin", "rb");
+    if (!tx_fp) {
+        fprintf(stderr, "Failed to open transactions file\n");
+        free(state);
+        if (batch_times) free(batch_times); // Ensure batch_times is freed if allocated
+        exit(EXIT_FAILURE);
+    }
+
     // Enhanced recovery reporting
     if (recovered_batch != UINT32_MAX) {
         printf("=== Recovery Details ===\n");
@@ -306,19 +315,22 @@ int main(int argc, char **argv) {
 
         // Read batch
         Transaction tx_batch[BATCH_SIZE];
-        FILE *fp = fopen("transactions.bin", "rb");
-        if (!fp) {
-            fprintf(stderr, "Failed to open transactions file\n");
+        if (fseek(tx_fp, batch * BATCH_SIZE * sizeof(Transaction), SEEK_SET) != 0) {
+            fprintf(stderr, "Error seeking in transactions file for batch %u\n", batch);
+            fclose(tx_fp); // Close the file before exiting
+            free(state);
+            free(batch_times);
             exit(EXIT_FAILURE);
         }
-        fseek(fp, batch * BATCH_SIZE * sizeof(Transaction), SEEK_SET);
-        size_t read_count = fread(tx_batch, sizeof(Transaction), BATCH_SIZE, fp);
+        size_t read_count = fread(tx_batch, sizeof(Transaction), BATCH_SIZE, tx_fp);
         if (read_count != BATCH_SIZE) {
             fprintf(stderr, "Error reading batch %u: expected %d, got %zu\n",
                     batch, BATCH_SIZE, read_count);
+            fclose(tx_fp); // Close the main file pointer
+            free(state);
+            free(batch_times);
             exit(EXIT_FAILURE);
         }
-        fclose(fp);
 
         // Process transactions
         for (int i = 0; i < BATCH_SIZE; i++) {
@@ -414,6 +426,7 @@ int main(int argc, char **argv) {
     }
 
     close(fd);
+    fclose(tx_fp); // Close transactions.bin file
     free(state);
     free(batch_times);
     return 0;
