@@ -299,7 +299,7 @@ int main(int argc, char **argv) {
         printf("========================\n\n");
     }
 
-    for (uint32_t batch = (recovered_batch == UINT32_MAX) ? 0 : recovered_batch+1; 
+    for (uint32_t batch = 0; 
          batch < NUMBER_OF_BATCHES; 
          batch++) {
         double batch_start = get_time_ms();
