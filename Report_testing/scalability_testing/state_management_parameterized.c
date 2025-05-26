@@ -863,7 +863,7 @@ int main(int argc, char **argv) {
 
     if (!meaningful_state_recovered) {
         printf("Initializing main state array with default balances as no prior state was recovered.\n");
-        for (uint64_t i = 0; i < SMALL_ACCOUNT_COUNT; i++) main_state_array[i] = 1000000; // Init only logical accounts
+        for (uint64_t i = 0; i < SMALL_ACCOUNT_COUNT; i++) main_state_array[i] = 10000000; // Init only logical accounts
         for (uint64_t i = SMALL_ACCOUNT_COUNT; i < PADDED_ACCOUNT_COUNT; i++) main_state_array[i] = 0; // Zero out padding
     } else {
         if (verify_recovered_state_hash(main_state_array, SMALL_ACCOUNT_COUNT, recovered_batch) != 0) {

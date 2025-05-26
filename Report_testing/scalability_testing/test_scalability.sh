@@ -197,7 +197,7 @@ run_test_pair() {
         
         local recovery_time_ms="N/A"
         if [ -f "$recovery_run_log" ]; then 
-            recovery_time_ms=$(grep -o "Recovery phase took [0-9.]* ms" "$recovery_run_log" | grep -o "[0-9.]*" || echo "N/A")
+            recovery_time_ms=$(grep -o "Recovery phase \(took\|completed in\) [0-9.]* ms" "$recovery_run_log" | grep -o "[0-9.]*" || echo "N/A")
             if [[ "$recovery_time_ms" == "N/A" ]]; then
                  log_message "WARNING: Could not extract recovery time for ${system_name} (Recovery Run) from $recovery_run_log. It might have been skipped or failed early."
             else

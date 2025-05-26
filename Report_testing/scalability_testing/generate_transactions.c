@@ -124,7 +124,7 @@ int main(int argc, char *argv[]) {
                     uint64_t count = ((uint64_t)rand_r(&thread_seed) % max_len) + 1;
                     current_tx.sender = ENCODE_OP(1, start);
                     current_tx.receiver = ENCODE_OP(1, count);
-                    current_tx.amount = (uint64_t)rand_r(&thread_seed) % 1000; // Value for memset
+                    current_tx.amount = (uint64_t)rand_r(&thread_seed) % 100; // Reduced from 1000 to 100 for memset values
                     thread_memset_count++;
 
                 } else { // P2P Transfer
@@ -132,7 +132,7 @@ int main(int argc, char *argv[]) {
                     uint64_t receiver_index = (uint64_t)rand_r(&thread_seed) % small_account_count_param;
                     current_tx.sender = ENCODE_OP(0, sender_index);
                     current_tx.receiver = ENCODE_OP(0, receiver_index);
-                    current_tx.amount = ((uint64_t)rand_r(&thread_seed) % 1000) + 1;
+                    current_tx.amount = ((uint64_t)rand_r(&thread_seed) % 100) + 1; // Reduced from 1000 to 100 to prevent insufficient funds
                     thread_transfer_count++;
                 }
                 thread_tx_buffer[tx_in_batch_idx] = current_tx;
