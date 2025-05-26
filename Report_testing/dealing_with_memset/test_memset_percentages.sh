@@ -234,7 +234,7 @@ main() {
     printf "Account Count: %'d\n" "$ACCOUNT_COUNT"
     printf "Output Directory: %s\n" "$OUTPUT_DIR"
     printf "Batch Size: %'d transactions\n" "65536"
-    printf "Total Batches: %'d\n" "50'000"
+    printf "Total Batches: %'d\n" "50000"
     printf "Test Range: 0%% to 100%% memset operations (5%% increments)\n"
     
     # Check if bc is available
