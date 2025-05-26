@@ -11,7 +11,7 @@
 
 #define ACCOUNT_SIZE         8       
 #define BATCH_SIZE          (1 << 16)
-#define NUMBER_OF_BATCHES   50
+#define NUMBER_OF_BATCHES   5000
 uint64_t SMALL_ACCOUNT_COUNT = 2000000UL; // Made into a variable
 #define STATE_CHUNK_SIZE    (512 * 1024)  // 512KB state chunks
 #define TARGET_CHUNK_DATA_BYTES   (STATE_CHUNK_SIZE / sizeof(int64_t))

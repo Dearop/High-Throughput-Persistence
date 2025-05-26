@@ -6,7 +6,7 @@
 
 // --- Definitions ---
 #define BATCH_SIZE          (1ULL << 16)
-#define NUMBER_OF_BATCHES   50
+#define NUMBER_OF_BATCHES   5000
 #define TOTAL_TRANSACTIONS  (BATCH_SIZE * NUMBER_OF_BATCHES)
 // #define SMALL_ACCOUNT_COUNT  10000000UL // Will be replaced by a command-line argument
 uint64_t small_account_count_param; // Global variable for number of accounts
