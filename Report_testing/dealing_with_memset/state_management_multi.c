@@ -18,8 +18,8 @@
 // --- Definitions and Constants ---
 
 #define BATCH_SIZE              (1ULL << 16)     // 65,536 transactions per batch
-#define SMALL_ACCOUNT_COUNT     500000000UL       // Target number of accounts
-#define ACCOUNT_SIZE            8              
+#define SMALL_ACCOUNT_COUNT     20000000UL       // Target number of accounts
+#define ACCOUNT_SIZE            8            
 
 // State Chunk configuration
 #define TARGET_CHUNK_DATA_BYTES (512 * 1024)   // Needs tuning => trade-off between transaction processing and state recovery speed
