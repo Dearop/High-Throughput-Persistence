@@ -43,11 +43,14 @@ compile_programs() {
 
 # Function to clean up files
 cleanup_files() {
-    log_message "Cleaning up temporary files..."
+    log_message "Cleaning up temporary files (transactions.bin, checkpoint_log.dat, etc.)..."
     rm -f transactions.bin
     rm -f checkpoint_log.dat state_hash.dat reconstructed_state.txt
     rm -f state_management_output.txt
-    rm -f *.bin *.dat *.txt 2>/dev/null || true
+    # Remove any other .bin, .dat, .txt files that might be lingering from previous tests
+    # Be careful with broad rm commands; ensuring this is scoped to what's expected.
+    # For now, keeping it as is from previous version, assuming specific file names cover it.
+    # rm -f *.bin *.dat *.txt 2>/dev/null || true 
 }
 
 # Function to generate transactions
@@ -265,6 +268,11 @@ main() {
     # Compile programs
     print_section_header "Compiling Programs"
     compile_programs
+
+    # Initial cleanup before any tests start
+    print_section_header "Initial Workspace Cleanup"
+    cleanup_files
+    log_message "Initial cleanup complete."
     
     # Create CSV headers
     create_csv_header
