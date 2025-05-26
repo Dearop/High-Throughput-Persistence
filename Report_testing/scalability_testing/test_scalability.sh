@@ -73,9 +73,10 @@ compile_programs() {
 
 # Function to clean up files
 cleanup_files() {
-    log_message "Cleaning up temporary files: transactions.bin, checkpoint_log.dat, state_hash.dat, reconstructed_state.txt, state_management_output.txt"
+    log_message "Cleaning up temporary files: transactions.bin, checkpoint_log.dat, state_log.bin, state_snapshot.bin, state_hash.dat, reconstructed_state.txt, state_management_output.txt"
     rm -f "${BASE_DIR}/transactions.bin"
-    rm -f "${BASE_DIR}/checkpoint_log.dat" "${BASE_DIR}/state_hash.dat" "${BASE_DIR}/reconstructed_state.txt"
+    rm -f "${BASE_DIR}/checkpoint_log.dat" "${BASE_DIR}/state_log.bin" "${BASE_DIR}/state_snapshot.bin"
+    rm -f "${BASE_DIR}/state_hash.dat" "${BASE_DIR}/reconstructed_state.txt"
     rm -f "${BASE_DIR}/state_management_output.txt"
 }
 
