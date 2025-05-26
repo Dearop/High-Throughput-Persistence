@@ -21,10 +21,10 @@
 #define WRITE_BUFFER_SIZE     (1 << 20)          /* 1MB write buffer               */
 
 #define STATE_CHUNK_BYTES     (512 * 1024)        /* 512 KiB                          */
-#define ACC_PER_CHUNK         (STATE_CHUNK_BYTES / ACCOUNT_SIZE_BYTES)
+#define ACC_PER_CHUNK         (STATE_CHUNK_BYTES / sizeof(int64_t))
 #define NUM_CHUNKS            ((SMALL_ACCOUNT_COUNT + ACC_PER_CHUNK - 1) / ACC_PER_CHUNK)
 
-// Maximum write-set size with safety margin (4x batch size to handle worst case)
+// Reduce maximum write-set size to be more conservative
 #define MAX_WRITE_SET_SIZE    (BATCH_SIZE * 2)    // Maximum 2 entries per transaction
 #define MAX_WS_BYTES         (MAX_WRITE_SET_SIZE * sizeof(WriteSetEntry))
 
@@ -156,25 +156,23 @@ static inline void apply_tx(const Transaction *__restrict tx,
             return;
         }
         
+        // Limit memset length to available write-set space
+        if (len > ws_cap - *ws_cnt) {
+            len = ws_cap - *ws_cnt;
+        }
+        
         // Adjust length to not exceed account bounds
         if (start + len > SMALL_ACCOUNT_COUNT) {
             len = SMALL_ACCOUNT_COUNT - start;
         }
         
-        // For memset, we only need one write-set entry with a special encoding
-        if (*ws_cnt + 1 > ws_cap) {
-            return;
-        }
-        
-        // Apply memset
+        // Apply memset and record each change
         for (uint64_t i = 0; i < len; ++i) {
+            if (*ws_cnt >= ws_cap) break;
             state[start + i] = (int64_t)tx->amount;
+            ws[*ws_cnt] = (WriteSetEntry){start + i, state[start + i]};
+            (*ws_cnt)++;
         }
-        
-        // Store the memset operation as a single write-set entry with special encoding
-        // Use the top 4 bits to indicate memset (1), and the remaining 60 bits for start address
-        ws[*ws_cnt] = (WriteSetEntry){(1ULL << 60) | start, (int64_t)tx->amount};
-        (*ws_cnt)++;
     }
 }
 
@@ -267,6 +265,14 @@ static inline int resize_write_set(DynamicWriteSet *ws, uint32_t new_capacity) {
     ws->capacity = new_capacity;
     return 1;
 }
+
+// Add safety check macro
+#define CHECK_WS_SPACE(cnt, needed, cap) \
+    if ((cnt) + (needed) > (cap)) { \
+        fprintf(stderr, "Write-set space check failed: cnt=%u needed=%u cap=%u\n", \
+                (cnt), (needed), (cap)); \
+        return; \
+    }
 
 int main(void)
 {
@@ -368,8 +374,37 @@ int main(void)
         // Wait for previous commit and submit new task
         pthread_mutex_lock(&mt);
         while (ready) pthread_cond_wait(&cv_done, &mt);
+        
+        // Calculate slot with explicit wrap-around
         uint32_t slot = batch % NUM_CHUNKS;
-        task = (struct task_data){slot, batch, ws_cnt, state + slot * ACC_PER_CHUNK, ws, map};
+        
+        // Debug output for slot calculation
+        fprintf(stderr, "Batch %u using slot %u (NUM_CHUNKS=%lu)\n", 
+                batch, slot, (unsigned long)NUM_CHUNKS);
+        
+        // Ensure we don't exceed chunk bounds
+        if (slot >= NUM_CHUNKS) {
+            fprintf(stderr, "Error: Slot index %u exceeds NUM_CHUNKS %lu\n", 
+                    slot, (unsigned long)NUM_CHUNKS);
+            break;
+        }
+        
+        // Calculate state source pointer with bounds check
+        const int64_t *state_src = state + slot * ACC_PER_CHUNK;
+        if (state_src + ACC_PER_CHUNK > state + SMALL_ACCOUNT_COUNT) {
+            fprintf(stderr, "Error: State source would exceed bounds\n");
+            break;
+        }
+        
+        task = (struct task_data){
+            .slot = slot,
+            .batch = batch,
+            .ws_cnt = ws_cnt,
+            .state_src = state_src,
+            .ws = ws,
+            .map = map
+        };
+        
         ready = 1;
         pthread_cond_signal(&cv_new);
         pthread_mutex_unlock(&mt);
