@@ -165,8 +165,7 @@ run_test_pair() {
         local end_time_run1=$(date +%s.%N)
         local duration_run1=$(echo "$end_time_run1 - $start_time_run1" | bc -l)
         log_message "${system_name} (Initial Run) completed in ${duration_run1} seconds."
-        extract_scalability_metrics "$initial_run_log" "$system_name" "$account_count" "$account_label" \\
-                                    "initial" "$duration_run1" "$gen_duration" "$tx_file_size" "0" # recovery_time_ms = 0
+        extract_scalability_metrics "$initial_run_log" "$system_name" "$account_count" "$account_label" "initial" "$duration_run1" "$gen_duration" "$tx_file_size" "0" # recovery_time_ms = 0
         initial_run_succeeded=true
     else
         log_message "ERROR: ${system_name} (Initial Run) failed. Check $initial_run_log"
@@ -208,8 +207,7 @@ run_test_pair() {
             log_message "WARNING: Log file $recovery_run_log not found for recovery run metrics extraction."
         fi
 
-        extract_scalability_metrics "$recovery_run_log" "$system_name" "$account_count" "$account_label" \\
-                                    "recovery" "$duration_run2" "$gen_duration" "$tx_file_size" "$recovery_time_ms"
+        extract_scalability_metrics "$recovery_run_log" "$system_name" "$account_count" "$account_label" "recovery" "$duration_run2" "$gen_duration" "$tx_file_size" "$recovery_time_ms"
     else
         log_message "Skipping Recovery Run for ${system_name} - ${account_label} due to Initial Run failure."
     fi
