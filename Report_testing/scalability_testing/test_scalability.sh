@@ -118,40 +118,18 @@ estimate_requirements() {
     echo "$total_disk_gb"
 }
 
-# Function to run a single test pair (initial and recovery)
-run_test_pair() {
+# Function to run a single test pair (initial and recovery) without transaction generation
+run_test_pair_no_gen() {
     local account_count=$1
     local account_label=$2
     local system_name=$3
     local command_template=$4
+    local gen_duration=$5
+    local tx_file_size=$6
 
     log_message "=== Testing ${system_name} with ${account_count} accounts (${account_label}) - Initial & Recovery Runs ==="
     
-    # Ensure clean state before this pair of runs
-    cleanup_files
-
     local base_log_name_stem="${BASE_DIR}/${OUTPUT_DIR}/${system_name}_${account_label}_${TIMESTAMP}"
-
-    # 1. Check disk space and generate transactions (once for the pair)
-    local required_disk=$(estimate_requirements $account_count)
-    if ! check_disk_space "$required_disk"; then
-        log_message "Skipping ${system_name} test pair for ${account_count} accounts due to insufficient disk space."
-        return 1 
-    fi
-
-    log_message "Generating transactions for ${account_count} accounts with ${MEMSET_PERCENTAGE}% memset..."
-    local gen_log_file="${base_log_name_stem}_generation.log"
-    local gen_start=$(date +%s.%N)
-    if ! "${BASE_DIR}/generate_transactions" "$MEMSET_PERCENTAGE" "$account_count" > "$gen_log_file" 2>&1; then
-        log_message "ERROR: Transaction generation failed for ${account_count} accounts. Check $gen_log_file"
-        rm -f "${BASE_DIR}/transactions.bin" # Explicitly remove potentially corrupt tx file
-        return 1
-    fi
-    local gen_end=$(date +%s.%N)
-    local gen_duration=$(echo "$gen_end - $gen_start" | bc -l)
-    local tx_file_size=$(stat -c%s "${BASE_DIR}/transactions.bin" 2>/dev/null || stat -f%z "${BASE_DIR}/transactions.bin" 2>/dev/null || echo "0")
-    log_message "Transaction file generated: ${gen_duration}s, size: $(format_bytes $tx_file_size)"
-
     local command_to_run=${command_template//ACCOUNTS_ARG/$account_count}
     local initial_run_succeeded=false
 
@@ -169,14 +147,12 @@ run_test_pair() {
         initial_run_succeeded=true
     else
         log_message "ERROR: ${system_name} (Initial Run) failed. Check $initial_run_log"
-        # Fall through to cleanup_files at the end. Do not proceed to recovery run.
     fi
 
     # --- Run 2: Recovery Run ---
     if $initial_run_succeeded; then
         log_message "--- ${system_name} - ${account_label} - Recovery Run ---"
         local recovery_run_log="${base_log_name_stem}_recovery_run.log"
-        # Command is the same, relies on checkpoint_log.dat from Run 1
 
         log_message "Executing Recovery Run: $command_to_run"
         local start_time_run2=$(date +%s.%N)
@@ -211,9 +187,6 @@ run_test_pair() {
     else
         log_message "Skipping Recovery Run for ${system_name} - ${account_label} due to Initial Run failure."
     fi
-    
-    # Final cleanup for this pair
-    cleanup_files 
     
     if ! $initial_run_succeeded; then
       return 1 # Indicate failure of the pair if initial run didn't succeed
@@ -371,15 +344,41 @@ for i in "${!ACCOUNT_COUNTS[@]}"; do
 
     log_message "--- Iteration for ${current_account_label} (${current_account_count} accounts) ---"
     
+    # Clean up any existing files before starting this account count iteration
+    cleanup_files
+    
+    # Generate transactions once for this account count
+    local required_disk=$(estimate_requirements $current_account_count)
+    if ! check_disk_space "$required_disk"; then
+        log_message "Skipping all tests for ${current_account_count} accounts due to insufficient disk space."
+        continue
+    fi
+
+    log_message "Generating transactions for ${current_account_count} accounts with ${MEMSET_PERCENTAGE}% memset..."
+    local gen_log_file="${OUTPUT_DIR}/generation_${current_account_label}_${TIMESTAMP}.log"
+    local gen_start=$(date +%s.%N)
+    if ! "${BASE_DIR}/generate_transactions" "$MEMSET_PERCENTAGE" "$current_account_count" > "$gen_log_file" 2>&1; then
+        log_message "ERROR: Transaction generation failed for ${current_account_count} accounts. Check $gen_log_file"
+        continue
+    fi
+    local gen_end=$(date +%s.%N)
+    local gen_duration=$(echo "$gen_end - $gen_start" | bc -l)
+    local tx_file_size=$(stat -c%s "${BASE_DIR}/transactions.bin" 2>/dev/null || stat -f%z "${BASE_DIR}/transactions.bin" 2>/dev/null || echo "0")
+    log_message "Transaction file generated: ${gen_duration}s, size: $(format_bytes $tx_file_size)"
+    
+    # Now run both programs using the same transaction file
     cmd_log_optim="./log_optim_parameterized ACCOUNTS_ARG" # Only expects account count
-    if ! run_test_pair "$current_account_count" "$current_account_label" "log_optim_parameterized" "$cmd_log_optim"; then
+    if ! run_test_pair_no_gen "$current_account_count" "$current_account_label" "log_optim_parameterized" "$cmd_log_optim" "$gen_duration" "$tx_file_size"; then
         log_message "Test pair failed for log_optim_parameterized with ${current_account_label}. See logs."
     fi
 
     cmd_state_mgmt="./state_management_parameterized ACCOUNTS_ARG" # Only expects account count (no saveref)
-    if ! run_test_pair "$current_account_count" "$current_account_label" "state_management_parameterized" "$cmd_state_mgmt"; then
+    if ! run_test_pair_no_gen "$current_account_count" "$current_account_label" "state_management_parameterized" "$cmd_state_mgmt" "$gen_duration" "$tx_file_size"; then
         log_message "Test pair failed for state_management_parameterized with ${current_account_label}. See logs."
     fi
+    
+    # Clean up after both programs have run
+    cleanup_files
 
 done
 
