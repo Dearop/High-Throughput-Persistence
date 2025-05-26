@@ -158,19 +158,18 @@ static inline void apply_tx(const Transaction *__restrict tx,
             return;
         }
         
-        // Limit memset length to available write-set space
-        if (len > ws_cap - *ws_cnt) {
-            len = ws_cap - *ws_cnt;
-        }
-        
-        // Adjust length to not exceed account bounds
+        // Ensure we don't exceed account bounds
         if (start + len > SMALL_ACCOUNT_COUNT) {
             len = SMALL_ACCOUNT_COUNT - start;
         }
         
-        // Apply memset and record each change
-        for (uint64_t i = 0; i < len; ++i) {
-            if (*ws_cnt >= ws_cap) break;
+        // Each address needs its own write-set entry
+        if (*ws_cnt + len > ws_cap) {
+            len = ws_cap - *ws_cnt;  // Limit to available space
+        }
+        
+        // Apply memset one address at a time
+        for (uint64_t i = 0; i < len; i++) {
             state[start + i] = (int64_t)tx->amount;
             ws[*ws_cnt] = (WriteSetEntry){start + i, state[start + i]};
             (*ws_cnt)++;
@@ -202,12 +201,6 @@ static void *commit_thread(void *arg)
         struct task_data t = task; 
         ready = 0; 
         pthread_mutex_unlock(&mt);
-        
-        // Debug output for task data
-        fprintf(stderr, "Commit thread received task:\n");
-        fprintf(stderr, "  slot=%u batch=%u ws_cnt=%u\n", t.slot, t.batch, t.ws_cnt);
-        fprintf(stderr, "  state_src=%p ws=%p map=%p\n", 
-                (void*)t.state_src, (void*)t.ws, t.map);
         
         // Validate task data
         if (!t.map || !t.state_src || !t.ws || t.ws_cnt > MAX_WRITE_SET_SIZE) {
