@@ -73,7 +73,7 @@ compile_programs() {
 
 # Function to clean up files
 cleanup_files() {
-    log_message "Cleaning up temporary files..."
+    log_message "Cleaning up temporary files: transactions.bin, checkpoint_log.dat, state_hash.dat, reconstructed_state.txt, state_management_output.txt"
     rm -f "${BASE_DIR}/transactions.bin"
     rm -f "${BASE_DIR}/checkpoint_log.dat" "${BASE_DIR}/state_hash.dat" "${BASE_DIR}/reconstructed_state.txt"
     rm -f "${BASE_DIR}/state_management_output.txt"
@@ -118,58 +118,108 @@ estimate_requirements() {
     echo "$total_disk_gb"
 }
 
-# Function to run a single test
-run_scalability_test() {
+# Function to run a single test pair (initial and recovery)
+run_test_pair() {
     local account_count=$1
     local account_label=$2
     local system_name=$3
     local command_template=$4
 
-    local command=${command_template//ACCOUNTS_ARG/$account_count}
+    log_message "=== Testing ${system_name} with ${account_count} accounts (${account_label}) - Initial & Recovery Runs ==="
     
-    log_message "=== Testing ${system_name} with ${account_count} accounts (${account_label}) ==="
-    
+    # Ensure clean state before this pair of runs
+    cleanup_files
+
+    local base_log_name_stem="${BASE_DIR}/${OUTPUT_DIR}/${system_name}_${account_label}_${TIMESTAMP}"
+
+    # 1. Check disk space and generate transactions (once for the pair)
     local required_disk=$(estimate_requirements $account_count)
     if ! check_disk_space "$required_disk"; then
-        log_message "Skipping ${system_name} test for ${account_count} accounts due to insufficient disk space"
+        log_message "Skipping ${system_name} test pair for ${account_count} accounts due to insufficient disk space."
         return 1 
     fi
-    
+
     log_message "Generating transactions for ${account_count} accounts with ${MEMSET_PERCENTAGE}% memset..."
-    log_message "Executing: ${BASE_DIR}/generate_transactions \"$MEMSET_PERCENTAGE\" \"$account_count\""
+    local gen_log_file="${base_log_name_stem}_generation.log"
     local gen_start=$(date +%s.%N)
-    
-    if ! "${BASE_DIR}/generate_transactions" "$MEMSET_PERCENTAGE" "$account_count" > "${BASE_DIR}/${OUTPUT_DIR}/generation_${system_name}_${account_label}_${TIMESTAMP}.log" 2>&1; then
-        log_message "ERROR: Transaction generation failed for ${account_count} accounts. Check ${BASE_DIR}/${OUTPUT_DIR}/generation_${system_name}_${account_label}_${TIMESTAMP}.log"
+    if ! "${BASE_DIR}/generate_transactions" "$MEMSET_PERCENTAGE" "$account_count" > "$gen_log_file" 2>&1; then
+        log_message "ERROR: Transaction generation failed for ${account_count} accounts. Check $gen_log_file"
+        rm -f "${BASE_DIR}/transactions.bin" # Explicitly remove potentially corrupt tx file
         return 1
     fi
-    
     local gen_end=$(date +%s.%N)
     local gen_duration=$(echo "$gen_end - $gen_start" | bc -l)
-    
-    if [ ! -f "${BASE_DIR}/transactions.bin" ]; then
-        log_message "ERROR: transactions.bin not created at ${BASE_DIR}/transactions.bin for ${account_count} accounts"
-        return 1
-    fi
-    
     local tx_file_size=$(stat -c%s "${BASE_DIR}/transactions.bin" 2>/dev/null || stat -f%z "${BASE_DIR}/transactions.bin" 2>/dev/null || echo "0")
-    log_message "Transaction file generated in ${gen_duration}s, size: $(format_bytes $tx_file_size)"
+    log_message "Transaction file generated: ${gen_duration}s, size: $(format_bytes $tx_file_size)"
+
+    local command_to_run=${command_template//ACCOUNTS_ARG/$account_count}
+    local initial_run_succeeded=false
+
+    # --- Run 1: Initial Run ---
+    log_message "--- ${system_name} - ${account_label} - Initial Run ---"
+    local initial_run_log="${base_log_name_stem}_initial_run.log"
     
-    log_message "Running ${system_name} with ${account_count} accounts... Command: $command"
-    local start_time=$(date +%s.%N)
-    
-    if eval "${command}" > "${BASE_DIR}/${OUTPUT_DIR}/${system_name}_${account_label}_${TIMESTAMP}.log" 2>&1; then
-        local end_time=$(date +%s.%N)
-        local duration=$(echo "$end_time - $start_time" | bc -l)
-        log_message "${system_name} completed successfully in ${duration} seconds"
-        
-        extract_scalability_metrics "${BASE_DIR}/${OUTPUT_DIR}/${system_name}_${account_label}_${TIMESTAMP}.log" "$system_name" "$account_count" "$account_label" "$duration" "$gen_duration" "$tx_file_size"
+    log_message "Executing Initial Run: $command_to_run"
+    local start_time_run1=$(date +%s.%N)
+    if eval "${command_to_run}" > "$initial_run_log" 2>&1; then
+        local end_time_run1=$(date +%s.%N)
+        local duration_run1=$(echo "$end_time_run1 - $start_time_run1" | bc -l)
+        log_message "${system_name} (Initial Run) completed in ${duration_run1} seconds."
+        extract_scalability_metrics "$initial_run_log" "$system_name" "$account_count" "$account_label" \\
+                                    "initial" "$duration_run1" "$gen_duration" "$tx_file_size" "0" # recovery_time_ms = 0
+        initial_run_succeeded=true
     else
-        log_message "ERROR: ${system_name} failed for ${account_count} accounts. Check ${BASE_DIR}/${OUTPUT_DIR}/${system_name}_${account_label}_${TIMESTAMP}.log"
-        return 1
+        log_message "ERROR: ${system_name} (Initial Run) failed. Check $initial_run_log"
+        # Fall through to cleanup_files at the end. Do not proceed to recovery run.
+    fi
+
+    # --- Run 2: Recovery Run ---
+    if $initial_run_succeeded; then
+        log_message "--- ${system_name} - ${account_label} - Recovery Run ---"
+        local recovery_run_log="${base_log_name_stem}_recovery_run.log"
+        # Command is the same, relies on checkpoint_log.dat from Run 1
+
+        log_message "Executing Recovery Run: $command_to_run"
+        local start_time_run2=$(date +%s.%N)
+        local recovery_run_completed_ok=true
+        if ! eval "${command_to_run}" > "$recovery_run_log" 2>&1; then
+            log_message "ERROR: ${system_name} (Recovery Run) failed. Check $recovery_run_log"
+            recovery_run_completed_ok=false
+        fi
+        
+        local end_time_run2=$(date +%s.%N) 
+        local duration_run2=$(echo "$end_time_run2 - $start_time_run2" | bc -l)
+
+        if $recovery_run_completed_ok; then
+            log_message "${system_name} (Recovery Run) completed in ${duration_run2} seconds."
+        else
+             log_message "${system_name} (Recovery Run) recorded duration ${duration_run2} seconds up to failure."
+        fi
+        
+        local recovery_time_ms="N/A"
+        if [ -f "$recovery_run_log" ]; then 
+            recovery_time_ms=$(grep -o "Recovery phase took [0-9.]* ms" "$recovery_run_log" | grep -o "[0-9.]*" || echo "N/A")
+            if [[ "$recovery_time_ms" == "N/A" ]]; then
+                 log_message "WARNING: Could not extract recovery time for ${system_name} (Recovery Run) from $recovery_run_log. It might have been skipped or failed early."
+            else
+                 log_message "  Extracted Recovery Time: ${recovery_time_ms} ms"
+            fi
+        else
+            log_message "WARNING: Log file $recovery_run_log not found for recovery run metrics extraction."
+        fi
+
+        extract_scalability_metrics "$recovery_run_log" "$system_name" "$account_count" "$account_label" \\
+                                    "recovery" "$duration_run2" "$gen_duration" "$tx_file_size" "$recovery_time_ms"
+    else
+        log_message "Skipping Recovery Run for ${system_name} - ${account_label} due to Initial Run failure."
     fi
     
-    cleanup_files
+    # Final cleanup for this pair
+    cleanup_files 
+    
+    if ! $initial_run_succeeded; then
+      return 1 # Indicate failure of the pair if initial run didn't succeed
+    fi
     return 0 
 }
 
@@ -179,31 +229,57 @@ extract_scalability_metrics() {
     local system_name=$2
     local account_count=$3
     local account_label=$4
-    local duration=$5
-    local gen_duration=$6
-    local tx_file_size=$7
+    local run_label=$5 # New: "initial" or "recovery"
+    local duration=$6
+    local gen_duration=$7
+    local tx_file_size=$8
+    local recovery_time_ms=$9 # New
     
-    local throughput=$(grep -o "Throughput: [0-9.]* tx/sec" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    if [[ "$throughput" == "N/A" ]]; then throughput=$(grep -i "transactions/sec:" "$log_file" | awk '{print $NF}' || echo "N/A"); fi 
-    if [[ "$throughput" == "N/A" ]]; then throughput=$(grep -i "Overall throughput:" "$log_file" | awk '{print $3}' || echo "N/A"); fi
+    local throughput="N/A"
+    local total_tx="N/A"
+    local avg_batch_time="N/A"
+    local median_time="N/A"
+    local p99_time="N/A"
+    local total_processing_time_ms="N/A"
 
-    local total_tx=$(grep -o "Total transactions: [0-9]*" "$log_file" | grep -o "[0-9]*" || echo "N/A")
-    local avg_batch_time=$(grep -o "Average batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local median_time=$(grep -o "Median batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local p99_time=$(grep -o "99th percentile batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    local total_processing_time_ms=$(grep -o "Total time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
-    if [[ "$total_processing_time_ms" == "N/A" ]]; then total_processing_time_ms=$(grep -i "Total processing time:" "$log_file" | awk '{print $4}' || echo "N/A"); fi
+    if [ -f "$log_file" ]; then
+        throughput=$(grep -o "Throughput: [0-9.]* tx/sec" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+        if [[ "$throughput" == "N/A" ]]; then throughput=$(grep -i "transactions/sec:" "$log_file" | awk '{print $NF}' || echo "N/A"); fi 
+        if [[ "$throughput" == "N/A" ]]; then throughput=$(grep -i "Overall throughput:" "$log_file" | awk '{print $3}' || echo "N/A"); fi
+        if [[ "$throughput" == "N/A" ]]; then throughput=$(grep -i "[STATS] Average throughput:" "$log_file" | awk '{print $4}' || echo "N/A"); fi # For log_optim
+
+        total_tx=$(grep -o "Total transactions: [0-9]*" "$log_file" | grep -o "[0-9]*" || echo "N/A")
+        if [[ "$total_tx" == "N/A" ]]; then total_tx=$(grep -i "Number of transactions processed:" "$log_file" | awk '{print $NF}' || echo "N/A"); fi # For log_optim
+
+        avg_batch_time=$(grep -o "Average batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+        if [[ "$avg_batch_time" == "N/A" ]]; then avg_batch_time=$(grep -o "[STATS] Average batch application time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A"); fi
+
+
+        median_time=$(grep -o "Median batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+        if [[ "$median_time" == "N/A" ]]; then median_time=$(grep -o "[STATS] Median batch application time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A"); fi
+
+        p99_time=$(grep -o "99th percentile batch time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+        if [[ "$p99_time" == "N/A" ]]; then p99_time=$(grep -o "[STATS] 99th percentile batch application time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A"); fi
+        
+        total_processing_time_ms=$(grep -o "Total time: [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A")
+        if [[ "$total_processing_time_ms" == "N/A" ]]; then total_processing_time_ms=$(grep -i "Total processing time:" "$log_file" | awk '{print $4}' || echo "N/A"); fi
+        if [[ "$total_processing_time_ms" == "N/A" ]]; then total_processing_time_ms=$(grep -o "Finished processing .* in [0-9.]* ms" "$log_file" | grep -o "[0-9.]*" || echo "N/A"); fi
+
+
+    else
+        log_message "WARNING: Log file $log_file not found for metrics extraction."
+    fi
     
     local state_size_mb=$(echo "scale=2; ($account_count * 8 / 1048576) + 0" | bc)
     
-    echo "${system_name},${account_count},${account_label},${duration},${gen_duration},${throughput},${total_tx},${avg_batch_time},${median_time},${p99_time},${total_processing_time_ms},${state_size_mb},${tx_file_size}" >> "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv"
+    echo "${system_name},${account_count},${account_label},${run_label},${duration},${gen_duration},${recovery_time_ms},${throughput},${total_tx},${avg_batch_time},${median_time},${p99_time},${total_processing_time_ms},${state_size_mb},${tx_file_size}" >> "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv"
     
-    log_message "  Metrics: Throughput=${throughput} tx/sec, AvgBatch=${avg_batch_time}ms, StateSize=${state_size_mb}MB, TotalProcessingTime=${total_processing_time_ms}ms"
+    log_message "  Metrics for ${run_label} run: RecoveryTime=${recovery_time_ms}ms, Throughput=${throughput} tx/sec, AvgBatch=${avg_batch_time}ms, StateSize=${state_size_mb}MB, TotalProcessingTime=${total_processing_time_ms}ms"
 }
 
 # Function to create CSV header
 create_csv_header() {
-    echo "System,Account_Count,Account_Label,Total_Test_Duration_Sec,Generation_Duration_Sec,Throughput_TxPerSec,Total_Transactions,Avg_Batch_Time_Ms,Median_Batch_Time_Ms,P99_Batch_Time_Ms,Total_Processing_Time_Ms,State_Size_MB,Transaction_File_Size_Bytes" > "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv"
+    echo "System,Account_Count,Account_Label,Run_Label,Total_Test_Duration_Sec,Generation_Duration_Sec,Recovery_Time_Ms,Throughput_TxPerSec,Total_Transactions,Avg_Batch_Time_Ms,Median_Batch_Time_Ms,P99_Batch_Time_Ms,Total_Processing_Time_Ms,State_Size_MB,Transaction_File_Size_Bytes" > "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv"
 }
 
 # Function to generate summary report
@@ -241,32 +317,39 @@ EOF
 
 The detailed results are available in: \`${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv\`
 
-### Performance vs Account Count
+### Performance vs Account Count (Initial Run Metrics & Recovery Times)
 
 EOF
 
     if [ -f "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" ]; then
-        echo "| Accounts | log_optim Throughput (tx/s) | state_mgmt Throughput (tx/s) | log_optim Avg Batch (ms) | state_mgmt Avg Batch (ms) | State Size (MB) |" >> "$summary_file"
-        echo "|----------|-----------------------------|------------------------------|--------------------------|---------------------------|-----------------|" >> "$summary_file"
+        echo "| Accounts | log_optim Thr. (Initial, tx/s) | log_optim Rec. Time (ms) | state_mgmt Thr. (Initial, tx/s) | state_mgmt Rec. Time (ms) | log_optim Avg Batch (Initial, ms) | state_mgmt Avg Batch (Initial, ms) | State Size (MB) |" >> "$summary_file"
+        echo "|----------|--------------------------------|--------------------------|---------------------------------|---------------------------|-----------------------------------|------------------------------------|-----------------|" >> "$summary_file"
         
         for i in "${!ACCOUNT_COUNTS[@]}"; do
             local count=${ACCOUNT_COUNTS[$i]}
             local label=${ACCOUNT_LABELS[$i]}
             
-            local log_throughput=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac {print $6}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
-            local state_throughput=$(awk -F, -v ac="$count" '$1 == "state_management_parameterized" && $2 == ac {print $6}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
-            local log_avg_batch=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac {print $8}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
-            local state_avg_batch=$(awk -F, -v ac="$count" '$1 == "state_management_parameterized" && $2 == ac {print $8}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
-            local state_size=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac {print $12}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A") 
+            local log_throughput=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac && $4 == "initial" {print $8}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
+            local log_recovery_ms=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac && $4 == "recovery" {print $7}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
             
-            echo "| $label | $log_throughput | $state_throughput | ${log_avg_batch} | ${state_avg_batch} | ${state_size} |" >> "$summary_file"
+            local state_throughput=$(awk -F, -v ac="$count" '$1 == "state_management_parameterized" && $2 == ac && $4 == "initial" {print $8}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
+            local state_recovery_ms=$(awk -F, -v ac="$count" '$1 == "state_management_parameterized" && $2 == ac && $4 == "recovery" {print $7}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
+
+            local log_avg_batch=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac && $4 == "initial" {print $10}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
+            local state_avg_batch=$(awk -F, -v ac="$count" '$1 == "state_management_parameterized" && $2 == ac && $4 == "initial" {print $10}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A")
+            
+            # State size can be picked from any relevant line, e.g., log_optim initial run
+            local state_size=$(awk -F, -v ac="$count" '$1 == "log_optim_parameterized" && $2 == ac && $4 == "initial" {print $14}' "${BASE_DIR}/${OUTPUT_DIR}/scalability_results_${TIMESTAMP}.csv" || echo "N/A") 
+            
+            echo "| $label | $log_throughput | $log_recovery_ms | $state_throughput | $state_recovery_ms | ${log_avg_batch} | ${state_avg_batch} | ${state_size} |" >> "$summary_file"
         done
     fi
 cat >> "$summary_file" << EOF
 
 ### Notes:
 - 'N/A' indicates data was not found or an error occurred during extraction.
-- Throughput is calculated based on the total processing time reported by the application.
+- Throughput and Avg Batch times are from the 'initial' run.
+- Recovery Time is from the 'recovery' run.
 EOF
 
     log_message "Scalability summary report generated: ${summary_file}"
@@ -290,14 +373,14 @@ for i in "${!ACCOUNT_COUNTS[@]}"; do
 
     log_message "--- Iteration for ${current_account_label} (${current_account_count} accounts) ---"
     
-    cmd_log_optim="./log_optim_parameterized ${current_account_count} $((1<<16)) 50000 512 8 0"
-    if ! run_scalability_test "$current_account_count" "$current_account_label" "log_optim_parameterized" "$cmd_log_optim"; then
-        log_message "Test run failed for log_optim_parameterized with ${current_account_label}. See logs."
+    cmd_log_optim="./log_optim_parameterized ACCOUNTS_ARG $((1<<16)) 50000 512 8 0" # ACCOUNTS_ARG is placeholder
+    if ! run_test_pair "$current_account_count" "$current_account_label" "log_optim_parameterized" "$cmd_log_optim"; then
+        log_message "Test pair failed for log_optim_parameterized with ${current_account_label}. See logs."
     fi
 
-    cmd_state_mgmt="./state_management_parameterized ${current_account_count} 50000 $((1<<16)) 512 8 16"
-    if ! run_scalability_test "$current_account_count" "$current_account_label" "state_management_parameterized" "$cmd_state_mgmt"; then
-        log_message "Test run failed for state_management_parameterized with ${current_account_label}. See logs."
+    cmd_state_mgmt="./state_management_parameterized ACCOUNTS_ARG 50000 $((1<<16)) 512 8 16" # ACCOUNTS_ARG is placeholder
+    if ! run_test_pair "$current_account_count" "$current_account_label" "state_management_parameterized" "$cmd_state_mgmt"; then
+        log_message "Test pair failed for state_management_parameterized with ${current_account_label}. See logs."
     fi
 
 done
