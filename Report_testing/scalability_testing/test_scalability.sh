@@ -13,8 +13,8 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${OUTPUT_DIR}/scalability_test_log_${TIMESTAMP}.txt"
 
 # Account count progression (in millions)
-ACCOUNT_COUNTS=(2000000 5000000 10000000 20000000 50000000 100000000)
-ACCOUNT_LABELS=("2M" "5M" "10M" "20M" "50M" "100M")
+ACCOUNT_COUNTS=(50000000 100000000)
+ACCOUNT_LABELS=("50M" "100M")
 
 # Base directory where script and C files are located
 BASE_DIR=$(pwd) # Assumes script is run from its location
