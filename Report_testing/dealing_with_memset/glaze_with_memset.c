@@ -16,7 +16,7 @@
 uint64_t SMALL_ACCOUNT_COUNT = 5000000UL; // Made into a variable
 #define STATE_CHUNK_SIZE    (512 * 1024)  // 512KB state chunks
 #define TARGET_CHUNK_DATA_BYTES   (STATE_CHUNK_SIZE / sizeof(int64_t))
-#define ACCOUNTS_PER_STATE_CHUNK (TARGET_CHUNK_DATA_BYTES / ACCOUNT_SIZE)
+#define ACCOUNTS_PER_STATE_CHUNK (STATE_CHUNK_SIZE / ACCOUNT_SIZE)
 #define RING_SIZE           ((SMALL_ACCOUNT_COUNT + ACCOUNTS_PER_STATE_CHUNK - 1) / ACCOUNTS_PER_STATE_CHUNK)
 #define INITIAL_WS_CAPACITY 1024  
      
@@ -40,30 +40,33 @@ typedef struct {
 } WriteSetEntry;
 
 typedef struct {
+    uint32_t magic; // Magic number for validation
     uint32_t batch_num;
-    uint32_t state_chunk_count;
     uint32_t write_set_count;
-    uint32_t reserved;
+    uint32_t reserved; // Keeps struct size somewhat similar
 } CheckpointHeader;
+
+#define CHECKPOINT_SLOT_SIZE (sizeof(CheckpointHeader) + STATE_CHUNK_SIZE + (SMALL_ACCOUNT_COUNT * sizeof(WriteSetEntry)))
+#define TOTAL_LOG_FILE_SIZE (RING_SIZE * CHECKPOINT_SLOT_SIZE)
+
 
 // Struct for checkpoint data to be passed to the worker thread
 typedef struct {
-    CheckpointHeader header;
-    int64_t* state_snapshot; // A copy of the relevant state part
-    WriteSetEntry* write_set_snapshot; // A copy of the write set
-    uint32_t write_set_count_snapshot;
+    CheckpointHeader header; // Will contain magic, batch_num, actual write_set_count
+    int64_t* state_snapshot; // A copy of the primary state chunk (STATE_CHUNK_SIZE)
+    WriteSetEntry* write_set_snapshot; // A copy of the actual write set for this batch
 } AsyncCheckpointData;
 
 // Global variables for asynchronous checkpointing
 pthread_t checkpoint_thread_id;
 pthread_mutex_t g_checkpoint_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t g_cond_slot_empty = PTHREAD_COND_INITIALIZER;  // Main waits on this if slot is full
-pthread_cond_t g_cond_slot_full = PTHREAD_COND_INITIALIZER;   // Worker waits on this if slot is empty
-AsyncCheckpointData g_checkpoint_slot; // The single shared slot
-int g_slot_is_full = 0; // 0 = empty, 1 = full
+pthread_cond_t g_cond_slot_empty = PTHREAD_COND_INITIALIZER;
+pthread_cond_t g_cond_slot_full = PTHREAD_COND_INITIALIZER;
+AsyncCheckpointData g_checkpoint_slot;
+int g_slot_is_full = 0;
 int g_terminate_checkpoint_thread = 0;
-int g_log_fd; // Global log file descriptor, to be used by worker thread
-int g_async_error_occurred = 0; // Flag for async errors
+int g_log_fd;
+int g_async_error_occurred = 0;
 
 // Add recovery functions from state_management.c
 void write_state_to_file(const char *filename, int64_t *state, size_t count) {
@@ -173,16 +176,55 @@ double get_time_ms() {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-void preallocate_log_file(const char *filename, size_t size) {
+void preallocate_log_file(const char *filename, size_t required_size) {
     int fd = open(filename, O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
-        perror("open");
+        perror("preallocate_log_file: open failed");
         exit(EXIT_FAILURE);
     }
-    if (ftruncate(fd, size) != 0) {
-        perror("ftruncate");
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        perror("preallocate_log_file: fstat failed");
         close(fd);
         exit(EXIT_FAILURE);
+    }
+
+    if (st.st_size < (off_t)required_size) {
+        printf("Preallocating log file %s to %zu bytes (current: %ld bytes).\\n", filename, required_size, (long)st.st_size);
+        if (ftruncate(fd, required_size) != 0) {
+            perror("preallocate_log_file: ftruncate failed");
+            // Try fallocate as a fallback or for systems where it's preferred
+            errno = 0;
+            if (posix_fallocate(fd, 0, required_size) != 0) {
+                 if (errno != ENOSPC && errno != EFBIG && errno != EINVAL) { // Ignore common fallocate "errors" that might mean it's not supported or disk is full
+                    perror("preallocate_log_file: posix_fallocate also failed");
+                 }
+                 // If both ftruncate and fallocate seem to fail for sizing, this is an issue.
+                 // However, ftruncate might have worked even if fallocate reported an error.
+                 // Re-check size.
+                 if (fstat(fd, &st) == 0 && st.st_size < (off_t)required_size) {
+                     fprintf(stderr, "Critical: Failed to resize log file to %zu bytes.\\n", required_size);
+                     close(fd);
+                     exit(EXIT_FAILURE);
+                 }
+            }
+        }
+         // Initialize all slot headers to be invalid if file was created or resized
+        printf("Initializing headers in new/resized log file slots to invalid state.\\n");
+        CheckpointHeader invalid_header = {0, 0, 0, 0};
+        for (uint32_t slot_idx = 0; slot_idx < RING_SIZE; ++slot_idx) {
+            off_t slot_base_offset = (off_t)slot_idx * CHECKPOINT_SLOT_SIZE;
+            if (pwrite(fd, &invalid_header, sizeof(CheckpointHeader), slot_base_offset) != sizeof(CheckpointHeader)) {
+                perror("preallocate_log_file: pwrite to initialize header failed");
+                // This is serious, as recovery might read garbage.
+            }
+        }
+        if (fsync(fd) != 0) {
+            perror("preallocate_log_file: fsync after header initialization failed");
+        }
+        printf("Log file preallocated and headers initialized.\\n");
+    } else {
+         printf("Log file %s already exists with sufficient size (%ld bytes >= %zu bytes).\\n", filename, (long)st.st_size, required_size);
     }
     close(fd);
 }
@@ -308,8 +350,8 @@ void* checkpoint_thread_function(void* arg) {
         if(local_copy_data.state_snapshot) free(local_copy_data.state_snapshot);
 
         // 3. Write write-set entries
-        if (!io_error && local_copy_data.write_set_count_snapshot > 0) {
-            size_t total_to_write = local_copy_data.write_set_count_snapshot * sizeof(WriteSetEntry);
+        if (!io_error && local_copy_data.header.write_set_count > 0) {
+            size_t total_to_write = local_copy_data.header.write_set_count * sizeof(WriteSetEntry);
             ssize_t written_this_call = 0;
             ssize_t rc;
             char* write_set_ptr = (char*)local_copy_data.write_set_snapshot;
@@ -460,14 +502,12 @@ int main(int argc, char **argv) {
         // Persist checkpoint (asynchronously)
         CheckpointHeader header = {
             .batch_num = batch,
-            .state_chunk_count = ACCOUNTS_PER_STATE_CHUNK,
             .write_set_count = ws_count
         };
         
         // Prepare data for the asynchronous checkpoint thread
         AsyncCheckpointData data_for_slot;
         data_for_slot.header = header; // struct copy
-        data_for_slot.write_set_count_snapshot = ws_count;
 
         data_for_slot.state_snapshot = malloc(STATE_CHUNK_SIZE);
         if (!data_for_slot.state_snapshot) {
