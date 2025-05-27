@@ -4,7 +4,7 @@
 # by iterating through different account numbers and chunk sizes.
 
 # --- Configuration ---
-CHUNK_SIZES_KB=(64 128 256 512 1024) # Chunk sizes in Kilobytes
+CHUNK_SIZES_KB=(256 512 1024 2048 4096 8192 16384) # Chunk sizes in Kilobytes
 ACCOUNT_COUNTS=(1000000 10000000 50000000 100000000) # Number of accounts
 MEMSET_PERCENTAGE="5.0" # Memset percentage for transaction generation
 NUM_TEST_ITERATIONS=2     # Number of independent test iterations per (account, chunk) config
