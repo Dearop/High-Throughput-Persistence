@@ -13,14 +13,20 @@
 #define ACCOUNT_SIZE         8       
 #define BATCH_SIZE          (1 << 16)
 #define NUMBER_OF_BATCHES   5000
-uint64_t SMALL_ACCOUNT_COUNT = 5000000UL; // Made into a variable
+uint64_t SMALL_ACCOUNT_COUNT = 5000000UL; // Default, can be overridden by argv
 #define STATE_CHUNK_SIZE    (512 * 1024)  // 512KB state chunks
 #define TARGET_CHUNK_DATA_BYTES   (STATE_CHUNK_SIZE / sizeof(int64_t))
 #define ACCOUNTS_PER_STATE_CHUNK (STATE_CHUNK_SIZE / ACCOUNT_SIZE)
 #define RING_SIZE           ((SMALL_ACCOUNT_COUNT + ACCOUNTS_PER_STATE_CHUNK - 1) / ACCOUNTS_PER_STATE_CHUNK)
 #define INITIAL_WS_CAPACITY 1024  
-     
+#define CHECKPOINT_MAGIC 0xC0FFEE42 
+#define INVALID_CHECKPOINT_MAGIC 0x0 
 
+// These will be calculated in main() based on SMALL_ACCOUNT_COUNT
+uint64_t MAX_WRITE_SET_ENTRIES_PER_SLOT_VAR;
+size_t MAX_WRITE_SET_BYTES_PER_SLOT_VAR;
+size_t CHECKPOINT_SLOT_SIZE_VAR;
+size_t TOTAL_LOG_FILE_SIZE_VAR;
 
 // Operation encoding macros
 #define FUNC_MASK   0xF000000000000000UL
@@ -192,31 +198,27 @@ void preallocate_log_file(const char *filename, size_t required_size) {
     if (st.st_size < (off_t)required_size) {
         printf("Preallocating log file %s to %zu bytes (current: %ld bytes).\\n", filename, required_size, (long)st.st_size);
         if (ftruncate(fd, required_size) != 0) {
-            perror("preallocate_log_file: ftruncate failed");
-            // Try fallocate as a fallback or for systems where it's preferred
+            perror("preallocate_log_file: ftruncate failed attempting to expand");
             errno = 0;
             if (posix_fallocate(fd, 0, required_size) != 0) {
-                 if (errno != ENOSPC && errno != EFBIG && errno != EINVAL) { // Ignore common fallocate "errors" that might mean it's not supported or disk is full
+                 if (errno != ENOSPC && errno != EFBIG && errno != EINVAL && errno != EOPNOTSUPP) { 
                     perror("preallocate_log_file: posix_fallocate also failed");
                  }
-                 // If both ftruncate and fallocate seem to fail for sizing, this is an issue.
-                 // However, ftruncate might have worked even if fallocate reported an error.
-                 // Re-check size.
                  if (fstat(fd, &st) == 0 && st.st_size < (off_t)required_size) {
-                     fprintf(stderr, "Critical: Failed to resize log file to %zu bytes.\\n", required_size);
+                     fprintf(stderr, "Critical: Failed to resize log file to %zu bytes despite attempts.\\n", required_size);
                      close(fd);
                      exit(EXIT_FAILURE);
                  }
             }
         }
-         // Initialize all slot headers to be invalid if file was created or resized
         printf("Initializing headers in new/resized log file slots to invalid state.\\n");
-        CheckpointHeader invalid_header = {0, 0, 0, 0};
+        CheckpointHeader invalid_header = {INVALID_CHECKPOINT_MAGIC, 0, 0, 0};
         for (uint32_t slot_idx = 0; slot_idx < RING_SIZE; ++slot_idx) {
-            off_t slot_base_offset = (off_t)slot_idx * CHECKPOINT_SLOT_SIZE;
+            off_t slot_base_offset = (off_t)slot_idx * CHECKPOINT_SLOT_SIZE_VAR;
             if (pwrite(fd, &invalid_header, sizeof(CheckpointHeader), slot_base_offset) != sizeof(CheckpointHeader)) {
                 perror("preallocate_log_file: pwrite to initialize header failed");
-                // This is serious, as recovery might read garbage.
+                close(fd);
+                exit(EXIT_FAILURE); // Made this fatal
             }
         }
         if (fsync(fd) != 0) {
@@ -241,16 +243,23 @@ int apply_transaction(const Transaction *tx, int64_t *state,
         // Check if we need to expand write-set
         if (*ws_count + count > *ws_capacity) {
             *ws_capacity = (*ws_capacity + count) * 2;
+            if (*ws_capacity > MAX_WRITE_SET_ENTRIES_PER_SLOT_VAR) {
+                *ws_capacity = MAX_WRITE_SET_ENTRIES_PER_SLOT_VAR;
+            }
             WriteSetEntry *new_ws = realloc(*ws, *ws_capacity * sizeof(WriteSetEntry));
             if (!new_ws) {
-                perror("Write-set realloc failed");
-                free(*ws);
+                perror("Write-set realloc failed for memset");
                 exit(EXIT_FAILURE);
             }
             *ws = new_ws;
         }
 
-        for (uint64_t i = 0; i < count; i++) {
+        uint64_t num_to_add = count;
+        if (*ws_count + num_to_add > *ws_capacity) {
+            num_to_add = *ws_capacity - *ws_count; 
+        }
+
+        for (uint64_t i = 0; i < num_to_add; i++) {
             uint64_t addr = (start + i) % SMALL_ACCOUNT_COUNT;
             if (addr >= SMALL_ACCOUNT_COUNT) continue;
             
@@ -262,10 +271,12 @@ int apply_transaction(const Transaction *tx, int64_t *state,
         // Check capacity for 2 new entries
         if (*ws_count + 2 > *ws_capacity) {
             *ws_capacity *= 2;
+            if (*ws_capacity > MAX_WRITE_SET_ENTRIES_PER_SLOT_VAR) {
+                *ws_capacity = MAX_WRITE_SET_ENTRIES_PER_SLOT_VAR;
+            }
             WriteSetEntry *new_ws = realloc(*ws, *ws_capacity * sizeof(WriteSetEntry));
             if (!new_ws) {
-                perror("Write-set realloc failed");
-                free(*ws);
+                perror("Write-set realloc failed for P2P");
                 exit(EXIT_FAILURE);
             }
             *ws = new_ws;
@@ -402,6 +413,19 @@ int main(int argc, char **argv) {
         }
         SMALL_ACCOUNT_COUNT = (uint64_t)parsed_accounts;
     }
+
+    // Calculate size-dependent parameters now that SMALL_ACCOUNT_COUNT is finalized
+    MAX_WRITE_SET_ENTRIES_PER_SLOT_VAR = SMALL_ACCOUNT_COUNT;
+    MAX_WRITE_SET_BYTES_PER_SLOT_VAR = MAX_WRITE_SET_ENTRIES_PER_SLOT_VAR * sizeof(WriteSetEntry);
+    CHECKPOINT_SLOT_SIZE_VAR = sizeof(CheckpointHeader) + STATE_CHUNK_SIZE + MAX_WRITE_SET_BYTES_PER_SLOT_VAR;
+    TOTAL_LOG_FILE_SIZE_VAR = RING_SIZE * CHECKPOINT_SLOT_SIZE_VAR;
+
+    printf("INFO: Runtime SMALL_ACCOUNT_COUNT set to %lu.\\n", SMALL_ACCOUNT_COUNT);
+    printf("INFO: Runtime MAX_WRITE_SET_ENTRIES_PER_SLOT_VAR is %lu.\\n", MAX_WRITE_SET_ENTRIES_PER_SLOT_VAR);
+    printf("INFO: Runtime MAX_WRITE_SET_BYTES_PER_SLOT_VAR is %zu bytes.\\n", MAX_WRITE_SET_BYTES_PER_SLOT_VAR);
+    printf("INFO: STATE_CHUNK_SIZE is %d bytes.\\n", STATE_CHUNK_SIZE);
+    printf("INFO: Runtime CHECKPOINT_SLOT_SIZE_VAR is %zu bytes.\\n", CHECKPOINT_SLOT_SIZE_VAR);
+    printf("INFO: Runtime TOTAL_LOG_FILE_SIZE_VAR is %zu bytes.\\n", TOTAL_LOG_FILE_SIZE_VAR);
 
     int64_t *state = calloc(SMALL_ACCOUNT_COUNT, sizeof(int64_t));
     if (!state) {
