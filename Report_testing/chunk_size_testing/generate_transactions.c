@@ -8,7 +8,8 @@
 #define BATCH_SIZE          (1ULL << 16)
 #define NUMBER_OF_BATCHES   50000
 #define TOTAL_TRANSACTIONS  (BATCH_SIZE * NUMBER_OF_BATCHES)
-#define SMALL_ACCOUNT_COUNT  10000000UL       // Target number of accounts
+// #define SMALL_ACCOUNT_COUNT  10000000UL // Will be replaced by a command-line argument
+uint64_t small_account_count_param; // Global variable for number of accounts
 
 // --- Operation Encoding ---
 // Top 4 bits hold the op code, remaining 60 bits hold data.
@@ -19,21 +20,19 @@
 typedef struct {
     uint64_t sender;
     uint64_t receiver;
-    uint64_t amount;
+    uint64_t amount; // Changed from uint32_t to uint64_t to match potential memset values
 } Transaction;
 
 void print_usage(const char *program_name) {
-    printf("Usage: %s <memset_percentage>\n", program_name);
+    printf("Usage: %s <memset_percentage> <num_accounts>\n", program_name);
     printf("\n");
     printf("Arguments:\n");
-    printf("  memset_percentage  Percentage of transactions that should be range-set (memset) operations\n");
-    printf("                     Must be a number between 0.0 and 100.0\n");
-    printf("                     Example: 5.0 means 5%% of transactions will be memset operations\n");
+    printf("  memset_percentage  Percentage of transactions that should be range-set (memset) operations (0.0-100.0)\n");
+    printf("  num_accounts       Target number of accounts (e.g., 1000000)\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  %s 5.0     # Generate transactions with 5%% memset operations\n", program_name);
-    printf("  %s 0.0     # Generate only P2P transfer transactions\n", program_name);
-    printf("  %s 25.0    # Generate transactions with 25%% memset operations\n", program_name);
+    printf("  %s 5.0 1000000    # Generate transactions with 5%% memset operations for 1M accounts\n", program_name);
+    printf("  %s 0.0 5000000    # Generate only P2P transfers for 5M accounts\n", program_name);
     printf("\n");
     printf("Output:\n");
     printf("  transactions.bin   Binary file containing %llu encoded transactions\n", (unsigned long long)TOTAL_TRANSACTIONS);
@@ -41,27 +40,35 @@ void print_usage(const char *program_name) {
 
 int main(int argc, char *argv[]) {
     // Parse command-line arguments
-    if (argc != 2) {
-        fprintf(stderr, "Error: Invalid number of arguments.\n\n");
+    if (argc != 3) { // Expect program name, memset_percentage, num_accounts
+        fprintf(stderr, "Error: Invalid number of arguments. Expected 2, got %d.\n\n", argc - 1);
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
 
-    char *endptr;
-    double memset_percentage = strtod(argv[1], &endptr);
+    char *endptr_memset;
+    double memset_percentage = strtod(argv[1], &endptr_memset);
     
     // Validate the memset percentage
-    if (*endptr != '\0') {
+    if (*endptr_memset != '\0' || argv[1] == endptr_memset) {
         fprintf(stderr, "Error: Invalid memset percentage '%s'. Must be a valid number.\n\n", argv[1]);
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
-    
     if (memset_percentage < 0.0 || memset_percentage > 100.0) {
         fprintf(stderr, "Error: Memset percentage %.2f is out of range. Must be between 0.0 and 100.0.\n\n", memset_percentage);
         print_usage(argv[0]);
         return EXIT_FAILURE;
     }
+
+    char *endptr_accounts;
+    long long parsed_accounts = strtoll(argv[2], &endptr_accounts, 10);
+    if (*endptr_accounts != '\0' || argv[2] == endptr_accounts || parsed_accounts <= 0) {
+        fprintf(stderr, "Error: Invalid number of accounts '%s'. Must be a positive integer.\n\n", argv[2]);
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    small_account_count_param = (uint64_t)parsed_accounts;
 
     // Convert percentage to probability (0.0 to 1.0)
     double memset_probability = memset_percentage / 100.0;
@@ -77,8 +84,8 @@ int main(int argc, char *argv[]) {
 
     printf("=== Transaction Generation Configuration ===\n");
     printf("Total transactions: %llu (%lu batches of %llu each)\n", 
-           (unsigned long long)TOTAL_TRANSACTIONS, NUMBER_OF_BATCHES, (unsigned long long)BATCH_SIZE);
-    printf("Account range: 0 to %lu\n", SMALL_ACCOUNT_COUNT - 1);
+           (unsigned long long)TOTAL_TRANSACTIONS, (unsigned long)NUMBER_OF_BATCHES, (unsigned long long)BATCH_SIZE);
+    printf("Target account count: %lu\n", (unsigned long)small_account_count_param);
     printf("Memset percentage: %.2f%% (%.4f probability)\n", memset_percentage, memset_probability);
     printf("P2P transfer percentage: %.2f%%\n", 100.0 - memset_percentage);
     printf("Output file: transactions.bin\n");
@@ -108,24 +115,24 @@ int main(int argc, char *argv[]) {
                 double r_val = (double)rand_r(&thread_seed) / RAND_MAX;
 
                 if (r_val < memset_probability) { // Range Set (memset operation)
-                    uint64_t start = (uint64_t)rand_r(&thread_seed) % SMALL_ACCOUNT_COUNT;
-                    uint64_t max_len = SMALL_ACCOUNT_COUNT - start;
-                    if (max_len == 0) max_len = 1;
-                    if (max_len > 100) {
+                    uint64_t start = (uint64_t)rand_r(&thread_seed) % small_account_count_param;
+                    uint64_t max_len = small_account_count_param - start;
+                    if (max_len == 0) max_len = 1; // Ensure at least 1 if start is the last account
+                    if (max_len > 100) { // Cap memset length
                         max_len = 100;
                     }
                     uint64_t count = ((uint64_t)rand_r(&thread_seed) % max_len) + 1;
                     current_tx.sender = ENCODE_OP(1, start);
                     current_tx.receiver = ENCODE_OP(1, count);
-                    current_tx.amount = (uint64_t)rand_r(&thread_seed) % 1000;
+                    current_tx.amount = (uint64_t)rand_r(&thread_seed) % 100; // Reduced from 1000 to 100 for memset values
                     thread_memset_count++;
 
                 } else { // P2P Transfer
-                    uint64_t sender_index = (uint64_t)rand_r(&thread_seed) % SMALL_ACCOUNT_COUNT;
-                    uint64_t receiver_index = (uint64_t)rand_r(&thread_seed) % SMALL_ACCOUNT_COUNT;
+                    uint64_t sender_index = (uint64_t)rand_r(&thread_seed) % small_account_count_param;
+                    uint64_t receiver_index = (uint64_t)rand_r(&thread_seed) % small_account_count_param;
                     current_tx.sender = ENCODE_OP(0, sender_index);
                     current_tx.receiver = ENCODE_OP(0, receiver_index);
-                    current_tx.amount = ((uint64_t)rand_r(&thread_seed) % 1000) + 1;
+                    current_tx.amount = ((uint64_t)rand_r(&thread_seed) % 100) + 1; // Reduced from 1000 to 100 to prevent insufficient funds
                     thread_transfer_count++;
                 }
                 thread_tx_buffer[tx_in_batch_idx] = current_tx;
@@ -173,4 +180,4 @@ int main(int argc, char *argv[]) {
     }
     
     return 0;
-}
+} 
