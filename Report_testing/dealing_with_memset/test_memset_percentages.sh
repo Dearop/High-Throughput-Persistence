@@ -12,7 +12,7 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${OUTPUT_DIR}/test_log_${TIMESTAMP}.txt"
 
 # Define the exponential memset percentages
-MEMSET_PERCENTAGES=(0 1 2 4 8 16 32 64 100)
+MEMSET_PERCENTAGES=(8 16 32 64 100)
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
