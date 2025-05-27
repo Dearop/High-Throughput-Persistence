@@ -39,7 +39,7 @@ echo "INFO: Executables checked."
 echo ""
 
 # --- CSV Header ---
-echo "chunk_size_kb,account_count,test_iteration,recovery_time_ms" > "$OUTPUT_CSV"
+echo "chunk_size_kb,account_count,test_iteration,recovery_time_ms,total_tx_processing_time_ms" > "$OUTPUT_CSV"
 
 # --- Main Loop ---
 for acc_count in "${ACCOUNT_COUNTS[@]}"; do
@@ -54,10 +54,9 @@ for acc_count in "${ACCOUNT_COUNTS[@]}"; do
     if [ $? -ne 0 ]; then
         echo "ERROR: Failed to generate transactions for ${acc_count} accounts."
         echo "       Skipping all chunk sizes for this account count."
-        # Log error to CSV for all chunk sizes for this acc_count
         for chunk_kb_skip in "${CHUNK_SIZES_KB[@]}"; do
             for iteration_id_skip in $(seq 1 "$NUM_TEST_ITERATIONS"); do
-                echo "${chunk_kb_skip},${acc_count},${iteration_id_skip},ERROR_TX_GENERATION" >> "$OUTPUT_CSV"
+                echo "${chunk_kb_skip},${acc_count},${iteration_id_skip},ERROR_TX_GENERATION,ERROR_TX_GENERATION" >> "$OUTPUT_CSV"
             done
         done
         echo ""
@@ -72,55 +71,67 @@ for acc_count in "${ACCOUNT_COUNTS[@]}"; do
         echo "Configuration: Account Count = ${acc_count}, Chunk Size = ${chunk_kb}KB"
         echo "----------------------------------------------------------------------"
 
-        # Step 2: Perform NUM_TEST_ITERATIONS
         for iteration_id in $(seq 1 "$NUM_TEST_ITERATIONS"); do
             echo "INFO: Starting Test Iteration ${iteration_id}/${NUM_TEST_ITERATIONS}"
 
-            # 2a: Cleanup logs before the priming run
             echo "  Cleaning up old log files: checkpoint_log.dat, state_hash.dat"
             rm -f checkpoint_log.dat state_hash.dat
 
-            # 2b: Priming run (to populate checkpoint_log.dat)
             echo "  Iteration ${iteration_id} - Step 1: Priming run (populating log)..."
             prime_run_output_file="prime_output_a${acc_count}_c${chunk_kb}_i${iteration_id}.txt"
             "$STATE_EXEC" "$acc_count" "$chunk_kb" > "$prime_run_output_file"
             if [ $? -ne 0 ]; then
                 echo "  ERROR: Priming run of $STATE_EXEC failed."
-                echo "${chunk_kb},${acc_count},${iteration_id},ERROR_PRIME_RUN" >> "$OUTPUT_CSV"
-                cat "$prime_run_output_file" # Print output for debugging
-                continue # Skip to the next test_iteration
+                echo "${chunk_kb},${acc_count},${iteration_id},ERROR_PRIME_RUN,ERROR_PRIME_RUN" >> "$OUTPUT_CSV"
+                cat "$prime_run_output_file"
+                continue
             fi
             echo "  Priming run complete. Log should be populated."
 
-            # 2c: Measurement run (to recover from the populated log)
             echo "  Iteration ${iteration_id} - Step 2: Measurement run (recovering from log)..."
             measurement_run_output_file="measure_output_a${acc_count}_c${chunk_kb}_i${iteration_id}.txt"
             RUN_OUTPUT=$("$STATE_EXEC" "$acc_count" "$chunk_kb" 2>&1 | tee "$measurement_run_output_file")
             
-            if [ $? -ne 0 ]; then
-                echo "  ERROR: Measurement run of $STATE_EXEC failed."
-                echo "${chunk_kb},${acc_count},${iteration_id},ERROR_MEASURE_RUN" >> "$OUTPUT_CSV"
+            PROC_EXIT_CODE=$?
+            RECOVERY_TIME_MS="NOT_FOUND"
+            TOTAL_TX_PROCESSING_TIME_MS="NOT_FOUND"
+
+            if [ $PROC_EXIT_CODE -ne 0 ]; then
+                echo "  ERROR: Measurement run of $STATE_EXEC failed (exit code $PROC_EXIT_CODE)."
+                # Try to parse anyway, might have partial output
             fi
 
-            # 2d: Extract recovery time
             RECOVERY_TIME_MS=$(echo "$RUN_OUTPUT" | grep "Recovery phase took" | awk '{print $4}')
+            TOTAL_TX_PROCESSING_TIME_MS=$(echo "$RUN_OUTPUT" | grep "Finished processing" | awk '{print $9}')
 
             if [ -z "$RECOVERY_TIME_MS" ]; then
                 RECOVERY_TIME_MS="NOT_FOUND"
                 echo "  WARNING: Could not parse recovery time from measurement run output."
-                echo "           Output for this run was saved to $measurement_run_output_file"
             else
                 echo "  INFO: Recovery Time: ${RECOVERY_TIME_MS} ms"
             fi
             
-            echo "${chunk_kb},${acc_count},${iteration_id},${RECOVERY_TIME_MS}" >> "$OUTPUT_CSV"
+            if [ -z "$TOTAL_TX_PROCESSING_TIME_MS" ]; then
+                TOTAL_TX_PROCESSING_TIME_MS="NOT_FOUND"
+                echo "  WARNING: Could not parse total TX processing time from measurement run output."
+            else
+                echo "  INFO: Total TX Processing Time: ${TOTAL_TX_PROCESSING_TIME_MS} ms"
+            fi
+            
+            # If the run itself failed, mark times as ERROR if not found
+            if [ $PROC_EXIT_CODE -ne 0 ]; then
+                [ "$RECOVERY_TIME_MS" == "NOT_FOUND" ] && RECOVERY_TIME_MS="ERROR_MEASURE_RUN_EXIT_CODE_${PROC_EXIT_CODE}"
+                [ "$TOTAL_TX_PROCESSING_TIME_MS" == "NOT_FOUND" ] && TOTAL_TX_PROCESSING_TIME_MS="ERROR_MEASURE_RUN_EXIT_CODE_${PROC_EXIT_CODE}"
+            fi 
+
+            echo "${chunk_kb},${acc_count},${iteration_id},${RECOVERY_TIME_MS},${TOTAL_TX_PROCESSING_TIME_MS}" >> "$OUTPUT_CSV"
             echo "INFO: Test Iteration ${iteration_id} complete."
-            echo "" # Newline for readability
-        done # End of NUM_TEST_ITERATIONS loop
+            echo ""
+        done
         echo ""
-    done # End of CHUNK_SIZES_KB loop
+    done
     echo ""
-done # End of ACCOUNT_COUNTS loop
+done
 
 echo "======================================================================"
 echo "All tests complete. Results saved to ${OUTPUT_CSV}"
