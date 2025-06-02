@@ -103,7 +103,7 @@ for acc_count in "${ACCOUNT_COUNTS[@]}"; do
             fi
 
             RECOVERY_TIME_MS=$(echo "$RUN_OUTPUT" | grep "Recovery phase took" | awk '{print $4}')
-            TOTAL_TX_PROCESSING_TIME_MS=$(echo "$RUN_OUTPUT" | grep "Finished processing .* transactions.bin .* in .* ms ---" | awk '{print $10}')
+            TOTAL_TX_PROCESSING_TIME_MS=$(echo "$RUN_OUTPUT" | awk '/^--- Finished processing transactions\.bin \([0-9]+ batches this run\) in [0-9\.]+ ms ---$/ {print $(NF-2)}')
             MEDIAN_BATCH_APPLICATION_TIME_MS=$(echo "$RUN_OUTPUT" | grep "\[STATS\] Median batch application time:" | awk '{print $6}')
 
             if [ -z "$RECOVERY_TIME_MS" ]; then
