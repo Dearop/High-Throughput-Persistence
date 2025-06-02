@@ -950,41 +950,66 @@ int main(int argc, char **argv) {
     if (log_fd_mmap < 0) {
         perror("CRITICAL: Failed to re-open log file for mmap");
         // Perform necessary cleanup before exiting
-        free(main_state_array); free(temp_snap_slot); free(temp_tx_slot);
+        free(main_state_array); 
+        free(temp_snap_slot); 
+        free(temp_tx_slot);
         exit(EXIT_FAILURE);
     }
     void *mapped_log_region = mmap(NULL, TOTAL_LOG_FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, log_fd_mmap, 0);
     if (mapped_log_region == MAP_FAILED) {
         perror("mmap failed");
         close(log_fd_mmap);
-        free(main_state_array); free(temp_snap_slot); free(temp_tx_slot);
+        free(main_state_array); 
+        free(temp_snap_slot); 
+        free(temp_tx_slot);
         exit(EXIT_FAILURE);
     }
     CheckpointHeader *log_header_ptr = (CheckpointHeader*)mapped_log_region;
     if (log_header_ptr->magic != CHECKPOINT_MAGIC) {
         fprintf(stderr, "CRITICAL: Log file header invalid after mmap!\n");
         munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
-        free(main_state_array); free(temp_snap_slot); free(temp_tx_slot);
+        free(main_state_array);
+        free(temp_snap_slot); 
+        free(temp_tx_slot);
         exit(EXIT_FAILURE);
     }
     log_header_ptr->current_cycle_ptr = 0;
 
     // Initialize pthread mutex and condition variables
     if (pthread_mutex_init(&commit_mutex, NULL) != 0) {
-        perror("Mutex init failed"); free(main_state_array); munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap); exit(EXIT_FAILURE);
+        perror("Mutex init failed"); 
+        free(main_state_array); 
+        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); 
+        close(log_fd_mmap); 
+        exit(EXIT_FAILURE);
     }
     if (pthread_cond_init(&commit_cond_data_ready, NULL) != 0) {
-        perror("Cond var (data_ready) init failed"); pthread_mutex_destroy(&commit_mutex); free(main_state_array); munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap); exit(EXIT_FAILURE);
+        perror("Cond var (data_ready) init failed"); 
+        pthread_mutex_destroy(&commit_mutex); 
+        free(main_state_array);
+        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); 
+        close(log_fd_mmap); 
+        exit(EXIT_FAILURE);
     }
     if (pthread_cond_init(&commit_cond_commit_done, NULL) != 0) {
-        perror("Cond var (commit_done) init failed"); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex); free(main_state_array); munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap); exit(EXIT_FAILURE);
+        perror("Cond var (commit_done) init failed"); 
+        pthread_cond_destroy(&commit_cond_data_ready); 
+        pthread_mutex_destroy(&commit_mutex); 
+        free(main_state_array);
+         munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); 
+         close(log_fd_mmap); 
+         exit(EXIT_FAILURE);
     }
 
     // Create the commit worker thread
     if (pthread_create(&commit_thread_id, NULL, commit_worker_func, NULL) != 0) {
         perror("Thread creation failed");
-        pthread_cond_destroy(&commit_cond_commit_done); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex);
-        free(main_state_array); munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
+        pthread_cond_destroy(&commit_cond_commit_done); 
+        pthread_cond_destroy(&commit_cond_data_ready); 
+        pthread_mutex_destroy(&commit_mutex);
+        free(main_state_array); 
+        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); 
+        close(log_fd_mmap);
         exit(EXIT_FAILURE);
     }
 
@@ -998,8 +1023,11 @@ int main(int argc, char **argv) {
         pthread_cond_signal(&commit_cond_data_ready);
         pthread_mutex_unlock(&commit_mutex);
         pthread_join(commit_thread_id, NULL);
-        pthread_cond_destroy(&commit_cond_commit_done); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex);
-        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
+        pthread_cond_destroy(&commit_cond_commit_done); 
+        pthread_cond_destroy(&commit_cond_data_ready); 
+        pthread_mutex_destroy(&commit_mutex);
+        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); 
+        close(log_fd_mmap);
         free(main_state_array); // temp_snap_slot and temp_tx_slot already removed
         exit(EXIT_FAILURE);
     }
@@ -1014,8 +1042,11 @@ int main(int argc, char **argv) {
         pthread_cond_signal(&commit_cond_data_ready);
         pthread_mutex_unlock(&commit_mutex);
         pthread_join(commit_thread_id, NULL);
-        pthread_cond_destroy(&commit_cond_commit_done); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex);
-        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
+        pthread_cond_destroy(&commit_cond_commit_done); 
+        pthread_cond_destroy(&commit_cond_data_ready); 
+        pthread_mutex_destroy(&commit_mutex);
+        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); 
+        close(log_fd_mmap);
         free(main_state_array); // temp_snap_slot and temp_tx_slot already removed
         exit(EXIT_FAILURE);
     }
@@ -1029,7 +1060,7 @@ int main(int argc, char **argv) {
     double proc_start_t_loop = get_time_ms();
 
     // Allocate array to store total times for each batch processed in this run
-    size_t max_batches_this_run = 10000000; // Arbitrary large enough value
+    size_t max_batches_this_run = 1000000000; // Arbitrary large enough value
     double *batch_total_times = malloc(max_batches_this_run * sizeof(double));
     if (!batch_total_times) {
         perror("Failed to allocate batch_total_times array");
@@ -1040,8 +1071,11 @@ int main(int argc, char **argv) {
         pthread_cond_signal(&commit_cond_data_ready);
         pthread_mutex_unlock(&commit_mutex);
         pthread_join(commit_thread_id, NULL);
-        pthread_cond_destroy(&commit_cond_commit_done); pthread_cond_destroy(&commit_cond_data_ready); pthread_mutex_destroy(&commit_mutex);
-        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); close(log_fd_mmap);
+        pthread_cond_destroy(&commit_cond_commit_done); 
+        pthread_cond_destroy(&commit_cond_data_ready); 
+        pthread_mutex_destroy(&commit_mutex);
+        munmap(mapped_log_region, TOTAL_LOG_FILE_SIZE); 
+        close(log_fd_mmap);
         free(main_state_array); free(tx_batch_buf); // temp_snap_slot and temp_tx_slot already removed
         exit(EXIT_FAILURE);
     }

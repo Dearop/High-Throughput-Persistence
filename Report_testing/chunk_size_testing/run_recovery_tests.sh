@@ -39,7 +39,7 @@ echo "INFO: Executables checked."
 echo ""
 
 # --- CSV Header ---
-echo "chunk_size_kb,account_count,test_iteration,recovery_time_ms,total_tx_processing_time_ms" > "$OUTPUT_CSV"
+echo "chunk_size_kb,account_count,test_iteration,recovery_time_ms,total_tx_processing_time_ms,median_batch_application_time_ms" > "$OUTPUT_CSV"
 
 # --- Main Loop ---
 for acc_count in "${ACCOUNT_COUNTS[@]}"; do
@@ -56,7 +56,7 @@ for acc_count in "${ACCOUNT_COUNTS[@]}"; do
         echo "       Skipping all chunk sizes for this account count."
         for chunk_kb_skip in "${CHUNK_SIZES_KB[@]}"; do
             for iteration_id_skip in $(seq 1 "$NUM_TEST_ITERATIONS"); do
-                echo "${chunk_kb_skip},${acc_count},${iteration_id_skip},ERROR_TX_GENERATION,ERROR_TX_GENERATION" >> "$OUTPUT_CSV"
+                echo "${chunk_kb_skip},${acc_count},${iteration_id_skip},ERROR_TX_GENERATION,ERROR_TX_GENERATION,ERROR_TX_GENERATION" >> "$OUTPUT_CSV"
             done
         done
         echo ""
@@ -82,7 +82,7 @@ for acc_count in "${ACCOUNT_COUNTS[@]}"; do
             "$STATE_EXEC" "$acc_count" "$chunk_kb" > "$prime_run_output_file"
             if [ $? -ne 0 ]; then
                 echo "  ERROR: Priming run of $STATE_EXEC failed."
-                echo "${chunk_kb},${acc_count},${iteration_id},ERROR_PRIME_RUN,ERROR_PRIME_RUN" >> "$OUTPUT_CSV"
+                echo "${chunk_kb},${acc_count},${iteration_id},ERROR_PRIME_RUN,ERROR_PRIME_RUN,ERROR_PRIME_RUN" >> "$OUTPUT_CSV"
                 cat "$prime_run_output_file"
                 continue
             fi
@@ -95,6 +95,7 @@ for acc_count in "${ACCOUNT_COUNTS[@]}"; do
             PROC_EXIT_CODE=$?
             RECOVERY_TIME_MS="NOT_FOUND"
             TOTAL_TX_PROCESSING_TIME_MS="NOT_FOUND"
+            MEDIAN_BATCH_APPLICATION_TIME_MS="NOT_FOUND"
 
             if [ $PROC_EXIT_CODE -ne 0 ]; then
                 echo "  ERROR: Measurement run of $STATE_EXEC failed (exit code $PROC_EXIT_CODE)."
@@ -102,7 +103,8 @@ for acc_count in "${ACCOUNT_COUNTS[@]}"; do
             fi
 
             RECOVERY_TIME_MS=$(echo "$RUN_OUTPUT" | grep "Recovery phase took" | awk '{print $4}')
-            TOTAL_TX_PROCESSING_TIME_MS=$(echo "$RUN_OUTPUT" | grep "Finished processing" | awk '{print $9}')
+            TOTAL_TX_PROCESSING_TIME_MS=$(echo "$RUN_OUTPUT" | grep "Finished processing .* transactions.bin .* in .* ms ---" | awk '{print $10}')
+            MEDIAN_BATCH_APPLICATION_TIME_MS=$(echo "$RUN_OUTPUT" | grep "\[STATS\] Median batch application time:" | awk '{print $6}')
 
             if [ -z "$RECOVERY_TIME_MS" ]; then
                 RECOVERY_TIME_MS="NOT_FOUND"
@@ -117,14 +119,22 @@ for acc_count in "${ACCOUNT_COUNTS[@]}"; do
             else
                 echo "  INFO: Total TX Processing Time: ${TOTAL_TX_PROCESSING_TIME_MS} ms"
             fi
+
+            if [ -z "$MEDIAN_BATCH_APPLICATION_TIME_MS" ]; then
+                MEDIAN_BATCH_APPLICATION_TIME_MS="NOT_FOUND"
+                echo "  WARNING: Could not parse median batch application time from measurement run output."
+            else
+                echo "  INFO: Median Batch Application Time: ${MEDIAN_BATCH_APPLICATION_TIME_MS} ms"
+            fi
             
             # If the run itself failed, mark times as ERROR if not found
             if [ $PROC_EXIT_CODE -ne 0 ]; then
                 [ "$RECOVERY_TIME_MS" == "NOT_FOUND" ] && RECOVERY_TIME_MS="ERROR_MEASURE_RUN_EXIT_CODE_${PROC_EXIT_CODE}"
                 [ "$TOTAL_TX_PROCESSING_TIME_MS" == "NOT_FOUND" ] && TOTAL_TX_PROCESSING_TIME_MS="ERROR_MEASURE_RUN_EXIT_CODE_${PROC_EXIT_CODE}"
+                [ "$MEDIAN_BATCH_APPLICATION_TIME_MS" == "NOT_FOUND" ] && MEDIAN_BATCH_APPLICATION_TIME_MS="ERROR_MEASURE_RUN_EXIT_CODE_${PROC_EXIT_CODE}"
             fi 
 
-            echo "${chunk_kb},${acc_count},${iteration_id},${RECOVERY_TIME_MS},${TOTAL_TX_PROCESSING_TIME_MS}" >> "$OUTPUT_CSV"
+            echo "${chunk_kb},${acc_count},${iteration_id},${RECOVERY_TIME_MS},${TOTAL_TX_PROCESSING_TIME_MS},${MEDIAN_BATCH_APPLICATION_TIME_MS}" >> "$OUTPUT_CSV"
             echo "INFO: Test Iteration ${iteration_id} complete."
             echo ""
         done
