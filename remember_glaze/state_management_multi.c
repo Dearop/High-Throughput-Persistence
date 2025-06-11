@@ -18,7 +18,7 @@
 // --- Definitions and Constants ---
 
 #define BATCH_SIZE              (1ULL << 16)     // 65,536 transactions per batch
-#define SMALL_ACCOUNT_COUNT     500000000UL       // Target number of accounts
+#define SMALL_ACCOUNT_COUNT     100000000UL       // Target number of accounts
 #define ACCOUNT_SIZE            8              
 
 // State Chunk configuration
