@@ -1,6 +1,8 @@
-# High-Throughput Persistence: Transactional State Management Benchmarks
+# High-Throughput Persistence: Transactional State Management 
 
-This project is a research and benchmarking suite for high-throughput, persistent, and recoverable state management systems, focusing on transaction processing, logging, and recovery in C. It includes a variety of implementations, each exploring different trade-offs in logging, snapshotting, batching, and recovery strategies.
+This project is a research and benchmarking suite for high-throughput, persistent, and recoverable state management systems, focusing on transaction processing, logging, and recovery in C. It includes a variety of implementations, each exploring different trade-offs in logging, snapshotting, batching, and recovery strategies. 
+
+This repo implements a durable persistence mechanism capable of reaching up to 50 Million transactions per second.
 
 ## Table of Contents
 
