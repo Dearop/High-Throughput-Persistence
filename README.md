@@ -78,11 +78,11 @@ This project is a research and benchmarking suite for high-throughput, persisten
 
 ### glaze/
 
-- **state_management.c**: Early chunked state management.
+- **state_management.c**: Early chunked state management using write sets and only handles transfers.
 - **generate_transactions.c**: Transaction generator.
 
 ### Report_testing/
-
+Measurements used for tests in the report that can be found in main.tex.
 - **dealing_with_memset/**: Scripts and binaries for memset (range set) performance testing.
 - **chunk_size_testing/**: Scripts and binaries for chunk size sensitivity testing.
 - **scalability_testing/**: Scripts and binaries for scalability testing.
